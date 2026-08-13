@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+web/node_modules/
+web/dist/
+webui/dist/*
+!webui/dist/index.html
+coverage/
+*.coverprofile
+*.test
+*.log
+*.tar.gz
+.idea/
+.vscode/
+.DS_Store
