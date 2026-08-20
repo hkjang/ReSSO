@@ -25,13 +25,60 @@ export interface User {
   realm_id: string
   username: string
   email: string
+  email_verified: boolean
   display_name: string
   enabled: boolean
   platform_admin: boolean
   manager_id?: string
+  federation_id?: string
+  external_id?: string
+  external_dn?: string
+  federation_synced_at?: string
   failed_attempts: number
   locked_until?: string
   password_changed_at: string
+  created_at: string
+  updated_at: string
+}
+
+export interface LDAPFederation {
+  id: string
+  realm_id: string
+  name: string
+  vendor: 'OTHER' | 'AD'
+  priority: number
+  enabled: boolean
+  connection_url: string
+  start_tls: boolean
+  ca_certificate?: string
+  bind_dn: string
+  bind_credential_set: boolean
+  users_dn: string
+  username_ldap_attribute: string
+  rdn_ldap_attribute: string
+  uuid_ldap_attribute: string
+  user_object_classes: string[]
+  user_ldap_filter: string
+  search_scope: 'ONE_LEVEL' | 'SUBTREE'
+  email_ldap_attribute: string
+  first_name_ldap_attribute: string
+  last_name_ldap_attribute: string
+  display_name_ldap_attribute: string
+  member_of_ldap_attribute: string
+  group_role_mappings: Record<string, string>
+  import_enabled: boolean
+  sync_registrations: boolean
+  missing_user_action: 'KEEP' | 'DISABLE'
+  edit_mode: 'READ_ONLY' | 'WRITABLE' | 'UNSYNCED'
+  batch_size: number
+  sync_period_seconds: number
+  next_sync_at?: string
+  last_sync_at?: string
+  last_sync_status: 'NEVER' | 'RUNNING' | 'SUCCESS' | 'FAILURE'
+  last_sync_error?: string
+  last_sync_added: number
+  last_sync_updated: number
+  last_sync_failed: number
   created_at: string
   updated_at: string
 }
@@ -88,6 +135,23 @@ export interface Role {
   created_at: string
 }
 
+export interface ClientRole {
+  id: string
+  client_id: string
+  client_key: string
+  name: string
+  description: string
+  created_at: string
+}
+
+export interface UserRoleMappings {
+  available_realm_roles: Role[]
+  available_client_roles: ClientRole[]
+  realm_role_ids: string[]
+  federation_realm_role_ids: string[]
+  client_role_ids: string[]
+}
+
 export interface APIKey {
   id: string
   name: string
@@ -118,5 +182,5 @@ export interface Me {
   user: User
   roles: string[]
   csrf_token: string
-  permissions: { platform_admin: boolean }
+  permissions: { platform_admin: boolean; realm_admin: boolean; admin: boolean }
 }

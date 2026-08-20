@@ -10,6 +10,7 @@ import DnsRoundedIcon from '@mui/icons-material/DnsRounded'
 import GroupsRoundedIcon from '@mui/icons-material/GroupsRounded'
 import KeyRoundedIcon from '@mui/icons-material/KeyRounded'
 import KeyboardCommandKeyRoundedIcon from '@mui/icons-material/KeyboardCommandKeyRounded'
+import LanRoundedIcon from '@mui/icons-material/LanRounded'
 import LogoutRoundedIcon from '@mui/icons-material/LogoutRounded'
 import MenuRoundedIcon from '@mui/icons-material/MenuRounded'
 import PolicyRoundedIcon from '@mui/icons-material/PolicyRounded'
@@ -32,6 +33,7 @@ const adminItems: NavItem[] = [
   { label: '대시보드', path: '/admin', icon: DashboardRoundedIcon, keywords: '현황 홈' },
   { label: 'Realm', path: '/admin/realms', icon: DnsRoundedIcon, keywords: '테넌트 영역' },
   { label: '사용자', path: '/admin/users', icon: GroupsRoundedIcon, keywords: '계정 조직' },
+  { label: 'User Federation', path: '/admin/user-federation', icon: LanRoundedIcon, keywords: 'LDAP AD 디렉터리 페더레이션' },
   { label: 'Client', path: '/admin/clients', icon: VpnKeyRoundedIcon, keywords: 'OIDC OAuth 애플리케이션' },
   { label: 'Role', path: '/admin/roles', icon: BadgeRoundedIcon, keywords: '권한 RBAC' },
   { label: '세션', path: '/admin/sessions', icon: SecurityRoundedIcon, keywords: '로그인 강제 로그아웃' },
@@ -63,7 +65,7 @@ export function AppShell() {
   const realms = useQuery({
     queryKey: ['realms'],
     queryFn: () => api<{ items: Realm[] }>('/api/admin/v1/realms'),
-    enabled: Boolean(me?.permissions.platform_admin),
+    enabled: Boolean(me?.permissions.admin),
     staleTime: 30_000,
   })
   const approvalEnabled = realms.data?.items.some((realm) => realm.approval_enabled) ?? false
@@ -74,9 +76,12 @@ export function AppShell() {
     staleTime: 30_000,
   })
   const navItems = useMemo(() => {
-    if (isAdmin) return adminItems.filter((item) => item.path !== '/admin/approvals' || approvalEnabled)
+    if (isAdmin) return adminItems.filter((item) => {
+      if (item.path === '/admin/logs' && !me?.permissions.platform_admin) return false
+      return item.path !== '/admin/approvals' || approvalEnabled
+    })
     return personalItems.filter((item) => item.path !== '/personal/requests' || capability.data?.enabled)
-  }, [isAdmin, approvalEnabled, capability.data?.enabled])
+  }, [isAdmin, approvalEnabled, capability.data?.enabled, me?.permissions.platform_admin])
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
@@ -138,7 +143,7 @@ export function AppShell() {
             <Box sx={{ px: 2, py: 1.5 }}><Typography fontWeight={700}>{me?.user.display_name}</Typography><Typography variant="body2" color="text.secondary">{me?.user.email}</Typography></Box>
             <Divider />
             <MenuItem onClick={() => { setProfileAnchor(null); navigate('/personal') }}><ListItemIcon><AccountCircleRoundedIcon fontSize="small" /></ListItemIcon>개인 설정</MenuItem>
-            {me?.permissions.platform_admin && <MenuItem onClick={() => { setProfileAnchor(null); navigate('/admin') }}><ListItemIcon><AdminPanelSettingsRoundedIcon fontSize="small" /></ListItemIcon>서비스 관리</MenuItem>}
+            {me?.permissions.admin && <MenuItem onClick={() => { setProfileAnchor(null); navigate('/admin') }}><ListItemIcon><AdminPanelSettingsRoundedIcon fontSize="small" /></ListItemIcon>서비스 관리</MenuItem>}
             <Divider />
             <Box sx={{ px: 2, py: 1.2 }}><Typography variant="caption" color="text.secondary">ReSSO {meta?.version}</Typography><Typography variant="caption" color="text.secondary" display="block" className="mono">{meta?.commit !== 'unknown' ? meta?.commit.slice(0, 12) : 'development build'}</Typography></Box>
             <Divider />
@@ -147,7 +152,7 @@ export function AppShell() {
         </Stack>
         <Box component="main" sx={{ p: { xs: 2, sm: 3, xl: 4 }, maxWidth: 1680, mx: 'auto' }}><Outlet /></Box>
       </Box>
-      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} items={navItems} admin={Boolean(me?.permissions.platform_admin)} />
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} items={navItems} admin={Boolean(me?.permissions.admin)} />
     </Box>
   )
 }

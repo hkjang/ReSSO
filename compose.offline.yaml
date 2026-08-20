@@ -2,7 +2,7 @@ name: resso
 
 services:
   resso:
-    image: resso:v0.1.0
+    image: resso:v0.2.0
     container_name: resso
     restart: unless-stopped
     ports:
@@ -12,6 +12,7 @@ services:
       BOOTSTRAP_ADMIN: ${BOOTSTRAP_ADMIN:?BOOTSTRAP_ADMIN is required}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?BOOTSTRAP_ADMIN_PASSWORD is required}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

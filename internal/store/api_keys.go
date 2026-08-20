@@ -86,11 +86,13 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (domain.Prin
 	prefix := raw[:dot]
 	var principal domain.Principal
 	var expected []byte
-	err := s.Pool.QueryRow(ctx, `SELECT u.id,u.realm_id,u.username,u.platform_admin,k.scopes,k.secret_hash
+	err := s.Pool.QueryRow(ctx, `SELECT u.id,u.realm_id,u.username,u.platform_admin,
+		EXISTS(SELECT 1 FROM user_roles ur JOIN roles r ON r.id=ur.role_id
+		    WHERE ur.user_id=u.id AND r.name='realm-admin'),k.scopes,k.secret_hash
         FROM personal_api_keys k JOIN users u ON u.id=k.user_id
         WHERE k.prefix=$1 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>now())
         AND u.enabled=true`, prefix).Scan(&principal.UserID, &principal.RealmID, &principal.Username,
-		&principal.PlatformAdmin, &principal.Scopes, &expected)
+		&principal.PlatformAdmin, &principal.RealmAdmin, &principal.Scopes, &expected)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !s.Sealer.MatchDigest(raw, expected)) {
 		return domain.Principal{}, ErrNotFound
 	}

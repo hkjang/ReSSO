@@ -44,7 +44,7 @@ func (s *Server) mcpProtectedResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	scheme := "http"
-	if requestIsSecure(r) {
+	if s.requestIsSecure(r) {
 		scheme = "https"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -132,8 +132,9 @@ func (s *Server) authenticateMCPPrincipal(r *http.Request) (domain.Principal, er
 	if err != nil || !user.Enabled {
 		return domain.Principal{}, errors.New("MCP user is unavailable")
 	}
+	realmAdmin, _ := s.store.UserHasRealmRole(r.Context(), user.ID, "realm-admin")
 	return domain.Principal{UserID: user.ID, RealmID: user.RealmID, Username: user.Username,
-		PlatformAdmin: user.PlatformAdmin, Scopes: strings.Fields(verified.Extra.Scope)}, nil
+		PlatformAdmin: user.PlatformAdmin, RealmAdmin: realmAdmin, Scopes: strings.Fields(verified.Extra.Scope)}, nil
 }
 
 func (s *Server) writeMCPError(w http.ResponseWriter, id json.RawMessage, code int, message string, data any) {
@@ -154,6 +155,8 @@ func (s *Server) mcpTools(principal domain.Principal) []any {
 	if principal.PlatformAdmin && slices.Contains(principal.Scopes, "admin:read") {
 		tools = append(tools, map[string]any{"name": "resso_list_realms", "description": "모든 Realm의 공개 운영 설정을 조회합니다.",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}})
+		tools = append(tools, map[string]any{"name": "resso_list_user_federations", "description": "Realm의 LDAP User Federation 연결 및 동기화 상태를 조회합니다. 자격증명은 반환하지 않습니다.",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"realm_id": map[string]any{"type": "string", "format": "uuid"}}, "additionalProperties": false}})
 	}
 	return tools
 }
@@ -189,6 +192,28 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 			return nil, errors.New("다른 Realm을 조회할 권한이 없습니다")
 		}
 		output, err = s.store.ListClients(r.Context(), realmID)
+	case "resso_list_user_federations":
+		if !principal.PlatformAdmin || !slices.Contains(principal.Scopes, "admin:read") {
+			return nil, errors.New("admin:read 권한이 필요합니다")
+		}
+		realmID, parseErr := mcpRealmID(call.Arguments, principal)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		providers, listErr := s.store.ListLDAPFederations(r.Context(), realmID)
+		if listErr != nil {
+			err = listErr
+			break
+		}
+		items := make([]map[string]any, 0, len(providers))
+		for _, provider := range providers {
+			items = append(items, map[string]any{"id": provider.ID, "realm_id": provider.RealmID, "name": provider.Name,
+				"vendor": provider.Vendor, "enabled": provider.Enabled, "connection_url": provider.ConnectionURL,
+				"priority": provider.Priority, "edit_mode": provider.EditMode, "last_sync_at": provider.LastSyncAt,
+				"last_sync_status": provider.LastSyncStatus, "last_sync_added": provider.LastSyncAdded,
+				"last_sync_updated": provider.LastSyncUpdated, "last_sync_failed": provider.LastSyncFailed})
+		}
+		output = items
 	case "resso_search_users":
 		var args struct {
 			RealmID string `json:"realm_id"`

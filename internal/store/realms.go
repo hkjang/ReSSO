@@ -16,6 +16,9 @@ import (
 
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
+var ErrFederationReadOnly = errors.New("LDAP federation is read-only")
+var ErrFederationPasswordExternal = errors.New("password is managed by the source LDAP directory")
+var ErrFederationOperation = errors.New("LDAP federation operation failed")
 
 const realmColumns = `id,name,display_name,issuer_url,enabled,approval_enabled,
     access_token_ttl_seconds,refresh_token_ttl_seconds,session_ttl_seconds,created_at,updated_at`
@@ -76,17 +79,25 @@ func (s *Store) CreateRealm(ctx context.Context, input CreateRealmInput) (domain
 	if err := validateIssuerURL(realm.IssuerURL); err != nil {
 		return domain.Realm{}, err
 	}
-	_, err := s.Pool.Exec(ctx, `INSERT INTO realms(id,name,display_name,issuer_url,created_at,updated_at)
-        VALUES($1,$2,$3,$4,$5,$5)`, realm.ID, realm.Name, realm.DisplayName, realm.IssuerURL, now)
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return domain.Realm{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, err = tx.Exec(ctx, `INSERT INTO realms(id,name,display_name,issuer_url,created_at,updated_at)
+		VALUES($1,$2,$3,$4,$5,$5)`, realm.ID, realm.Name, realm.DisplayName, realm.IssuerURL, now)
 	if err != nil {
 		return domain.Realm{}, fmt.Errorf("create realm: %w", err)
 	}
 	for _, name := range []string{"user", "realm-admin", "offline_access"} {
-		_, err = s.Pool.Exec(ctx, `INSERT INTO roles(id,realm_id,name,description) VALUES($1,$2,$3,$4)`,
+		_, err = tx.Exec(ctx, `INSERT INTO roles(id,realm_id,name,description) VALUES($1,$2,$3,$4)`,
 			uuid.New(), realm.ID, name, "Built-in "+name+" role")
 		if err != nil {
 			return domain.Realm{}, fmt.Errorf("create built-in realm roles: %w", err)
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Realm{}, fmt.Errorf("commit realm creation: %w", err)
 	}
 	return realm, nil
 }

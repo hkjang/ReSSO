@@ -7,12 +7,13 @@
 3. 32바이트 `ENCRYPTION_KEY`를 생성해 Password Vault에 보관합니다.
 4. 12자 이상의 임시 Bootstrap 관리자 비밀번호를 준비합니다.
 5. Reverse Proxy에서 TLS를 종료하고 `/`, `/api`, `/realms`, `/mcp`, `/.well-known` 경로를 변경 없이 전달합니다.
+   Proxy 네트워크만 `TRUSTED_PROXY_CIDRS`에 등록합니다. 등록되지 않은 발신지의 전달 Header는 무시됩니다.
 6. 최초 로그인 후 `master` Realm의 Issuer URL을 외부 URL로 변경합니다.
 7. Bootstrap 관리자 비밀번호를 개인 설정에서 즉시 변경합니다.
 
 ## 데이터 보호와 백업
 
-PostgreSQL에는 사용자, Client, Session, Refresh Token의 HMAC digest, 감사 이벤트와 AES-256-GCM으로 암호화된 Signing Private Key가 저장됩니다. 백업 복구에는 동일한 `ENCRYPTION_KEY`가 반드시 필요합니다.
+PostgreSQL에는 사용자, Client, Session, Refresh Token의 HMAC digest, 감사 이벤트와 AES-256-GCM으로 암호화된 Signing Private Key 및 LDAP Bind Credential이 저장됩니다. 백업 복구에는 동일한 `ENCRYPTION_KEY`가 반드시 필요합니다.
 
 - PostgreSQL: 조직의 RPO/RTO에 맞춰 PITR 가능한 백업 사용
 - `ENCRYPTION_KEY`: DB와 다른 보안 경계에 복제 보관
@@ -36,6 +37,15 @@ GET /health/ready  PostgreSQL 연결 준비 상태
 ```
 
 Docker 이미지에는 `/resso healthcheck`가 포함됩니다.
+
+관리 대시보드는 외부 Issuer HTTPS, Realm ACTIVE 서명 키, LDAP 동기화 실패, 잠긴 사용자와 7일 내 만료 API Key를 실제 DB 상태로 표시합니다.
+
+## 관리자 권한
+
+- `platform_admin`: 모든 Realm, 새 Realm 생성, 서버 로그를 포함한 서비스 전체 관리
+- `realm-admin` Realm Role: 자신이 속한 Realm의 사용자, Federation, Client, Role, Session, Signing Key, 승인과 감사 이벤트 관리
+- Realm 관리자는 다른 Realm과 플랫폼 서버 로그에 접근할 수 없습니다.
+- 개인 API Key의 `api:read`·`admin:read`는 GET 요청만 허용하며 변경에는 브라우저 Session과 CSRF Token이 필요합니다.
 
 ## Key Rotation
 
@@ -68,3 +78,12 @@ Realm 설정의 “팀장 검토·승인 프로세스 사용”이 켜진 경우
 5. 문제가 있으면 이전 이미지로 Container를 되돌립니다.
 
 DB Migration은 기동 시 Advisory Lock 아래 자동 적용됩니다. Migration 적용 후 애플리케이션 이미지 롤백이 필요한 경우에는 릴리즈 노트의 DB 호환성을 먼저 확인해야 합니다.
+
+## LDAP Federation 운영
+
+- 관리 → User Federation에서 Realm별 LDAP 또는 AD 공급자를 구성합니다.
+- 실제 동기화 전 `연결 테스트`와 별도 시험 계정의 `인증 테스트`를 모두 통과시킵니다.
+- 운영 연결은 `ldaps://` 또는 StartTLS와 조직 CA 인증서를 사용합니다.
+- `DISABLE` 정책은 전체 동기화에서 사라진 계정을 비활성화하고 세션을 종료하므로 LDAP 필터 변경 전에 영향 범위를 확인합니다.
+- 자동 동기화는 5분 이상 주기로 설정하며 다중 Pod에서는 PostgreSQL `SKIP LOCKED` claim으로 중복 실행을 방지합니다.
+- 상세 설정과 장애 대응은 [user-federation.md](user-federation.md)를 참고하세요.

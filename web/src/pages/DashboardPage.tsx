@@ -9,7 +9,7 @@ import { api } from '../lib/api'
 import { PageHeader, ContentCard } from '../components/Page'
 import { ErrorAlert, PageLoading } from '../components/Feedback'
 
-interface DashboardData { realms: number; users: number; clients: number; active_sessions: number; pending_approvals: number }
+interface DashboardData { realms: number; users: number; clients: number; active_sessions: number; pending_approvals: number; readiness: { issuer_https: boolean; signing_keys_ready: boolean; federation_failures: number; locked_users: number; expiring_api_keys: number } }
 
 export function DashboardPage() {
   const query = useQuery({ queryKey: ['dashboard'], queryFn: () => api<DashboardData>('/api/admin/v1/dashboard'), refetchInterval: 30_000 })
@@ -21,6 +21,13 @@ export function DashboardPage() {
     { label: 'OIDC Client', value: query.data?.clients ?? 0, icon: VpnKeyRoundedIcon, color: '#7f56d9' },
     { label: '활성 세션', value: query.data?.active_sessions ?? 0, icon: SecurityRoundedIcon, color: '#f79009' },
     { label: '승인 대기', value: query.data?.pending_approvals ?? 0, icon: ApprovalRoundedIcon, color: '#d92d20' },
+  ]
+  const readiness = [
+    { label: '외부 Issuer HTTPS', ready: Boolean(query.data?.readiness.issuer_https), detail: query.data?.readiness.issuer_https ? '정상' : 'HTTP Issuer 확인 필요' },
+    { label: 'Realm 서명 키', ready: Boolean(query.data?.readiness.signing_keys_ready), detail: query.data?.readiness.signing_keys_ready ? '정상' : 'ACTIVE 키 누락' },
+    { label: 'LDAP 최근 동기화', ready: (query.data?.readiness.federation_failures ?? 0) === 0, detail: `${query.data?.readiness.federation_failures ?? 0}개 실패` },
+    { label: '잠긴 사용자', ready: (query.data?.readiness.locked_users ?? 0) === 0, detail: `${query.data?.readiness.locked_users ?? 0}명` },
+    { label: '7일 내 API 키 만료', ready: (query.data?.readiness.expiring_api_keys ?? 0) === 0, detail: `${query.data?.readiness.expiring_api_keys ?? 0}개` },
   ]
   return (
     <>
@@ -43,7 +50,7 @@ export function DashboardPage() {
             <Typography variant="h3">운영 준비 상태</Typography>
             <Typography color="text.secondary" variant="body2" sx={{ mt: .75, mb: 3 }}>핵심 인증 구성요소가 PostgreSQL 기반으로 준비되어 있습니다.</Typography>
             <Stack spacing={2.2}>
-              {[['OIDC Discovery & JWKS', 100], ['Authorization Code + PKCE', 100], ['Refresh token rotation', 100], ['운영 감사 및 구조화 로그', 100]].map(([label, value]) => <Box key={String(label)}><Stack direction="row" justifyContent="space-between" sx={{ mb: .7 }}><Typography variant="body2" fontWeight={650}>{label}</Typography><Typography variant="caption" color="success.main">준비됨</Typography></Stack><LinearProgress variant="determinate" value={Number(value)} color="success" sx={{ height: 7, borderRadius: 99 }} /></Box>)}
+              {readiness.map((item) => <Box key={item.label}><Stack direction="row" justifyContent="space-between" sx={{ mb: .7 }}><Typography variant="body2" fontWeight={650}>{item.label}</Typography><Typography variant="caption" color={item.ready ? 'success.main' : 'warning.main'}>{item.detail}</Typography></Stack><LinearProgress variant="determinate" value={item.ready ? 100 : 35} color={item.ready ? 'success' : 'warning'} sx={{ height: 7, borderRadius: 99 }} /></Box>)}
             </Stack>
           </ContentCard>
         </Grid>

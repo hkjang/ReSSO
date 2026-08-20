@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"errors"
 	"net/http"
 	"slices"
 	"time"
@@ -12,13 +13,19 @@ import (
 )
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
-	session, _ := sessionFrom(r.Context())
-	roles, _ := s.store.RealmRolesForUser(r.Context(), session.User.ID)
+	principal, _ := principalFrom(r.Context())
+	user, err := s.store.UserByID(r.Context(), principal.UserID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	roles, _ := s.store.RealmRolesForUser(r.Context(), user.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user":        session.User,
-		"roles":       roles,
-		"csrf_token":  cookieValue(r, csrfCookieName),
-		"permissions": map[string]bool{"platform_admin": session.User.PlatformAdmin},
+		"user":       user,
+		"roles":      roles,
+		"csrf_token": cookieValue(r, csrfCookieName),
+		"permissions": map[string]bool{"platform_admin": principal.PlatformAdmin,
+			"realm_admin": principal.RealmAdmin, "admin": principal.PlatformAdmin || principal.RealmAdmin},
 	})
 }
 
@@ -38,6 +45,14 @@ func (s *Server) updateMyProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.store.UpdateProfile(r.Context(), principal.UserID, input)
 	if err != nil {
+		if errors.Is(err, store.ErrFederationReadOnly) {
+			writeError(w, r, http.StatusConflict, "federation_read_only", "READ_ONLY LDAP 계정은 원본 디렉터리에서 수정하세요.")
+			return
+		}
+		if errors.Is(err, store.ErrFederationOperation) {
+			writeError(w, r, http.StatusBadGateway, "ldap_update_failed", "LDAP 디렉터리에서 프로필을 변경하지 못했습니다.")
+			return
+		}
 		writeStoreError(w, r, err)
 		return
 	}
@@ -55,6 +70,14 @@ func (s *Server) changeMyPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.ChangePassword(r.Context(), principal.UserID, input.CurrentPassword, input.NewPassword, false); err != nil {
+		if errors.Is(err, store.ErrFederationPasswordExternal) {
+			writeError(w, r, http.StatusConflict, "federation_password_external", "비밀번호는 원본 LDAP 디렉터리에서 변경하세요.")
+			return
+		}
+		if errors.Is(err, store.ErrFederationOperation) {
+			writeError(w, r, http.StatusBadGateway, "ldap_password_update_failed", "LDAP 디렉터리에서 비밀번호를 변경하지 못했습니다.")
+			return
+		}
 		writeError(w, r, http.StatusBadRequest, "password_change_failed", err.Error())
 		return
 	}
@@ -99,7 +122,7 @@ func (s *Server) revokeMySession(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "SESSION_REVOKE", "SUCCESS", "session", id.String(), nil)
 	if principal.SessionID != nil && *principal.SessionID == id {
-		clearBrowserCookies(w, r)
+		s.clearBrowserCookies(w, r)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -140,7 +163,7 @@ func (s *Server) createMyAPIKey(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	if !validAPIKeyScopes(input.Scopes, principal.PlatformAdmin) || input.ExpiresDays < 1 || input.ExpiresDays > 365 {
+	if !validAPIKeyScopes(input.Scopes, principal.PlatformAdmin || principal.RealmAdmin) || input.ExpiresDays < 1 || input.ExpiresDays > 365 {
 		writeError(w, r, http.StatusBadRequest, "invalid_api_key", "권한 범위 또는 만료 기간(1~365일)이 올바르지 않습니다.")
 		return
 	}
@@ -279,7 +302,7 @@ func (s *Server) decideMyReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request, err := s.store.DecideApprovalRequest(r.Context(), requestID, principal.UserID,
-		principal.PlatformAdmin, input.Decision == "approve", input.Note)
+		principal.PlatformAdmin, false, uuid.Nil, input.Decision == "approve", input.Note)
 	if err != nil {
 		writeError(w, r, http.StatusForbidden, "decision_failed", err.Error())
 		return

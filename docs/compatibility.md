@@ -17,17 +17,25 @@
 | Keycloak `realm_access` / `resource_access` Claim | 구현 |
 | Keycloak URL 구조 | 핵심 OIDC Endpoint 구현 |
 | SSO Browser Session | PostgreSQL 기반 구현 |
+| LDAP/AD User Federation | Simple Bind, LDAPS/StartTLS, JIT·전체·주기 동기화 구현 |
+| LDAP 속성 및 Group→Role 매핑 | 직접 `memberOf` 매핑 구현 |
+| OIDC CORS | Client별 정확한 Web Origin 허용 |
+| Realm/Client Role 관리 | 관리자 할당·회수 및 Claim 반영 구현 |
+| Realm 관리자 위임 | `realm-admin` Role의 Realm 범위 관리 구현 |
 
 ## 아직 구현하지 않음
 
 - Dynamic Client Registration
 - Device Authorization, CIBA, Token Exchange
-- SAML, LDAP/AD Federation, Kerberos
+- SAML, Kerberos/SPNEGO
 - 외부 OIDC/SAML Identity Broker
 - TOTP/WebAuthn/Passkey MFA
 - Front-channel / Back-channel Logout 알림 전송
 - Keycloak Admin REST API wire compatibility
 - Keycloak Theme 또는 전체 Admin Console 호환
+- LDAP Changed Users Sync, 중첩 Group 탐색, LDAP Connection Pool
+
+Claim은 Scope에 따라 최소화됩니다. `profile`은 이름·사용자명, `email`은 이메일과 검증 상태, `roles`는 `realm_access`와 `resource_access`를 제공합니다. v0.2.0 Migration은 기존 Client에 `roles` 기본 Scope를 추가해 이전 동작을 유지합니다.
 
 ReSSO의 목표는 Keycloak 전체 복제가 아니라 issuer 변경만으로 일반 OIDC Client가 연동되는 핵심 L3~L4 호환 서버입니다. 기존 애플리케이션이 Keycloak Admin API, SAML 또는 고유 SPI를 사용한다면 별도의 Migration 분석이 필요합니다.
 

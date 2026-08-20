@@ -63,6 +63,7 @@ func (s *Store) PruneOperationalData(ctx context.Context) error {
 		"DELETE FROM authorization_requests WHERE expires_at < now() - interval '1 day'",
 		"DELETE FROM authorization_codes WHERE expires_at < now() - interval '1 day'",
 		"DELETE FROM revoked_access_tokens WHERE expires_at < now()",
+		"DELETE FROM login_rate_limits WHERE updated_at < now() - interval '1 day'",
 		"DELETE FROM sso_sessions WHERE expires_at < now() - interval '30 days'",
 	}
 	for _, statement := range statements {

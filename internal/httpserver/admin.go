@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,27 +16,45 @@ func (s *Server) adminRoutes(r chi.Router) {
 	r.Get("/dashboard", s.adminDashboard)
 	r.Get("/quick-search", s.adminQuickSearch)
 	r.Get("/realms", s.adminListRealms)
-	r.Post("/realms", s.adminCreateRealm)
-	r.Get("/realms/{realmID}", s.adminGetRealm)
-	r.Put("/realms/{realmID}", s.adminUpdateRealm)
-	r.Get("/realms/{realmID}/users", s.adminListUsers)
-	r.Post("/realms/{realmID}/users", s.adminCreateUser)
-	r.Put("/realms/{realmID}/users/{userID}", s.adminUpdateUser)
-	r.Put("/realms/{realmID}/users/{userID}/password", s.adminResetPassword)
-	r.Get("/realms/{realmID}/clients", s.adminListClients)
-	r.Post("/realms/{realmID}/clients", s.adminCreateClient)
-	r.Put("/realms/{realmID}/clients/{clientID}", s.adminUpdateClient)
-	r.Post("/realms/{realmID}/clients/{clientID}/rotate-secret", s.adminRotateClientSecret)
-	r.Get("/realms/{realmID}/roles", s.adminListRoles)
-	r.Post("/realms/{realmID}/roles", s.adminCreateRole)
-	r.Get("/realms/{realmID}/sessions", s.adminListRealmSessions)
-	r.Delete("/realms/{realmID}/sessions/{sessionID}", s.adminRevokeSession)
-	r.Get("/realms/{realmID}/keys", s.adminListKeys)
-	r.Post("/realms/{realmID}/keys/rotate", s.adminRotateKey)
+	r.With(s.requirePlatformAdmin).Post("/realms", s.adminCreateRealm)
+	r.Route("/realms/{realmID}", func(r chi.Router) {
+		r.Use(s.requireRealmAccess)
+		r.Get("/", s.adminGetRealm)
+		r.Put("/", s.adminUpdateRealm)
+		r.Get("/users", s.adminListUsers)
+		r.Post("/users", s.adminCreateUser)
+		r.Put("/users/{userID}", s.adminUpdateUser)
+		r.Put("/users/{userID}/password", s.adminResetPassword)
+		r.Get("/users/{userID}/role-mappings", s.adminGetUserRoleMappings)
+		r.Put("/users/{userID}/role-mappings", s.adminReplaceUserRoleMappings)
+		r.Get("/user-federations", s.adminListLDAPFederations)
+		r.Post("/user-federations", s.adminCreateLDAPFederation)
+		r.Get("/user-federations/{federationID}", s.adminGetLDAPFederation)
+		r.Put("/user-federations/{federationID}", s.adminUpdateLDAPFederation)
+		r.Delete("/user-federations/{federationID}", s.adminDeleteLDAPFederation)
+		r.Post("/user-federations/{federationID}/test-connection", s.adminTestLDAPConnection)
+		r.Post("/user-federations/{federationID}/test-authentication", s.adminTestLDAPAuthentication)
+		r.Post("/user-federations/{federationID}/sync", s.adminSyncLDAPFederation)
+		r.Get("/clients", s.adminListClients)
+		r.Post("/clients", s.adminCreateClient)
+		r.Put("/clients/{clientID}", s.adminUpdateClient)
+		r.Post("/clients/{clientID}/rotate-secret", s.adminRotateClientSecret)
+		r.Get("/clients/{clientID}/roles", s.adminListClientRoles)
+		r.Post("/clients/{clientID}/roles", s.adminCreateClientRole)
+		r.Delete("/clients/{clientID}/roles/{roleID}", s.adminDeleteClientRole)
+		r.Get("/roles", s.adminListRoles)
+		r.Post("/roles", s.adminCreateRole)
+		r.Put("/roles/{roleID}", s.adminUpdateRole)
+		r.Delete("/roles/{roleID}", s.adminDeleteRole)
+		r.Get("/sessions", s.adminListRealmSessions)
+		r.Delete("/sessions/{sessionID}", s.adminRevokeSession)
+		r.Get("/keys", s.adminListKeys)
+		r.Post("/keys/rotate", s.adminRotateKey)
+	})
 	r.Get("/approvals", s.adminListApprovals)
 	r.Post("/approvals/{requestID}/decision", s.adminDecideApproval)
 	r.Get("/audit", s.adminListAudit)
-	r.Get("/system-logs", s.adminListSystemLogs)
+	r.With(s.requirePlatformAdmin).Get("/system-logs", s.adminListSystemLogs)
 }
 
 func parseUUIDParam(w http.ResponseWriter, r *http.Request, name string) (uuid.UUID, bool) {
@@ -56,26 +75,67 @@ func queryInt(r *http.Request, name string, fallback int) int {
 }
 
 func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
+	principal, _ := principalFrom(r.Context())
+	var realmID *uuid.UUID
+	if !principal.PlatformAdmin {
+		realmID = &principal.RealmID
+	}
 	var counts struct {
 		Realms, Users, Clients, ActiveSessions, PendingApprovals int
 	}
 	err := s.store.Pool.QueryRow(r.Context(), `SELECT
-        (SELECT count(*) FROM realms),
-        (SELECT count(*) FROM users),
-        (SELECT count(*) FROM clients),
-        (SELECT count(*) FROM sso_sessions WHERE revoked_at IS NULL AND expires_at>now()),
-        (SELECT count(*) FROM approval_requests WHERE status='PENDING')`).Scan(&counts.Realms, &counts.Users,
+		(SELECT count(*) FROM realms WHERE ($1::uuid IS NULL OR id=$1)),
+		(SELECT count(*) FROM users WHERE ($1::uuid IS NULL OR realm_id=$1)),
+		(SELECT count(*) FROM clients WHERE ($1::uuid IS NULL OR realm_id=$1)),
+		(SELECT count(*) FROM sso_sessions WHERE revoked_at IS NULL AND expires_at>now()
+		    AND ($1::uuid IS NULL OR realm_id=$1)),
+		(SELECT count(*) FROM approval_requests WHERE status='PENDING'
+		    AND ($1::uuid IS NULL OR realm_id=$1))`, realmID).Scan(&counts.Realms, &counts.Users,
 		&counts.Clients, &counts.ActiveSessions, &counts.PendingApprovals)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
+	var readiness struct {
+		IssuerHTTPS, SigningKeysReady                    bool
+		FederationFailures, LockedUsers, ExpiringAPIKeys int
+	}
+	err = s.store.Pool.QueryRow(r.Context(), `SELECT
+		NOT EXISTS(SELECT 1 FROM realms WHERE enabled=true AND ($1::uuid IS NULL OR id=$1)
+		    AND issuer_url NOT LIKE 'https://%'),
+		NOT EXISTS(SELECT 1 FROM realms r WHERE r.enabled=true AND ($1::uuid IS NULL OR r.id=$1)
+		    AND NOT EXISTS(SELECT 1 FROM signing_keys k WHERE k.realm_id=r.id AND k.status='ACTIVE')),
+		(SELECT count(*) FROM user_federations WHERE enabled=true AND last_sync_status='FAILURE'
+		    AND ($1::uuid IS NULL OR realm_id=$1)),
+		(SELECT count(*) FROM users WHERE locked_until>now() AND ($1::uuid IS NULL OR realm_id=$1)),
+		(SELECT count(*) FROM personal_api_keys k JOIN users u ON u.id=k.user_id
+		    WHERE k.revoked_at IS NULL AND k.expires_at BETWEEN now() AND now()+interval '7 days'
+		    AND ($1::uuid IS NULL OR u.realm_id=$1))`, realmID).Scan(&readiness.IssuerHTTPS,
+		&readiness.SigningKeysReady, &readiness.FederationFailures, &readiness.LockedUsers, &readiness.ExpiringAPIKeys)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"realms": counts.Realms, "users": counts.Users,
-		"clients": counts.Clients, "active_sessions": counts.ActiveSessions, "pending_approvals": counts.PendingApprovals})
+		"clients": counts.Clients, "active_sessions": counts.ActiveSessions, "pending_approvals": counts.PendingApprovals,
+		"readiness": map[string]any{"issuer_https": readiness.IssuerHTTPS, "signing_keys_ready": readiness.SigningKeysReady,
+			"federation_failures": readiness.FederationFailures, "locked_users": readiness.LockedUsers,
+			"expiring_api_keys": readiness.ExpiringAPIKeys}})
 }
 
 func (s *Server) adminListRealms(w http.ResponseWriter, r *http.Request) {
-	items, err := s.store.ListRealms(r.Context())
+	principal, _ := principalFrom(r.Context())
+	var items any
+	var err error
+	if principal.PlatformAdmin {
+		items, err = s.store.ListRealms(r.Context())
+	} else {
+		var realm any
+		realm, err = s.store.RealmByID(r.Context(), principal.RealmID)
+		if err == nil {
+			items = []any{realm}
+		}
+	}
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
@@ -140,12 +200,18 @@ func (s *Server) adminListUsers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	items, err := s.store.ListUsers(r.Context(), realmID, r.URL.Query().Get("q"), queryInt(r, "limit", 100), queryInt(r, "offset", 0))
+	query := r.URL.Query().Get("q")
+	items, err := s.store.ListUsers(r.Context(), realmID, query, queryInt(r, "limit", 100), queryInt(r, "offset", 0))
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	total, err := s.store.CountUsers(r.Context(), realmID, query)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": total})
 }
 
 func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -176,16 +242,33 @@ func (s *Server) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	current, err := s.store.UserByID(r.Context(), userID)
+	if err != nil || current.RealmID != realmID {
+		writeStoreError(w, r, store.ErrNotFound)
+		return
+	}
+	principal, _ := principalFrom(r.Context())
+	if current.PlatformAdmin && !principal.PlatformAdmin {
+		writeError(w, r, http.StatusForbidden, "insufficient_permission", "플랫폼 관리자 계정은 플랫폼 관리자만 변경할 수 있습니다.")
+		return
+	}
 	var input store.UpdateUserInput
 	if !decodeJSON(w, r, &input) {
 		return
 	}
 	user, err := s.store.UpdateUser(r.Context(), userID, input)
+	if errors.Is(err, store.ErrFederationReadOnly) {
+		writeError(w, r, http.StatusConflict, "federation_read_only", "READ_ONLY LDAP 계정은 원본 디렉터리에서 수정하세요.")
+		return
+	}
+	if errors.Is(err, store.ErrFederationOperation) {
+		writeError(w, r, http.StatusBadGateway, "ldap_update_failed", "LDAP 디렉터리에서 사용자 정보를 변경하지 못했습니다.")
+		return
+	}
 	if err != nil || user.RealmID != realmID {
 		writeStoreError(w, r, err)
 		return
 	}
-	principal, _ := principalFrom(r.Context())
 	s.audit(r, &realmID, &principal.UserID, principal.Username, "USER_UPDATE", "SUCCESS", "user", user.ID.String(), map[string]any{"enabled": user.Enabled})
 	writeJSON(w, http.StatusOK, user)
 }
@@ -204,6 +287,11 @@ func (s *Server) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, "not_found", "사용자를 찾을 수 없습니다.")
 		return
 	}
+	principal, _ := principalFrom(r.Context())
+	if user.PlatformAdmin && !principal.PlatformAdmin {
+		writeError(w, r, http.StatusForbidden, "insufficient_permission", "플랫폼 관리자 계정은 플랫폼 관리자만 변경할 수 있습니다.")
+		return
+	}
 	var input struct {
 		NewPassword string `json:"new_password"`
 	}
@@ -211,11 +299,18 @@ func (s *Server) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.ChangePassword(r.Context(), userID, "", input.NewPassword, true); err != nil {
+		if errors.Is(err, store.ErrFederationPasswordExternal) {
+			writeError(w, r, http.StatusConflict, "federation_password_external", "이 계정의 비밀번호는 원본 LDAP 디렉터리에서 변경하세요.")
+			return
+		}
+		if errors.Is(err, store.ErrFederationOperation) {
+			writeError(w, r, http.StatusBadGateway, "ldap_password_update_failed", "LDAP 디렉터리에서 비밀번호를 변경하지 못했습니다.")
+			return
+		}
 		writeError(w, r, http.StatusBadRequest, "password_reset_failed", err.Error())
 		return
 	}
 	_ = s.store.RevokeAllUserSessions(r.Context(), userID, nil)
-	principal, _ := principalFrom(r.Context())
 	s.audit(r, &realmID, &principal.UserID, principal.Username, "PASSWORD_RESET", "SUCCESS", "user", userID.String(), nil)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -259,6 +354,11 @@ func (s *Server) adminUpdateClient(w http.ResponseWriter, r *http.Request) {
 	}
 	clientID, ok := parseUUIDParam(w, r, "clientID")
 	if !ok {
+		return
+	}
+	current, err := s.store.ClientByID(r.Context(), clientID)
+	if err != nil || current.RealmID != realmID {
+		writeError(w, r, http.StatusNotFound, "not_found", "Client를 찾을 수 없습니다.")
 		return
 	}
 	var input store.UpdateClientInput
@@ -337,6 +437,172 @@ func (s *Server) adminCreateRole(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, role)
 }
 
+func (s *Server) adminUpdateRole(w http.ResponseWriter, r *http.Request) {
+	realmID, ok := parseUUIDParam(w, r, "realmID")
+	if !ok {
+		return
+	}
+	roleID, ok := parseUUIDParam(w, r, "roleID")
+	if !ok {
+		return
+	}
+	var input struct {
+		Description string `json:"description"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	role, err := s.store.UpdateRole(r.Context(), realmID, roleID, input.Description)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	principal, _ := principalFrom(r.Context())
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "ROLE_UPDATE", "SUCCESS", "role", role.ID.String(), nil)
+	writeJSON(w, http.StatusOK, role)
+}
+
+func (s *Server) adminDeleteRole(w http.ResponseWriter, r *http.Request) {
+	realmID, ok := parseUUIDParam(w, r, "realmID")
+	if !ok {
+		return
+	}
+	roleID, ok := parseUUIDParam(w, r, "roleID")
+	if !ok {
+		return
+	}
+	if err := s.store.DeleteRole(r.Context(), realmID, roleID); err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	principal, _ := principalFrom(r.Context())
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "ROLE_DELETE", "SUCCESS", "role", roleID.String(), nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) adminListClientRoles(w http.ResponseWriter, r *http.Request) {
+	realmID, ok := parseUUIDParam(w, r, "realmID")
+	if !ok {
+		return
+	}
+	clientID, ok := parseUUIDParam(w, r, "clientID")
+	if !ok {
+		return
+	}
+	client, err := s.store.ClientByID(r.Context(), clientID)
+	if err != nil || client.RealmID != realmID {
+		writeStoreError(w, r, store.ErrNotFound)
+		return
+	}
+	items, err := s.store.ListClientRoles(r.Context(), realmID, clientID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) adminCreateClientRole(w http.ResponseWriter, r *http.Request) {
+	realmID, ok := parseUUIDParam(w, r, "realmID")
+	if !ok {
+		return
+	}
+	clientID, ok := parseUUIDParam(w, r, "clientID")
+	if !ok {
+		return
+	}
+	var input struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	role, err := s.store.CreateClientRole(r.Context(), realmID, clientID, input.Name, input.Description)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "client_role_creation_failed", err.Error())
+		return
+	}
+	principal, _ := principalFrom(r.Context())
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "CLIENT_ROLE_CREATE", "SUCCESS", "client_role", role.ID.String(), nil)
+	writeJSON(w, http.StatusCreated, role)
+}
+
+func (s *Server) adminDeleteClientRole(w http.ResponseWriter, r *http.Request) {
+	realmID, ok := parseUUIDParam(w, r, "realmID")
+	if !ok {
+		return
+	}
+	clientID, ok := parseUUIDParam(w, r, "clientID")
+	if !ok {
+		return
+	}
+	roleID, ok := parseUUIDParam(w, r, "roleID")
+	if !ok {
+		return
+	}
+	if err := s.store.DeleteClientRole(r.Context(), realmID, clientID, roleID); err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	principal, _ := principalFrom(r.Context())
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "CLIENT_ROLE_DELETE", "SUCCESS", "client_role", roleID.String(), nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) adminGetUserRoleMappings(w http.ResponseWriter, r *http.Request) {
+	realmID, ok := parseUUIDParam(w, r, "realmID")
+	if !ok {
+		return
+	}
+	userID, ok := parseUUIDParam(w, r, "userID")
+	if !ok {
+		return
+	}
+	mappings, err := s.store.GetUserRoleMappings(r.Context(), realmID, userID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, mappings)
+}
+
+func (s *Server) adminReplaceUserRoleMappings(w http.ResponseWriter, r *http.Request) {
+	realmID, ok := parseUUIDParam(w, r, "realmID")
+	if !ok {
+		return
+	}
+	userID, ok := parseUUIDParam(w, r, "userID")
+	if !ok {
+		return
+	}
+	target, err := s.store.UserByID(r.Context(), userID)
+	if err != nil || target.RealmID != realmID {
+		writeStoreError(w, r, store.ErrNotFound)
+		return
+	}
+	principal, _ := principalFrom(r.Context())
+	if target.PlatformAdmin && !principal.PlatformAdmin {
+		writeError(w, r, http.StatusForbidden, "insufficient_permission", "플랫폼 관리자 계정은 플랫폼 관리자만 변경할 수 있습니다.")
+		return
+	}
+	var input struct {
+		RealmRoleIDs  []uuid.UUID `json:"realm_role_ids"`
+		ClientRoleIDs []uuid.UUID `json:"client_role_ids"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	mappings, err := s.store.ReplaceUserRoleMappings(r.Context(), realmID, userID, input.RealmRoleIDs, input.ClientRoleIDs)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "role_mapping_failed", err.Error())
+		return
+	}
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "USER_ROLE_MAPPING_UPDATE", "SUCCESS", "user", userID.String(),
+		map[string]any{"realm_roles": len(mappings.RealmRoleIDs), "client_roles": len(mappings.ClientRoleIDs)})
+	writeJSON(w, http.StatusOK, mappings)
+}
+
 func (s *Server) adminListRealmSessions(w http.ResponseWriter, r *http.Request) {
 	realmID, ok := parseUUIDParam(w, r, "realmID")
 	if !ok {
@@ -359,11 +625,22 @@ func (s *Server) adminRevokeSession(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	var sessionRealmID uuid.UUID
+	var targetPlatformAdmin bool
+	if err := s.store.Pool.QueryRow(r.Context(), `SELECT s.realm_id,u.platform_admin FROM sso_sessions s
+		JOIN users u ON u.id=s.user_id WHERE s.id=$1`, sessionID).Scan(&sessionRealmID, &targetPlatformAdmin); err != nil || sessionRealmID != realmID {
+		writeError(w, r, http.StatusNotFound, "not_found", "세션을 찾을 수 없습니다.")
+		return
+	}
+	principal, _ := principalFrom(r.Context())
+	if targetPlatformAdmin && !principal.PlatformAdmin {
+		writeError(w, r, http.StatusForbidden, "insufficient_permission", "플랫폼 관리자 세션은 플랫폼 관리자만 종료할 수 있습니다.")
+		return
+	}
 	if err := s.store.RevokeSession(r.Context(), sessionID); err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
-	principal, _ := principalFrom(r.Context())
 	s.audit(r, &realmID, &principal.UserID, principal.Username, "ADMIN_FORCE_LOGOUT", "SUCCESS", "session", sessionID.String(), nil)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -398,7 +675,10 @@ func (s *Server) adminRotateKey(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adminListApprovals(w http.ResponseWriter, r *http.Request) {
 	var realmID *uuid.UUID
-	if raw := r.URL.Query().Get("realm_id"); raw != "" {
+	principal, _ := principalFrom(r.Context())
+	if !principal.PlatformAdmin {
+		realmID = &principal.RealmID
+	} else if raw := r.URL.Query().Get("realm_id"); raw != "" {
 		parsed, err := uuid.Parse(raw)
 		if err != nil {
 			writeError(w, r, http.StatusBadRequest, "invalid_id", "Realm ID가 올바르지 않습니다.")
@@ -431,7 +711,8 @@ func (s *Server) adminDecideApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	principal, _ := principalFrom(r.Context())
-	request, err := s.store.DecideApprovalRequest(r.Context(), requestID, principal.UserID, true, input.Decision == "approve", input.Note)
+	request, err := s.store.DecideApprovalRequest(r.Context(), requestID, principal.UserID,
+		principal.PlatformAdmin, principal.RealmAdmin, principal.RealmID, input.Decision == "approve", input.Note)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
@@ -442,7 +723,10 @@ func (s *Server) adminDecideApproval(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adminListAudit(w http.ResponseWriter, r *http.Request) {
 	var realmID *uuid.UUID
-	if raw := r.URL.Query().Get("realm_id"); raw != "" {
+	principal, _ := principalFrom(r.Context())
+	if !principal.PlatformAdmin {
+		realmID = &principal.RealmID
+	} else if raw := r.URL.Query().Get("realm_id"); raw != "" {
 		parsed, err := uuid.Parse(raw)
 		if err != nil {
 			writeError(w, r, http.StatusBadRequest, "invalid_id", "Realm ID가 올바르지 않습니다.")
@@ -474,17 +758,25 @@ func (s *Server) adminQuickSearch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"items": []any{}})
 		return
 	}
+	principal, _ := principalFrom(r.Context())
+	var realmID *uuid.UUID
+	if !principal.PlatformAdmin {
+		realmID = &principal.RealmID
+	}
 	rows, err := s.store.Pool.Query(r.Context(), `
-        SELECT kind,id,label,description,path FROM (
-          SELECT 'realm' kind,id::text,name label,display_name description,'/admin/realms/'||id::text path
-          FROM realms WHERE name ILIKE '%'||$1||'%' OR display_name ILIKE '%'||$1||'%'
-          UNION ALL
-          SELECT 'user',u.id::text,u.username,u.email,'/admin/realms/'||u.realm_id::text||'/users'
-          FROM users u WHERE u.username ILIKE '%'||$1||'%' OR u.email ILIKE '%'||$1||'%'
-          UNION ALL
-          SELECT 'client',c.id::text,c.client_id,c.name,'/admin/realms/'||c.realm_id::text||'/clients'
-          FROM clients c WHERE c.client_id ILIKE '%'||$1||'%' OR c.name ILIKE '%'||$1||'%'
-        ) results LIMIT 20`, query)
+		SELECT kind,id,label,description,path FROM (
+		  SELECT 'realm' kind,id::text,name label,display_name description,'/admin/realms/'||id::text path
+		  FROM realms WHERE ($2::uuid IS NULL OR id=$2) AND (name ILIKE '%'||$1||'%' OR display_name ILIKE '%'||$1||'%')
+		  UNION ALL
+		  SELECT 'user',u.id::text,u.username,u.email,'/admin/realms/'||u.realm_id::text||'/users'
+		  FROM users u WHERE ($2::uuid IS NULL OR u.realm_id=$2) AND (u.username ILIKE '%'||$1||'%' OR u.email ILIKE '%'||$1||'%')
+		  UNION ALL
+		  SELECT 'client',c.id::text,c.client_id,c.name,'/admin/realms/'||c.realm_id::text||'/clients'
+		  FROM clients c WHERE ($2::uuid IS NULL OR c.realm_id=$2) AND (c.client_id ILIKE '%'||$1||'%' OR c.name ILIKE '%'||$1||'%')
+		  UNION ALL
+		  SELECT 'federation',f.id::text,f.name,f.connection_url,'/admin/user-federation'
+		  FROM user_federations f WHERE ($2::uuid IS NULL OR f.realm_id=$2) AND (f.name ILIKE '%'||$1||'%' OR f.connection_url ILIKE '%'||$1||'%')
+		) results LIMIT 20`, query, realmID)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return

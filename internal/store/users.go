@@ -14,13 +14,15 @@ import (
 	"github.com/hkjang/ReSSO/internal/password"
 )
 
-const userColumns = `id,realm_id,username,email,display_name,enabled,platform_admin,manager_id,
-    failed_attempts,locked_until,password_changed_at,created_at,updated_at`
+const userColumns = `id,realm_id,username,email,email_verified,display_name,enabled,platform_admin,manager_id,
+    federation_id,external_id,external_dn,federation_synced_at,failed_attempts,locked_until,
+    password_changed_at,created_at,updated_at`
 
 func scanUser(row pgx.Row) (domain.User, error) {
 	var user domain.User
-	err := row.Scan(&user.ID, &user.RealmID, &user.Username, &user.Email, &user.DisplayName, &user.Enabled,
-		&user.PlatformAdmin, &user.ManagerID, &user.FailedAttempts, &user.LockedUntil,
+	err := row.Scan(&user.ID, &user.RealmID, &user.Username, &user.Email, &user.EmailVerified, &user.DisplayName, &user.Enabled,
+		&user.PlatformAdmin, &user.ManagerID, &user.FederationID, &user.ExternalID, &user.ExternalDN,
+		&user.FederationSyncedAt, &user.FailedAttempts, &user.LockedUntil,
 		&user.PasswordChanged, &user.CreatedAt, &user.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.User{}, ErrNotFound
@@ -55,6 +57,15 @@ func (s *Store) ListUsers(ctx context.Context, realmID uuid.UUID, query string, 
 	return users, rows.Err()
 }
 
+func (s *Store) CountUsers(ctx context.Context, realmID uuid.UUID, query string) (int, error) {
+	pattern := "%" + strings.ToLower(strings.TrimSpace(query)) + "%"
+	var total int
+	err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE realm_id=$1 AND
+		($2='' OR lower(username) LIKE $3 OR lower(email) LIKE $3 OR lower(display_name) LIKE $3)`,
+		realmID, strings.TrimSpace(query), pattern).Scan(&total)
+	return total, err
+}
+
 type CreateUserInput struct {
 	Username    string     `json:"username"`
 	Email       string     `json:"email"`
@@ -77,9 +88,6 @@ func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateU
 	}
 	if len([]rune(input.Password)) < minLength {
 		return domain.User{}, fmt.Errorf("password must contain at least %d characters", minLength)
-	}
-	if input.Email == "" {
-		input.Email = input.Username + "@localhost"
 	}
 	if input.DisplayName == "" {
 		input.DisplayName = input.Username
@@ -116,9 +124,20 @@ type UpdateUserInput struct {
 }
 
 func (s *Store) UpdateUser(ctx context.Context, userID uuid.UUID, input UpdateUserInput) (domain.User, error) {
-	command, err := s.Pool.Exec(ctx, `UPDATE users SET email=$2,display_name=$3,enabled=$4,
-        manager_id=$5,updated_at=now() WHERE id=$1`, userID, strings.TrimSpace(strings.ToLower(input.Email)),
-		strings.TrimSpace(input.DisplayName), input.Enabled, input.ManagerID)
+	current, err := s.UserByID(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	email := strings.TrimSpace(strings.ToLower(input.Email))
+	displayName := strings.TrimSpace(input.DisplayName)
+	if current.Email != email || current.DisplayName != displayName {
+		if err := s.updateFederatedAttributes(ctx, current, email, displayName); err != nil {
+			return domain.User{}, err
+		}
+	}
+	command, err := s.Pool.Exec(ctx, `UPDATE users SET email_verified=CASE WHEN email<>$2 THEN false ELSE email_verified END,
+		email=$2,display_name=$3,enabled=$4,
+		manager_id=$5,updated_at=now() WHERE id=$1`, userID, email, displayName, input.Enabled, input.ManagerID)
 	if err != nil {
 		return domain.User{}, fmt.Errorf("update user: %w", err)
 	}
@@ -129,8 +148,18 @@ func (s *Store) UpdateUser(ctx context.Context, userID uuid.UUID, input UpdateUs
 }
 
 func (s *Store) UpdateProfile(ctx context.Context, userID uuid.UUID, input UpdateProfileInput) (domain.User, error) {
-	_, err := s.Pool.Exec(ctx, `UPDATE users SET email=$2,display_name=$3,updated_at=now() WHERE id=$1`,
-		userID, strings.TrimSpace(strings.ToLower(input.Email)), strings.TrimSpace(input.DisplayName))
+	current, err := s.UserByID(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	email := strings.TrimSpace(strings.ToLower(input.Email))
+	displayName := strings.TrimSpace(input.DisplayName)
+	if err := s.updateFederatedAttributes(ctx, current, email, displayName); err != nil {
+		return domain.User{}, err
+	}
+	_, err = s.Pool.Exec(ctx, `UPDATE users SET email_verified=CASE WHEN email<>$2 THEN false ELSE email_verified END,
+		email=$2,display_name=$3,updated_at=now() WHERE id=$1`,
+		userID, email, displayName)
 	if err != nil {
 		return domain.User{}, fmt.Errorf("update profile: %w", err)
 	}
@@ -138,12 +167,16 @@ func (s *Store) UpdateProfile(ctx context.Context, userID uuid.UUID, input Updat
 }
 
 func (s *Store) ChangePassword(ctx context.Context, userID uuid.UUID, current, replacement string, adminReset bool) error {
+	user, err := s.UserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
 	var hash string
 	var realmID uuid.UUID
 	if err := s.Pool.QueryRow(ctx, "SELECT password_hash,realm_id FROM users WHERE id=$1", userID).Scan(&hash, &realmID); err != nil {
 		return err
 	}
-	if !adminReset {
+	if !adminReset && user.FederationID == nil {
 		ok, err := password.Verify(current, hash)
 		if err != nil || !ok {
 			return errors.New("current password is incorrect")
@@ -155,6 +188,14 @@ func (s *Store) ChangePassword(ctx context.Context, userID uuid.UUID, current, r
 	}
 	if len([]rune(replacement)) < minLength {
 		return fmt.Errorf("new password must contain at least %d characters", minLength)
+	}
+	if user.FederationID != nil {
+		if err := s.changeFederatedPassword(ctx, user, current, replacement); err != nil {
+			return err
+		}
+		_, err := s.Pool.Exec(ctx, `UPDATE users SET password_changed_at=now(),failed_attempts=0,
+            locked_until=NULL,updated_at=now() WHERE id=$1`, userID)
+		return err
 	}
 	newHash, err := password.Hash(replacement)
 	if err != nil {
@@ -170,6 +211,7 @@ type AuthenticationResult struct {
 	Success        bool
 	FailureReason  string
 	SessionSeconds int
+	AuthMethod     string
 }
 
 func (s *Store) AuthenticatePassword(ctx context.Context, realm domain.Realm, username, suppliedPassword string) (AuthenticationResult, error) {
@@ -181,11 +223,11 @@ func (s *Store) AuthenticatePassword(ctx context.Context, realm domain.Realm, us
 	var user domain.User
 	var passwordHash string
 	var maxAttempts, lockoutSeconds int
-	err = tx.QueryRow(ctx, `SELECT u.id,u.realm_id,u.username,u.email,u.display_name,u.enabled,u.platform_admin,
+	err = tx.QueryRow(ctx, `SELECT u.id,u.realm_id,u.username,u.email,u.email_verified,u.display_name,u.enabled,u.platform_admin,
         u.manager_id,u.failed_attempts,u.locked_until,u.password_changed_at,u.created_at,u.updated_at,u.password_hash,
         r.max_login_attempts,r.lockout_seconds FROM users u JOIN realms r ON r.id=u.realm_id
         WHERE u.realm_id=$1 AND lower(u.username)=lower($2) FOR UPDATE`, realm.ID, strings.TrimSpace(username)).Scan(
-		&user.ID, &user.RealmID, &user.Username, &user.Email, &user.DisplayName, &user.Enabled, &user.PlatformAdmin,
+		&user.ID, &user.RealmID, &user.Username, &user.Email, &user.EmailVerified, &user.DisplayName, &user.Enabled, &user.PlatformAdmin,
 		&user.ManagerID, &user.FailedAttempts, &user.LockedUntil, &user.PasswordChanged, &user.CreatedAt, &user.UpdatedAt,
 		&passwordHash, &maxAttempts, &lockoutSeconds)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -272,4 +314,11 @@ func (s *Store) ClientRolesForUser(ctx context.Context, userID uuid.UUID) (map[s
 		result[client] = append(result[client], role)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) UserHasRealmRole(ctx context.Context, userID uuid.UUID, name string) (bool, error) {
+	var assigned bool
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_roles ur
+		JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1 AND r.name=$2)`, userID, name).Scan(&assigned)
+	return assigned, err
 }

@@ -30,3 +30,18 @@ func TestLoadRejectsShortPassword(t *testing.T) {
 		t.Fatal("Load() accepted a short bootstrap password")
 	}
 }
+
+func TestLoadTrustedProxyCIDRs(t *testing.T) {
+	t.Setenv(EnvPostgresDSN, "postgres://resso:test@db/resso")
+	t.Setenv(EnvBootstrapAdmin, "root-admin")
+	t.Setenv(EnvBootstrapAdminPass, "correct horse battery staple")
+	t.Setenv(EnvEncryptionKey, strings.Repeat("00", 32))
+	t.Setenv(EnvTrustedProxyCIDRs, "10.0.0.0/8, 2001:db8::/32")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.TrustedProxyCIDRs) != 2 {
+		t.Fatalf("trusted proxy networks = %d, want 2", len(cfg.TrustedProxyCIDRs))
+	}
+}

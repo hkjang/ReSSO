@@ -39,6 +39,7 @@ type keycloakClaims struct {
 	SessionState      string              `json:"session_state,omitempty"`
 	PreferredUsername string              `json:"preferred_username,omitempty"`
 	Email             string              `json:"email,omitempty"`
+	EmailVerified     *bool               `json:"email_verified,omitempty"`
 	Name              string              `json:"name,omitempty"`
 	Nonce             string              `json:"nonce,omitempty"`
 	RealmAccess       map[string][]string `json:"realm_access,omitempty"`
@@ -71,30 +72,45 @@ func (s *Service) IssueUserTokens(ctx context.Context, realm domain.Realm, clien
 		return TokenResponse{}, err
 	}
 	now := time.Now().UTC()
+	authTime, err := s.Store.SessionAuthTime(ctx, sessionID)
+	if err != nil {
+		return TokenResponse{}, err
+	}
 	ttl := client.AccessTokenTTLSeconds
 	if ttl <= 0 {
 		ttl = realm.AccessTokenTTLSeconds
-	}
-	roles, err := s.Store.RealmRolesForUser(ctx, user.ID)
-	if err != nil {
-		return TokenResponse{}, err
-	}
-	clientRoles, err := s.Store.ClientRolesForUser(ctx, user.ID)
-	if err != nil {
-		return TokenResponse{}, err
-	}
-	resources := make(map[string]any, len(clientRoles))
-	for clientID, assigned := range clientRoles {
-		resources[clientID] = map[string]any{"roles": assigned}
 	}
 	accessJTI := uuid.New()
 	accessStandard := jwt.Claims{Issuer: realm.IssuerURL, Subject: user.ID.String(), Audience: jwt.Audience{client.ClientID},
 		Expiry: jwt.NewNumericDate(now.Add(time.Duration(ttl) * time.Second)), IssuedAt: jwt.NewNumericDate(now),
 		NotBefore: jwt.NewNumericDate(now.Add(-5 * time.Second)), ID: accessJTI.String()}
 	extra := keycloakClaims{Type: "Bearer", AuthorizedParty: client.ClientID, Scope: strings.Join(scopes, " "),
-		AuthTime: now.Unix(), SessionID: sessionID.String(), SessionState: sessionID.String(),
-		PreferredUsername: user.Username, Email: user.Email, Name: user.DisplayName,
-		RealmAccess: map[string][]string{"roles": roles}, ResourceAccess: resources}
+		AuthTime: authTime.Unix(), SessionID: sessionID.String(), SessionState: sessionID.String()}
+	if containsScope(scopes, "profile") {
+		extra.PreferredUsername = user.Username
+		extra.Name = user.DisplayName
+	}
+	if containsScope(scopes, "email") {
+		extra.Email = user.Email
+		verified := user.EmailVerified
+		extra.EmailVerified = &verified
+	}
+	if containsScope(scopes, "roles") {
+		roles, roleErr := s.Store.RealmRolesForUser(ctx, user.ID)
+		if roleErr != nil {
+			return TokenResponse{}, roleErr
+		}
+		clientRoles, roleErr := s.Store.ClientRolesForUser(ctx, user.ID)
+		if roleErr != nil {
+			return TokenResponse{}, roleErr
+		}
+		resources := make(map[string]any, len(clientRoles))
+		for clientID, assigned := range clientRoles {
+			resources[clientID] = map[string]any{"roles": assigned}
+		}
+		extra.RealmAccess = map[string][]string{"roles": roles}
+		extra.ResourceAccess = resources
+	}
 	accessToken, err := signClaims(signer, accessStandard, extra)
 	if err != nil {
 		return TokenResponse{}, err

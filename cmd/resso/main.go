@@ -74,7 +74,7 @@ func main() {
 	logger.Info("ReSSO starting", "version", version.Version, "commit", version.Commit,
 		"listen", cfg.ListenAddress, "bootstrap_admin_created", bootstrap.Created)
 
-	app := httpserver.New(data, logger)
+	app := httpserver.New(data, logger, cfg.TrustedProxyCIDRs)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddress,
 		Handler:           app.Handler(),
@@ -89,6 +89,7 @@ func main() {
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go maintenance(runCtx, data, logger)
+	go federationMaintenance(runCtx, data, logger)
 	go func() {
 		<-runCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -104,6 +105,37 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("ReSSO stopped")
+}
+
+func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.Logger) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			claimCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			ids, err := data.ClaimDueLDAPFederations(claimCtx, 5)
+			cancel()
+			if err != nil {
+				logger.Warn("claim due LDAP federations failed", "error", err)
+				continue
+			}
+			for _, id := range ids {
+				syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Minute)
+				summary, syncErr := data.SyncLDAPFederation(syncCtx, id)
+				syncCancel()
+				if syncErr != nil {
+					logger.Error("scheduled LDAP federation sync failed", "federation_id", id,
+						"read", summary.Read, "failed", summary.Failed, "error", syncErr)
+					continue
+				}
+				logger.Info("scheduled LDAP federation sync completed", "federation_id", id,
+					"read", summary.Read, "added", summary.Added, "updated", summary.Updated, "disabled", summary.Disabled)
+			}
+		}
+	}
 }
 
 func maintenance(ctx context.Context, data *store.Store, logger *slog.Logger) {

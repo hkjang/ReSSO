@@ -41,9 +41,10 @@ func (s *Store) CreateSession(ctx context.Context, realmID, userID uuid.UUID, tt
 }
 
 type AuthenticatedSession struct {
-	Session  domain.Session
-	User     domain.User
-	CSRFHash []byte
+	Session    domain.Session
+	User       domain.User
+	CSRFHash   []byte
+	RealmAdmin bool
 }
 
 func (s *Store) SessionByToken(ctx context.Context, rawToken string) (AuthenticatedSession, error) {
@@ -53,16 +54,21 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 	var result AuthenticatedSession
 	err := s.Pool.QueryRow(ctx, `SELECT s.id,s.realm_id,s.user_id,u.username,s.ip_address,s.user_agent,s.auth_method,
         s.created_at,s.last_access,s.expires_at,s.revoked_at,s.csrf_hash,
-        u.id,u.realm_id,u.username,u.email,u.display_name,u.enabled,u.platform_admin,u.manager_id,
-        u.failed_attempts,u.locked_until,u.password_changed_at,u.created_at,u.updated_at
+		u.id,u.realm_id,u.username,u.email,u.email_verified,u.display_name,u.enabled,u.platform_admin,u.manager_id,
+		u.federation_id,u.external_id,u.external_dn,u.federation_synced_at,
+		u.failed_attempts,u.locked_until,u.password_changed_at,u.created_at,u.updated_at,
+		EXISTS(SELECT 1 FROM user_roles ur JOIN roles rr ON rr.id=ur.role_id
+		    WHERE ur.user_id=u.id AND rr.name='realm-admin')
         FROM sso_sessions s JOIN users u ON u.id=s.user_id
         WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now() AND u.enabled=true`, s.Sealer.Digest(rawToken)).Scan(
 		&result.Session.ID, &result.Session.RealmID, &result.Session.UserID, &result.Session.Username,
 		&result.Session.IPAddress, &result.Session.UserAgent, &result.Session.AuthMethod, &result.Session.CreatedAt,
 		&result.Session.LastAccess, &result.Session.ExpiresAt, &result.Session.RevokedAt, &result.CSRFHash,
-		&result.User.ID, &result.User.RealmID, &result.User.Username, &result.User.Email, &result.User.DisplayName,
-		&result.User.Enabled, &result.User.PlatformAdmin, &result.User.ManagerID, &result.User.FailedAttempts,
-		&result.User.LockedUntil, &result.User.PasswordChanged, &result.User.CreatedAt, &result.User.UpdatedAt)
+		&result.User.ID, &result.User.RealmID, &result.User.Username, &result.User.Email, &result.User.EmailVerified, &result.User.DisplayName,
+		&result.User.Enabled, &result.User.PlatformAdmin, &result.User.ManagerID, &result.User.FederationID,
+		&result.User.ExternalID, &result.User.ExternalDN, &result.User.FederationSyncedAt,
+		&result.User.FailedAttempts, &result.User.LockedUntil, &result.User.PasswordChanged,
+		&result.User.CreatedAt, &result.User.UpdatedAt, &result.RealmAdmin)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuthenticatedSession{}, ErrNotFound
 	}
@@ -73,6 +79,16 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 		_, _ = s.Pool.Exec(ctx, "UPDATE sso_sessions SET last_access=now() WHERE id=$1", result.Session.ID)
 	}
 	return result, nil
+}
+
+func (s *Store) SessionAuthTime(ctx context.Context, id uuid.UUID) (time.Time, error) {
+	var authTime time.Time
+	err := s.Pool.QueryRow(ctx, `SELECT created_at FROM sso_sessions
+		WHERE id=$1 AND revoked_at IS NULL AND expires_at>now()`, id).Scan(&authTime)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, ErrNotFound
+	}
+	return authTime, err
 }
 
 func (s *Store) ValidateCSRF(session AuthenticatedSession, csrf string) bool {

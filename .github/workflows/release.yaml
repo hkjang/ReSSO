@@ -11,6 +11,20 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: resso
+          POSTGRES_PASSWORD: integration-password
+          POSTGRES_DB: resso
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U resso -d resso"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,6 +47,24 @@ jobs:
       - name: Test frontend
         working-directory: web
         run: npm ci && npm run test && npm run build
+      - name: Integration smoke test
+        shell: bash
+        env:
+          POSTGRES_DSN: postgres://resso:integration-password@127.0.0.1:5432/resso?sslmode=disable
+          BOOTSTRAP_ADMIN: admin
+          BOOTSTRAP_ADMIN_PASSWORD: integration-password-123
+          ENCRYPTION_KEY: MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
+        run: |
+          go build -o /tmp/resso ./cmd/resso
+          /tmp/resso >/tmp/resso.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; cat /tmp/resso.log' EXIT
+          for attempt in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/health/ready >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/health/ready >/dev/null
+          bash ./scripts/smoke-test.sh http://127.0.0.1:8080 admin integration-password-123
       - name: Build offline image
         shell: bash
         run: |
@@ -53,7 +85,9 @@ jobs:
           archive="resso-${GITHUB_REF_NAME}.tar.gz"
           digest="$(cut -d' ' -f1 release-sha256.txt)"
           notes="$(printf 'Docker image: `%s`\n\nArchive: `%s`\n\nSHA-256: `%s`' "resso:${GITHUB_REF_NAME}" "$archive" "$digest")"
-          gh release create "${GITHUB_REF_NAME}" "$archive#ReSSO offline Docker image" \
+          gh release create "${GITHUB_REF_NAME}" \
+            "$archive#ReSSO offline Docker image" \
+            "release-sha256.txt#SHA-256 checksum" \
             --title "ReSSO ${GITHUB_REF_NAME}" \
             --generate-notes \
             --notes "$notes"

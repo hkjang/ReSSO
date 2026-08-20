@@ -22,19 +22,66 @@ type Realm struct {
 }
 
 type User struct {
-	ID              uuid.UUID  `json:"id"`
-	RealmID         uuid.UUID  `json:"realm_id"`
-	Username        string     `json:"username"`
-	Email           string     `json:"email"`
-	DisplayName     string     `json:"display_name"`
-	Enabled         bool       `json:"enabled"`
-	PlatformAdmin   bool       `json:"platform_admin"`
-	ManagerID       *uuid.UUID `json:"manager_id,omitempty"`
-	FailedAttempts  int        `json:"failed_attempts"`
-	LockedUntil     *time.Time `json:"locked_until,omitempty"`
-	PasswordChanged time.Time  `json:"password_changed_at"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	ID                 uuid.UUID  `json:"id"`
+	RealmID            uuid.UUID  `json:"realm_id"`
+	Username           string     `json:"username"`
+	Email              string     `json:"email"`
+	EmailVerified      bool       `json:"email_verified"`
+	DisplayName        string     `json:"display_name"`
+	Enabled            bool       `json:"enabled"`
+	PlatformAdmin      bool       `json:"platform_admin"`
+	ManagerID          *uuid.UUID `json:"manager_id,omitempty"`
+	FederationID       *uuid.UUID `json:"federation_id,omitempty"`
+	ExternalID         *string    `json:"external_id,omitempty"`
+	ExternalDN         *string    `json:"external_dn,omitempty"`
+	FederationSyncedAt *time.Time `json:"federation_synced_at,omitempty"`
+	FailedAttempts     int        `json:"failed_attempts"`
+	LockedUntil        *time.Time `json:"locked_until,omitempty"`
+	PasswordChanged    time.Time  `json:"password_changed_at"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+}
+
+type LDAPFederation struct {
+	ID                       uuid.UUID         `json:"id"`
+	RealmID                  uuid.UUID         `json:"realm_id"`
+	Name                     string            `json:"name"`
+	Vendor                   string            `json:"vendor"`
+	Priority                 int               `json:"priority"`
+	Enabled                  bool              `json:"enabled"`
+	ConnectionURL            string            `json:"connection_url"`
+	StartTLS                 bool              `json:"start_tls"`
+	CACertificate            string            `json:"ca_certificate,omitempty"`
+	BindDN                   string            `json:"bind_dn"`
+	BindCredentialSet        bool              `json:"bind_credential_set"`
+	UsersDN                  string            `json:"users_dn"`
+	UsernameLDAPAttribute    string            `json:"username_ldap_attribute"`
+	RDNLDAPAttribute         string            `json:"rdn_ldap_attribute"`
+	UUIDLDAPAttribute        string            `json:"uuid_ldap_attribute"`
+	UserObjectClasses        []string          `json:"user_object_classes"`
+	UserLDAPFilter           string            `json:"user_ldap_filter"`
+	SearchScope              string            `json:"search_scope"`
+	EmailLDAPAttribute       string            `json:"email_ldap_attribute"`
+	FirstNameLDAPAttribute   string            `json:"first_name_ldap_attribute"`
+	LastNameLDAPAttribute    string            `json:"last_name_ldap_attribute"`
+	DisplayNameLDAPAttribute string            `json:"display_name_ldap_attribute"`
+	MemberOfLDAPAttribute    string            `json:"member_of_ldap_attribute"`
+	GroupRoleMappings        map[string]string `json:"group_role_mappings"`
+	ImportEnabled            bool              `json:"import_enabled"`
+	SyncRegistrations        bool              `json:"sync_registrations"`
+	MissingUserAction        string            `json:"missing_user_action"`
+	EditMode                 string            `json:"edit_mode"`
+	BatchSize                int               `json:"batch_size"`
+	SyncPeriodSeconds        int               `json:"sync_period_seconds"`
+	NextSyncAt               *time.Time        `json:"next_sync_at,omitempty"`
+	LastSyncAt               *time.Time        `json:"last_sync_at,omitempty"`
+	LastSyncStatus           string            `json:"last_sync_status"`
+	LastSyncError            string            `json:"last_sync_error,omitempty"`
+	LastSyncAdded            int               `json:"last_sync_added"`
+	LastSyncUpdated          int               `json:"last_sync_updated"`
+	LastSyncFailed           int               `json:"last_sync_failed"`
+	CreatedAt                time.Time         `json:"created_at"`
+	UpdatedAt                time.Time         `json:"updated_at"`
 }
 
 type Client struct {
@@ -101,6 +148,7 @@ type Principal struct {
 	RealmID       uuid.UUID
 	Username      string
 	PlatformAdmin bool
+	RealmAdmin    bool
 	SessionID     *uuid.UUID
 	Scopes        []string
 }

@@ -48,7 +48,7 @@ func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_basic", "client_secret_post", "none"},
 		"code_challenge_methods_supported":              []string{"S256"},
 		"scopes_supported":                              []string{"openid", "profile", "email", "roles"},
-		"claims_supported":                              []string{"iss", "sub", "aud", "exp", "iat", "auth_time", "jti", "sid", "azp", "scope", "preferred_username", "email", "name", "realm_access", "resource_access"},
+		"claims_supported":                              []string{"iss", "sub", "aud", "exp", "iat", "auth_time", "jti", "sid", "azp", "scope", "preferred_username", "email", "email_verified", "name", "realm_access", "resource_access"},
 	})
 }
 
@@ -197,6 +197,10 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 	includeRefresh := slices.Contains(client.GrantTypes, "refresh_token")
 	response, err := s.oidc.IssueUserTokens(r.Context(), realm, client, user, code.SessionID, code.Scope, code.Nonce, includeRefresh)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "authorization session is no longer active")
+			return
+		}
 		s.logger.Error("token issue failed", "trace_id", traceIDFrom(r.Context()), "error", err)
 		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
@@ -240,6 +244,10 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 	}
 	response, err := s.oidc.IssueRefreshedUserTokens(r.Context(), realm, client, user, rotated, rawNew)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "authorization session is no longer active")
+			return
+		}
 		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}
@@ -304,10 +312,34 @@ func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 		writeBearerError(w, r, "invalid_token")
 		return
 	}
-	roles, _ := s.store.RealmRolesForUser(r.Context(), user.ID)
-	writeJSON(w, http.StatusOK, map[string]any{"sub": user.ID.String(), "preferred_username": user.Username,
-		"email": user.Email, "email_verified": user.Email != "", "name": user.DisplayName,
-		"realm_access": map[string]any{"roles": roles}})
+	if sid, parseErr := uuid.Parse(verified.Extra.SessionID); parseErr != nil {
+		writeBearerError(w, r, "invalid_token")
+		return
+	} else if _, sessionErr := s.store.SessionAuthTime(r.Context(), sid); sessionErr != nil {
+		writeBearerError(w, r, "invalid_token")
+		return
+	}
+	scopes := strings.Fields(verified.Extra.Scope)
+	result := map[string]any{"sub": user.ID.String()}
+	if slices.Contains(scopes, "profile") {
+		result["preferred_username"] = user.Username
+		result["name"] = user.DisplayName
+	}
+	if slices.Contains(scopes, "email") {
+		result["email"] = user.Email
+		result["email_verified"] = user.EmailVerified
+	}
+	if slices.Contains(scopes, "roles") {
+		roles, _ := s.store.RealmRolesForUser(r.Context(), user.ID)
+		result["realm_access"] = map[string]any{"roles": roles}
+		clientRoles, _ := s.store.ClientRolesForUser(r.Context(), user.ID)
+		resources := make(map[string]any, len(clientRoles))
+		for clientID, assigned := range clientRoles {
+			resources[clientID] = map[string]any{"roles": assigned}
+		}
+		result["resource_access"] = resources
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
@@ -327,7 +359,18 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	raw := r.Form.Get("token")
-	if verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, ""); verifyErr == nil {
+	if verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, client.ClientID); verifyErr == nil && verified.Extra.AuthorizedParty == client.ClientID {
+		if verified.Extra.SessionID != "" {
+			sid, parseErr := uuid.Parse(verified.Extra.SessionID)
+			if parseErr != nil {
+				writeJSON(w, http.StatusOK, map[string]any{"active": false})
+				return
+			}
+			if _, sessionErr := s.store.SessionAuthTime(r.Context(), sid); sessionErr != nil {
+				writeJSON(w, http.StatusOK, map[string]any{"active": false})
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"active": true, "scope": verified.Extra.Scope,
 			"client_id": verified.Extra.AuthorizedParty, "username": verified.Extra.PreferredUsername,
 			"token_type": "Bearer", "exp": verified.Claims.Expiry.Time().Unix(), "iat": verified.Claims.IssuedAt.Time().Unix(),
@@ -400,7 +443,7 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.RevokeSession(r.Context(), session.Session.ID)
 		s.audit(r, &realm.ID, &session.User.ID, session.User.Username, "LOGOUT", "SUCCESS", "session", session.Session.ID.String(), nil)
 	}
-	clearBrowserCookies(w, r)
+	s.clearBrowserCookies(w, r)
 	if redirectTo != "" {
 		parsed, _ := url.Parse(redirectTo)
 		query := parsed.Query()

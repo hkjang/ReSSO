@@ -3,6 +3,7 @@ package httpserver
 import (
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 
@@ -20,14 +21,14 @@ const (
 )
 
 type Server struct {
-	store        *store.Store
-	oidc         *oidc.Service
-	logger       *slog.Logger
-	loginLimiter *loginLimiter
+	store             *store.Store
+	oidc              *oidc.Service
+	logger            *slog.Logger
+	trustedProxyCIDRs []*net.IPNet
 }
 
-func New(data *store.Store, logger *slog.Logger) *Server {
-	return &Server{store: data, oidc: &oidc.Service{Store: data}, logger: logger, loginLimiter: newLoginLimiter()}
+func New(data *store.Store, logger *slog.Logger, trustedProxyCIDRs []*net.IPNet) *Server {
+	return &Server{store: data, oidc: &oidc.Service{Store: data}, logger: logger, trustedProxyCIDRs: trustedProxyCIDRs}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -44,8 +45,10 @@ func (s *Server) Handler() http.Handler {
 	})
 
 	router.Route("/realms/{realm}", func(r chi.Router) {
+		r.Use(s.oidcCORS)
 		r.Get("/.well-known/openid-configuration", s.discovery)
 		r.Route("/protocol/openid-connect", func(r chi.Router) {
+			r.Options("/*", s.oidcOptions)
 			r.Get("/auth", s.authorization)
 			r.Post("/token", s.token)
 			r.Get("/userinfo", s.userInfo)
@@ -60,7 +63,7 @@ func (s *Server) Handler() http.Handler {
 
 	router.Route("/api/v1", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
-			r.Use(s.requireSession)
+			r.Use(s.requireSessionOrAPIKey)
 			r.Get("/me", s.me)
 			r.Put("/me/profile", s.updateMyProfile)
 			r.Put("/me/password", s.changeMyPassword)
@@ -80,8 +83,8 @@ func (s *Server) Handler() http.Handler {
 	})
 
 	router.Route("/api/admin/v1", func(r chi.Router) {
-		r.Use(s.requireSession)
-		r.Use(s.requirePlatformAdmin)
+		r.Use(s.requireSessionOrAPIKey)
+		r.Use(s.requireAdmin)
 		s.adminRoutes(r)
 	})
 	router.Get("/api/openapi.json", s.openAPISpec)
@@ -91,6 +94,10 @@ func (s *Server) Handler() http.Handler {
 
 	router.Handle("/*", s.spaHandler())
 	return router
+}
+
+func (s *Server) oidcOptions(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) spaHandler() http.Handler {

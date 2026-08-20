@@ -24,9 +24,25 @@ realms="$(curl -fsS -b "$cookie_jar" "$base_url/api/admin/v1/realms")"
 realm_id="$(echo "$realms" | jq -er '.items[] | select(.name == "master") | .id')"
 
 suffix="$(date +%s)-$$"
+for empty_email_index in 1 2; do
+  empty_email_user="empty-email-$empty_email_index-$suffix"
+  curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg username "$empty_email_user" '{username:$username,email:"",display_name:$username,password:"empty-email-password-123",enabled:true}')" \
+    "$base_url/api/admin/v1/realms/$realm_id/users" | jq -e '.id != null' >/dev/null
+done
+
 client_identifier="smoke-$suffix"
-client_payload="$(jq -nc --arg client "$client_identifier" '{client_id:$client,name:"Smoke test",type:"public",redirect_uris:["http://localhost:9999/callback"],post_logout_redirect_uris:["http://localhost:9999/logout"],web_origins:["http://localhost:9999"],grant_types:["authorization_code","refresh_token"],default_scopes:["openid","profile","email"],require_pkce:true,backchannel_logout_uri:""}')"
+client_payload="$(jq -nc --arg client "$client_identifier" '{client_id:$client,name:"Smoke test",type:"public",redirect_uris:["http://localhost:9999/callback"],post_logout_redirect_uris:["http://localhost:9999/logout"],web_origins:["http://localhost:9999"],grant_types:["authorization_code","refresh_token"],default_scopes:["openid","profile","email","roles"],require_pkce:true,backchannel_logout_uri:""}')"
 curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' -d "$client_payload" "$base_url/api/admin/v1/realms/$realm_id/clients" | jq -e '.client.client_id != null' >/dev/null
+
+curl -fsS -D "$work_dir/cors-headers" -o /dev/null -X OPTIONS \
+  -H 'Origin: http://localhost:9999' \
+  -H 'Access-Control-Request-Method: POST' \
+  "$base_url/realms/master/protocol/openid-connect/token"
+grep -Eiq '^access-control-allow-origin: http://localhost:9999' "$work_dir/cors-headers" || {
+  echo "registered Web Origin did not receive CORS headers" >&2
+  exit 1
+}
 
 verifier='dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk'
 challenge='E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM'
@@ -63,7 +79,7 @@ access_token="$(echo "$tokens" | jq -er '.access_token')"
 refresh_token="$(echo "$tokens" | jq -er '.refresh_token')"
 echo "$tokens" | jq -e '.token_type == "Bearer" and .id_token != null' >/dev/null
 
-curl -fsS -H "Authorization: Bearer $access_token" "$base_url/realms/master/protocol/openid-connect/userinfo" | jq -e '.preferred_username != null' >/dev/null
+curl -fsS -H "Authorization: Bearer $access_token" "$base_url/realms/master/protocol/openid-connect/userinfo" | jq -e '.preferred_username != null and .email_verified == false and .realm_access == null' >/dev/null
 refreshed="$(curl -fsS -X POST --data-urlencode 'grant_type=refresh_token' --data-urlencode "client_id=$client_identifier" --data-urlencode "refresh_token=$refresh_token" "$base_url/realms/master/protocol/openid-connect/token")"
 rotated_refresh="$(echo "$refreshed" | jq -er '.refresh_token')"
 echo "$refreshed" | jq -e '.access_token != null' >/dev/null
@@ -72,7 +88,82 @@ reuse_status="$(curl -sS -o "$work_dir/reuse.json" -w '%{http_code}' -X POST --d
 family_status="$(curl -sS -o "$work_dir/family.json" -w '%{http_code}' -X POST --data-urlencode 'grant_type=refresh_token' --data-urlencode "client_id=$client_identifier" --data-urlencode "refresh_token=$rotated_refresh" "$base_url/realms/master/protocol/openid-connect/token")"
 [ "$family_status" = 400 ] || { echo "refresh token family was not revoked after reuse" >&2; exit 1; }
 
-api_key_payload='{"name":"Smoke MCP","scopes":["mcp:read","api:read"],"expires_days":1}'
+role_name="smoke-role-$suffix"
+role_response="$(curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+  -d "$(jq -nc --arg name "$role_name" '{name:$name,description:"Smoke Realm Role"}')" \
+  "$base_url/api/admin/v1/realms/$realm_id/roles")"
+role_id="$(echo "$role_response" | jq -er '.id')"
+client_uuid="$(curl -fsS -b "$cookie_jar" "$base_url/api/admin/v1/realms/$realm_id/clients" | jq -er --arg client "$client_identifier" '.items[] | select(.client_id == $client) | .id')"
+client_role_response="$(curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+  -d '{"name":"operator","description":"Smoke Client Role"}' \
+  "$base_url/api/admin/v1/realms/$realm_id/clients/$client_uuid/roles")"
+client_role_id="$(echo "$client_role_response" | jq -er '.id')"
+admin_id="$(curl -fsS -b "$cookie_jar" "$base_url/api/admin/v1/realms/$realm_id/users?q=$admin" | jq -er --arg admin "$admin" '.items[] | select(.username == $admin) | .id')"
+current_mappings="$(curl -fsS -b "$cookie_jar" "$base_url/api/admin/v1/realms/$realm_id/users/$admin_id/role-mappings")"
+mapping_payload="$(echo "$current_mappings" | jq -c --arg role "$role_id" --arg client_role "$client_role_id" \
+  '{realm_role_ids:((.realm_role_ids + [$role]) | unique),client_role_ids:((.client_role_ids + [$client_role]) | unique)}')"
+curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' -X PUT \
+  -d "$mapping_payload" "$base_url/api/admin/v1/realms/$realm_id/users/$admin_id/role-mappings" | \
+  jq -e --arg role "$role_id" --arg client_role "$client_role_id" '(.realm_role_ids | index($role)) != null and (.client_role_ids | index($client_role)) != null' >/dev/null
+
+curl -fsS -b "$cookie_jar" -D "$work_dir/role-headers" -o /dev/null --get \
+  --data-urlencode "client_id=$client_identifier" \
+  --data-urlencode 'redirect_uri=http://localhost:9999/callback' \
+  --data-urlencode 'response_type=code' \
+  --data-urlencode 'scope=openid profile email roles' \
+  --data-urlencode 'state=role-smoke-state' \
+  --data-urlencode "code_challenge=$challenge" \
+  --data-urlencode 'code_challenge_method=S256' \
+  "$base_url/realms/master/protocol/openid-connect/auth"
+role_location="$(sed -n 's/^location: //Ip' "$work_dir/role-headers" | tr -d '\r')"
+role_code="$(echo "$role_location" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')"
+[ -n "$role_code" ] || { echo "role authorization code was not returned" >&2; exit 1; }
+role_tokens="$(curl -fsS -X POST \
+  --data-urlencode 'grant_type=authorization_code' \
+  --data-urlencode "client_id=$client_identifier" \
+  --data-urlencode "code=$role_code" \
+  --data-urlencode 'redirect_uri=http://localhost:9999/callback' \
+  --data-urlencode "code_verifier=$verifier" \
+  "$base_url/realms/master/protocol/openid-connect/token")"
+role_access_token="$(echo "$role_tokens" | jq -er '.access_token')"
+curl -fsS -H "Authorization: Bearer $role_access_token" "$base_url/realms/master/protocol/openid-connect/userinfo" | \
+  jq -e --arg realm_role "$role_name" --arg client "$client_identifier" \
+  '(.realm_access.roles | index($realm_role)) != null and (.resource_access[$client].roles | index("operator")) != null' >/dev/null
+
+secondary_name="smoke-secondary-$suffix"
+secondary_realm="$(curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+  -d "$(jq -nc --arg name "$secondary_name" --arg issuer "https://sso.example.test/realms/$secondary_name" '{name:$name,display_name:"Smoke Secondary",issuer_url:$issuer}')" \
+  "$base_url/api/admin/v1/realms")"
+secondary_id="$(echo "$secondary_realm" | jq -er '.id')"
+delegated_user="realm-admin-$suffix"
+delegated_password='delegated-password-123'
+delegated_response="$(curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+  -d "$(jq -nc --arg username "$delegated_user" --arg password "$delegated_password" '{username:$username,email:($username+"@example.test"),display_name:"Delegated Realm Admin",password:$password,enabled:true}')" \
+  "$base_url/api/admin/v1/realms/$realm_id/users")"
+delegated_id="$(echo "$delegated_response" | jq -er '.id')"
+realm_admin_role_id="$(curl -fsS -b "$cookie_jar" "$base_url/api/admin/v1/realms/$realm_id/roles" | jq -er '.items[] | select(.name == "realm-admin") | .id')"
+delegated_mappings="$(curl -fsS -b "$cookie_jar" "$base_url/api/admin/v1/realms/$realm_id/users/$delegated_id/role-mappings")"
+delegated_mapping_payload="$(echo "$delegated_mappings" | jq -c --arg role "$realm_admin_role_id" '{realm_role_ids:((.realm_role_ids+[$role])|unique),client_role_ids:.client_role_ids}')"
+curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' -X PUT \
+  -d "$delegated_mapping_payload" "$base_url/api/admin/v1/realms/$realm_id/users/$delegated_id/role-mappings" >/dev/null
+delegated_cookie_jar="$work_dir/delegated-cookies"
+delegated_login_payload="$(jq -nc --arg username "$delegated_user" --arg password "$delegated_password" '{realm:"master",username:$username,password:$password,request:""}')"
+delegated_login="$(curl -fsS -c "$delegated_cookie_jar" -H 'Content-Type: application/json' -d "$delegated_login_payload" "$base_url/api/v1/auth/login")"
+delegated_csrf="$(echo "$delegated_login" | jq -er '.csrf_token')"
+curl -fsS -b "$delegated_cookie_jar" "$base_url/api/admin/v1/realms" | jq -e '.items | length == 1 and .[0].name == "master"' >/dev/null
+curl -fsS -b "$delegated_cookie_jar" "$base_url/api/admin/v1/realms/$realm_id/users?limit=1" | jq -e '.total > 0' >/dev/null
+cross_realm_status="$(curl -sS -o "$work_dir/cross-realm.json" -w '%{http_code}' -b "$delegated_cookie_jar" "$base_url/api/admin/v1/realms/$secondary_id/clients")"
+[ "$cross_realm_status" = 403 ] || { echo "Realm administrator crossed Realm boundary" >&2; exit 1; }
+create_realm_status="$(curl -sS -o "$work_dir/create-realm.json" -w '%{http_code}' -b "$delegated_cookie_jar" -H "X-CSRF-Token: $delegated_csrf" -H 'Content-Type: application/json' -d '{"name":"forbidden","display_name":"Forbidden","issuer_url":"https://sso.example.test/realms/forbidden"}' "$base_url/api/admin/v1/realms")"
+[ "$create_realm_status" = 403 ] || { echo "Realm administrator created a Realm" >&2; exit 1; }
+logs_status="$(curl -sS -o "$work_dir/logs.json" -w '%{http_code}' -b "$delegated_cookie_jar" "$base_url/api/admin/v1/system-logs")"
+[ "$logs_status" = 403 ] || { echo "Realm administrator accessed platform logs" >&2; exit 1; }
+protected_admin_status="$(curl -sS -o "$work_dir/protected-admin.json" -w '%{http_code}' -b "$delegated_cookie_jar" \
+  -H "X-CSRF-Token: $delegated_csrf" -H 'Content-Type: application/json' -X PUT \
+  -d '{"new_password":"must-not-be-applied-123"}' "$base_url/api/admin/v1/realms/$realm_id/users/$admin_id/password")"
+[ "$protected_admin_status" = 403 ] || { echo "Realm administrator changed a platform administrator" >&2; exit 1; }
+
+api_key_payload='{"name":"Smoke MCP and REST","scopes":["mcp:read","api:read","admin:read"],"expires_days":1}'
 api_key_response="$(curl -sS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' -d "$api_key_payload" "$base_url/api/v1/me/api-keys")"
 api_key="$(echo "$api_key_response" | jq -er '.secret')" || {
   echo "$api_key_response" | jq '{error,message,trace_id}' >&2
@@ -80,5 +171,7 @@ api_key="$(echo "$api_key_response" | jq -er '.secret')" || {
 }
 mcp_request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}'
 curl -fsS -H "Authorization: Bearer $api_key" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d "$mcp_request" "$base_url/mcp" | jq -e '.result.serverInfo.name == "ReSSO"' >/dev/null
+curl -fsS -H "Authorization: Bearer $api_key" "$base_url/api/v1/me" | jq -e --arg admin "$admin" '.user.username == $admin' >/dev/null
+curl -fsS -H "Authorization: Bearer $api_key" "$base_url/api/admin/v1/realms" | jq -e '.items | length > 0' >/dev/null
 
 echo "ReSSO smoke test passed"

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 )
@@ -14,6 +15,7 @@ const (
 	EnvBootstrapAdmin        = "BOOTSTRAP_ADMIN"
 	EnvBootstrapAdminPass    = "BOOTSTRAP_ADMIN_PASSWORD"
 	EnvEncryptionKey         = "ENCRYPTION_KEY"
+	EnvTrustedProxyCIDRs     = "TRUSTED_PROXY_CIDRS"
 	DefaultListenAddress     = ":8080"
 	DefaultBootstrapRealm    = "master"
 	DefaultBootstrapIssuer   = "http://localhost:8080/realms/master"
@@ -29,6 +31,7 @@ type Config struct {
 	BootstrapAdminPassword string
 	EncryptionKey          []byte
 	ListenAddress          string
+	TrustedProxyCIDRs      []*net.IPNet
 }
 
 func Load() (Config, error) {
@@ -68,6 +71,16 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.EncryptionKey = key
+	if raw := strings.TrimSpace(os.Getenv(EnvTrustedProxyCIDRs)); raw != "" {
+		for _, value := range strings.Split(raw, ",") {
+			value = strings.TrimSpace(value)
+			_, network, parseErr := net.ParseCIDR(value)
+			if parseErr != nil {
+				return Config{}, fmt.Errorf("%s contains invalid CIDR %q", EnvTrustedProxyCIDRs, value)
+			}
+			cfg.TrustedProxyCIDRs = append(cfg.TrustedProxyCIDRs, network)
+		}
+	}
 	return cfg, nil
 }
 

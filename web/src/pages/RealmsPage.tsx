@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom'
 import { Alert, Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, Stack, Switch, TextField, Typography } from '@mui/material'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, jsonBody } from '../lib/api'
+import { useAuth } from '../lib/auth'
 import { useRealms } from '../lib/realms'
 import type { Realm } from '../types'
 import { PageHeader, ContentCard, StatusChip } from '../components/Page'
@@ -12,6 +13,7 @@ import { EmptyState, ErrorAlert, PageLoading } from '../components/Feedback'
 const newRealm = { name: '', display_name: '', issuer_url: '' }
 
 export function RealmsPage() {
+	const { me } = useAuth()
   const params = useParams()
   const queryClient = useQueryClient()
   const realms = useRealms()
@@ -41,7 +43,7 @@ export function RealmsPage() {
   const submitCreate = (event: FormEvent) => { event.preventDefault(); create.mutate() }
   return (
     <>
-      <PageHeader title="Realm" description="사용자, Client, 역할과 서명 키가 격리되는 인증 영역입니다." action={{ label: 'Realm 만들기', onClick: () => setCreateOpen(true) }} badge={`${realms.data?.items.length ?? 0}`} />
+      <PageHeader title="Realm" description="사용자, Client, 역할과 서명 키가 격리되는 인증 영역입니다." action={me?.permissions.platform_admin ? { label: 'Realm 만들기', onClick: () => setCreateOpen(true) } : undefined} badge={`${realms.data?.items.length ?? 0}`} />
       <ContentCard noPadding>
         {!realms.data?.items.length ? <EmptyState title="Realm이 없습니다" /> : <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(2, minmax(0, 1fr))', xl: 'repeat(3, minmax(0, 1fr))' } }}>
           {realms.data.items.map((realm) => <Box component="button" key={realm.id} onClick={() => setSelected(realm)} sx={{ appearance: 'none', border: 0, borderRight: '1px solid', borderBottom: '1px solid', borderColor: 'divider', bgcolor: '#fff', textAlign: 'left', p: 2.5, cursor: 'pointer', '&:hover': { bgcolor: '#f9fafb' } }}>

@@ -100,6 +100,11 @@ func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClie
 	if err := validateURIs(input.PostLogoutRedirectURIs, false); err != nil {
 		return domain.Client{}, fmt.Errorf("post_logout_redirect_uris: %w", err)
 	}
+	var err error
+	input.WebOrigins, err = normalizeWebOrigins(input.WebOrigins)
+	if err != nil {
+		return domain.Client{}, fmt.Errorf("web_origins: %w", err)
+	}
 	command, err := s.Pool.Exec(ctx, `UPDATE clients SET name=$2,redirect_uris=$3,
         post_logout_redirect_uris=$4,web_origins=$5,grant_types=$6,default_scopes=$7,
         require_pkce=$8,enabled=$9,access_token_ttl_seconds=$10,refresh_token_ttl_seconds=$11,
@@ -125,7 +130,7 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 		input.GrantTypes = []string{"authorization_code", "refresh_token"}
 	}
 	if len(input.DefaultScopes) == 0 {
-		input.DefaultScopes = []string{"openid", "profile", "email"}
+		input.DefaultScopes = []string{"openid", "profile", "email", "roles"}
 	}
 	if err := validateURIs(input.RedirectURIs, false); err != nil {
 		return CreatedClient{}, fmt.Errorf("redirect_uris: %w", err)
@@ -133,6 +138,11 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 	if err := validateURIs(input.PostLogoutRedirectURIs, false); err != nil {
 		return CreatedClient{}, fmt.Errorf("post_logout_redirect_uris: %w", err)
 	}
+	normalizedOrigins, err := normalizeWebOrigins(input.WebOrigins)
+	if err != nil {
+		return CreatedClient{}, fmt.Errorf("web_origins: %w", err)
+	}
+	input.WebOrigins = normalizedOrigins
 	client := domain.Client{ID: uuid.New(), RealmID: realmID, ClientID: input.ClientID, Name: input.Name,
 		Type: input.Type, RedirectURIs: input.RedirectURIs, PostLogoutRedirectURIs: input.PostLogoutRedirectURIs,
 		WebOrigins: input.WebOrigins, GrantTypes: input.GrantTypes, DefaultScopes: input.DefaultScopes,
@@ -140,7 +150,6 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 		RefreshTokenTTLSeconds: 1800, BackchannelLogoutURI: strings.TrimSpace(input.BackchannelLogoutURI),
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	var secret, secretHash string
-	var err error
 	if client.Type == "confidential" {
 		secret, err = cryptoutil.RandomToken(32)
 		if err != nil {
@@ -171,11 +180,48 @@ func validateURIs(values []string, allowFragment bool) error {
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" || (!allowFragment && parsed.Fragment != "") {
 			return fmt.Errorf("%q is not an absolute URI without a fragment", value)
 		}
-		if parsed.Scheme != "https" && !(parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "[::1]")) {
+		if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHostname(parsed.Hostname())) {
 			return fmt.Errorf("%q must use HTTPS except for loopback development addresses", value)
 		}
 	}
 	return nil
+}
+
+func normalizeWebOrigins(values []string) ([]string, error) {
+	normalized := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		parsed, err := url.Parse(value)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil ||
+			(parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return nil, fmt.Errorf("%q must be an origin without path, query, userinfo or fragment", value)
+		}
+		if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHostname(parsed.Hostname())) {
+			return nil, fmt.Errorf("%q must use HTTPS except for loopback development origins", value)
+		}
+		origin := strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)
+		if !seen[origin] {
+			normalized = append(normalized, origin)
+			seen[origin] = true
+		}
+	}
+	return normalized, nil
+}
+
+func isLoopbackHostname(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func (s *Store) WebOriginAllowed(ctx context.Context, realmID uuid.UUID, origin string) (bool, error) {
+	normalized, err := normalizeWebOrigins([]string{origin})
+	if err != nil || len(normalized) != 1 {
+		return false, nil
+	}
+	var allowed bool
+	err = s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM clients
+		WHERE realm_id=$1 AND enabled=true AND $2=ANY(web_origins))`, realmID, normalized[0]).Scan(&allowed)
+	return allowed, err
 }
 
 func RedirectURIAllowed(client domain.Client, requested string) bool {

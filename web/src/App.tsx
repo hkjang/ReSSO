@@ -16,6 +16,7 @@ const ApprovalsPage = lazy(() => import('./pages/ApprovalsPage').then((module) =
 const AuditPage = lazy(() => import('./pages/OperationsPages').then((module) => ({ default: module.AuditPage })))
 const LogsPage = lazy(() => import('./pages/OperationsPages').then((module) => ({ default: module.LogsPage })))
 const IntegrationsPage = lazy(() => import('./pages/IntegrationsPage').then((module) => ({ default: module.IntegrationsPage })))
+const UserFederationPage = lazy(() => import('./pages/UserFederationPage').then((module) => ({ default: module.UserFederationPage })))
 const ProfilePage = lazy(() => import('./pages/PersonalPages').then((module) => ({ default: module.ProfilePage })))
 const PersonalSecurityPage = lazy(() => import('./pages/PersonalPages').then((module) => ({ default: module.PersonalSecurityPage })))
 const PersonalSessionsPage = lazy(() => import('./pages/PersonalPages').then((module) => ({ default: module.PersonalSessionsPage })))
@@ -31,7 +32,7 @@ function ProtectedLayout() {
 
 function AdminOnly({ children }: { children: ReactNode }) {
   const { me } = useAuth()
-  return me?.permissions.platform_admin ? children : <Navigate to="/personal" replace />
+  return me?.permissions.admin ? children : <Navigate to="/personal" replace />
 }
 
 export default function App() {
@@ -57,6 +58,7 @@ export default function App() {
         <Route path="/admin/audit" element={<AdminOnly><AuditPage /></AdminOnly>} />
         <Route path="/admin/logs" element={<AdminOnly><LogsPage /></AdminOnly>} />
         <Route path="/admin/integrations" element={<AdminOnly><IntegrationsPage /></AdminOnly>} />
+        <Route path="/admin/user-federation" element={<AdminOnly><UserFederationPage /></AdminOnly>} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes></Suspense>

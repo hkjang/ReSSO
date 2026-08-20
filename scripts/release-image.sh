@@ -9,7 +9,7 @@ fi
 release_version="$1"
 case "$release_version" in
   v[0-9]*.[0-9]*.[0-9]*) ;;
-  *) echo "version must look like v0.1.0" >&2; exit 2 ;;
+  *) echo "version must look like vX.Y.Z" >&2; exit 2 ;;
 esac
 
 commit="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"

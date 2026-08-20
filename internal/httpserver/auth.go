@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -15,38 +14,6 @@ import (
 	"github.com/hkjang/ReSSO/internal/domain"
 	"github.com/hkjang/ReSSO/internal/store"
 )
-
-type limiterEntry struct {
-	window time.Time
-	count  int
-}
-
-type loginLimiter struct {
-	mu      sync.Mutex
-	entries map[string]limiterEntry
-}
-
-func newLoginLimiter() *loginLimiter { return &loginLimiter{entries: map[string]limiterEntry{}} }
-
-func (l *loginLimiter) allow(key string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := time.Now()
-	entry := l.entries[key]
-	if now.Sub(entry.window) > 5*time.Minute {
-		entry = limiterEntry{window: now}
-	}
-	entry.count++
-	l.entries[key] = entry
-	if len(l.entries) > 10000 {
-		for k, value := range l.entries {
-			if now.Sub(value.window) > 10*time.Minute {
-				delete(l.entries, k)
-			}
-		}
-	}
-	return entry.count <= 30
-}
 
 func (s *Server) authChallenge(w http.ResponseWriter, r *http.Request) {
 	request, err := s.store.AuthorizationRequestByToken(r.Context(), chi.URLParam(r, "token"))
@@ -79,10 +46,6 @@ type loginRequest struct {
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	if !s.loginLimiter.allow(clientIP(r)) {
-		writeError(w, r, http.StatusTooManyRequests, "rate_limited", "로그인 요청이 너무 많습니다. 잠시 후 다시 시도하세요.")
-		return
-	}
 	var input loginRequest
 	if !decodeJSON(w, r, &input) {
 		return
@@ -108,7 +71,21 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusUnauthorized, "invalid_credentials", "아이디 또는 비밀번호가 올바르지 않습니다.")
 		return
 	}
-	result, err := s.store.AuthenticatePassword(r.Context(), realm, input.Username, input.Password)
+	ip := s.clientIP(r)
+	ipAllowed, rateErr := s.store.AllowLoginAttempt(r.Context(), "login/ip/"+ip, 100, 5*time.Minute)
+	accountBucket := "login/account/" + realm.ID.String() + "/" + strings.ToLower(strings.TrimSpace(input.Username))
+	accountAllowed, accountErr := s.store.AllowLoginAttempt(r.Context(), accountBucket, 30, 5*time.Minute)
+	if rateErr != nil || accountErr != nil {
+		s.logger.Error("login rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", errors.Join(rateErr, accountErr))
+		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
+		return
+	}
+	if !ipAllowed || !accountAllowed {
+		w.Header().Set("Retry-After", "300")
+		writeError(w, r, http.StatusTooManyRequests, "rate_limited", "로그인 요청이 너무 많습니다. 잠시 후 다시 시도하세요.")
+		return
+	}
+	result, err := s.store.Authenticate(r.Context(), realm, input.Username, input.Password)
 	if err != nil {
 		s.logger.Error("password authentication failed", "trace_id", traceIDFrom(r.Context()), "error", err)
 		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
@@ -120,20 +97,24 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusUnauthorized, "invalid_credentials", message)
 		return
 	}
+	authMethod := result.AuthMethod
+	if authMethod == "" {
+		authMethod = "password"
+	}
 	newSession, err := s.store.CreateSession(r.Context(), realm.ID, result.User.ID,
-		time.Duration(result.SessionSeconds)*time.Second, clientIP(r), r.UserAgent(), "password")
+		time.Duration(result.SessionSeconds)*time.Second, s.clientIP(r), r.UserAgent(), authMethod)
 	if err != nil {
 		s.logger.Error("create browser session failed", "trace_id", traceIDFrom(r.Context()), "error", err)
 		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
 		return
 	}
-	setBrowserCookies(w, r, newSession.Token, newSession.CSRFToken, newSession.Session.ExpiresAt)
+	s.setBrowserCookies(w, r, newSession.Token, newSession.CSRFToken, newSession.Session.ExpiresAt)
 	response := map[string]any{"authenticated": true, "csrf_token": newSession.CSRFToken, "redirect_to": "/"}
 	if authRequest != nil {
 		consumed, err := s.store.ConsumeAuthorizationRequest(r.Context(), input.Request)
 		if err != nil {
 			_ = s.store.RevokeSession(r.Context(), newSession.Session.ID)
-			clearBrowserCookies(w, r)
+			s.clearBrowserCookies(w, r)
 			writeError(w, r, http.StatusConflict, "request_already_used", "로그인 요청이 이미 처리되었습니다.")
 			return
 		}
@@ -152,18 +133,18 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-func setBrowserCookies(w http.ResponseWriter, r *http.Request, session, csrf string, expires time.Time) {
-	secure := requestIsSecure(r)
+func (s *Server) setBrowserCookies(w http.ResponseWriter, r *http.Request, session, csrf string, expires time.Time) {
+	secure := s.requestIsSecure(r)
 	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: session, Path: "/", Expires: expires,
 		MaxAge: int(time.Until(expires).Seconds()), HttpOnly: true, Secure: secure, SameSite: http.SameSiteLaxMode})
 	http.SetCookie(w, &http.Cookie{Name: csrfCookieName, Value: csrf, Path: "/", Expires: expires,
 		MaxAge: int(time.Until(expires).Seconds()), HttpOnly: false, Secure: secure, SameSite: http.SameSiteStrictMode})
 }
 
-func clearBrowserCookies(w http.ResponseWriter, r *http.Request) {
+func (s *Server) clearBrowserCookies(w http.ResponseWriter, r *http.Request) {
 	for _, name := range []string{sessionCookieName, csrfCookieName} {
 		http.SetCookie(w, &http.Cookie{Name: name, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0),
-			HttpOnly: name == sessionCookieName, Secure: requestIsSecure(r), SameSite: http.SameSiteLaxMode})
+			HttpOnly: name == sessionCookieName, Secure: s.requestIsSecure(r), SameSite: http.SameSiteLaxMode})
 	}
 }
 
@@ -183,7 +164,7 @@ func authorizationRedirect(target, code, state, issuer string, sessionID uuid.UU
 func (s *Server) browserLogout(w http.ResponseWriter, r *http.Request) {
 	session, _ := sessionFrom(r.Context())
 	_ = s.store.RevokeSession(r.Context(), session.Session.ID)
-	clearBrowserCookies(w, r)
+	s.clearBrowserCookies(w, r)
 	s.audit(r, &session.User.RealmID, &session.User.ID, session.User.Username, "LOGOUT", "SUCCESS", "session", session.Session.ID.String(), nil)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -191,7 +172,7 @@ func (s *Server) browserLogout(w http.ResponseWriter, r *http.Request) {
 func (s *Server) audit(r *http.Request, realmID, actorID *uuid.UUID, actorName, eventType, result, targetType, targetID string, detail map[string]any) {
 	err := s.store.WriteAudit(r.Context(), store.AuditEvent{RealmID: realmID, ActorID: actorID, ActorName: actorName,
 		EventType: eventType, Result: result, TargetType: targetType, TargetID: targetID,
-		IPAddress: clientIP(r), UserAgent: r.UserAgent(), TraceID: traceIDFrom(r.Context()), Detail: detail})
+		IPAddress: s.clientIP(r), UserAgent: r.UserAgent(), TraceID: traceIDFrom(r.Context()), Detail: detail})
 	if err != nil && !errors.Is(err, contextCanceled(r)) {
 		s.logger.Warn("write audit event failed", "trace_id", traceIDFrom(r.Context()), "error", err)
 	}

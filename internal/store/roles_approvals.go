@@ -53,6 +53,212 @@ func (s *Store) CreateRole(ctx context.Context, realmID uuid.UUID, name, descrip
 	return role, err
 }
 
+func (s *Store) UpdateRole(ctx context.Context, realmID, roleID uuid.UUID, description string) (Role, error) {
+	command, err := s.Pool.Exec(ctx, `UPDATE roles SET description=$3,updated_at=now()
+		WHERE id=$1 AND realm_id=$2`, roleID, realmID, strings.TrimSpace(description))
+	if err != nil {
+		return Role{}, err
+	}
+	if command.RowsAffected() == 0 {
+		return Role{}, ErrNotFound
+	}
+	var role Role
+	err = s.Pool.QueryRow(ctx, `SELECT id,realm_id,name,description,created_at,updated_at
+		FROM roles WHERE id=$1`, roleID).Scan(&role.ID, &role.RealmID, &role.Name, &role.Description,
+		&role.CreatedAt, &role.UpdatedAt)
+	return role, err
+}
+
+func (s *Store) DeleteRole(ctx context.Context, realmID, roleID uuid.UUID) error {
+	command, err := s.Pool.Exec(ctx, `DELETE FROM roles WHERE id=$1 AND realm_id=$2
+		AND name NOT IN ('user','realm-admin','offline_access')`, roleID, realmID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
+type ClientRole struct {
+	ID          uuid.UUID `json:"id"`
+	ClientID    uuid.UUID `json:"client_id"`
+	ClientKey   string    `json:"client_key"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+func (s *Store) ListClientRoles(ctx context.Context, realmID, clientID uuid.UUID) ([]ClientRole, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT cr.id,cr.client_id,c.client_id,cr.name,cr.description,cr.created_at
+		FROM client_roles cr JOIN clients c ON c.id=cr.client_id
+		WHERE c.realm_id=$1 AND ($2::uuid IS NULL OR c.id=$2) ORDER BY c.client_id,cr.name`, realmID, nullableUUID(clientID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	roles := make([]ClientRole, 0)
+	for rows.Next() {
+		var role ClientRole
+		if err := rows.Scan(&role.ID, &role.ClientID, &role.ClientKey, &role.Name, &role.Description, &role.CreatedAt); err != nil {
+			return nil, err
+		}
+		roles = append(roles, role)
+	}
+	return roles, rows.Err()
+}
+
+func nullableUUID(id uuid.UUID) *uuid.UUID {
+	if id == uuid.Nil {
+		return nil
+	}
+	return &id
+}
+
+func (s *Store) CreateClientRole(ctx context.Context, realmID, clientID uuid.UUID, name, description string) (ClientRole, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ClientRole{}, errors.New("client role name is required")
+	}
+	role := ClientRole{ID: uuid.New(), ClientID: clientID, Name: name,
+		Description: strings.TrimSpace(description), CreatedAt: time.Now().UTC()}
+	err := s.Pool.QueryRow(ctx, "SELECT client_id FROM clients WHERE id=$1 AND realm_id=$2", clientID, realmID).Scan(&role.ClientKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ClientRole{}, ErrNotFound
+	}
+	if err != nil {
+		return ClientRole{}, err
+	}
+	_, err = s.Pool.Exec(ctx, `INSERT INTO client_roles(id,client_id,name,description,created_at)
+		VALUES($1,$2,$3,$4,$5)`, role.ID, clientID, role.Name, role.Description, role.CreatedAt)
+	return role, err
+}
+
+func (s *Store) DeleteClientRole(ctx context.Context, realmID, clientID, roleID uuid.UUID) error {
+	command, err := s.Pool.Exec(ctx, `DELETE FROM client_roles cr USING clients c
+		WHERE cr.id=$1 AND cr.client_id=$2 AND c.id=cr.client_id AND c.realm_id=$3`, roleID, clientID, realmID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+type UserRoleMappings struct {
+	AvailableRealmRoles    []Role       `json:"available_realm_roles"`
+	AvailableClientRoles   []ClientRole `json:"available_client_roles"`
+	RealmRoleIDs           []uuid.UUID  `json:"realm_role_ids"`
+	FederationRealmRoleIDs []uuid.UUID  `json:"federation_realm_role_ids"`
+	ClientRoleIDs          []uuid.UUID  `json:"client_role_ids"`
+}
+
+func (s *Store) GetUserRoleMappings(ctx context.Context, realmID, userID uuid.UUID) (UserRoleMappings, error) {
+	var exists bool
+	if err := s.Pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND realm_id=$2)", userID, realmID).Scan(&exists); err != nil {
+		return UserRoleMappings{}, err
+	}
+	if !exists {
+		return UserRoleMappings{}, ErrNotFound
+	}
+	result := UserRoleMappings{RealmRoleIDs: []uuid.UUID{}, FederationRealmRoleIDs: []uuid.UUID{}, ClientRoleIDs: []uuid.UUID{}}
+	var err error
+	result.AvailableRealmRoles, err = s.ListRoles(ctx, realmID)
+	if err != nil {
+		return UserRoleMappings{}, err
+	}
+	result.AvailableClientRoles, err = s.ListClientRoles(ctx, realmID, uuid.Nil)
+	if err != nil {
+		return UserRoleMappings{}, err
+	}
+	rows, err := s.Pool.Query(ctx, `SELECT ur.role_id,EXISTS(SELECT 1 FROM federation_role_assignments fra
+		WHERE fra.user_id=ur.user_id AND fra.role_id=ur.role_id) FROM user_roles ur
+		JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1 AND r.realm_id=$2`, userID, realmID)
+	if err != nil {
+		return UserRoleMappings{}, err
+	}
+	for rows.Next() {
+		var roleID uuid.UUID
+		var federation bool
+		if err := rows.Scan(&roleID, &federation); err != nil {
+			rows.Close()
+			return UserRoleMappings{}, err
+		}
+		result.RealmRoleIDs = append(result.RealmRoleIDs, roleID)
+		if federation {
+			result.FederationRealmRoleIDs = append(result.FederationRealmRoleIDs, roleID)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return UserRoleMappings{}, err
+	}
+	rows, err = s.Pool.Query(ctx, `SELECT ucr.client_role_id FROM user_client_roles ucr
+		JOIN client_roles cr ON cr.id=ucr.client_role_id JOIN clients c ON c.id=cr.client_id
+		WHERE ucr.user_id=$1 AND c.realm_id=$2`, userID, realmID)
+	if err != nil {
+		return UserRoleMappings{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var roleID uuid.UUID
+		if err := rows.Scan(&roleID); err != nil {
+			return UserRoleMappings{}, err
+		}
+		result.ClientRoleIDs = append(result.ClientRoleIDs, roleID)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) ReplaceUserRoleMappings(ctx context.Context, realmID, userID uuid.UUID,
+	realmRoleIDs, clientRoleIDs []uuid.UUID) (UserRoleMappings, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return UserRoleMappings{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var userExists bool
+	if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND realm_id=$2)", userID, realmID).Scan(&userExists); err != nil || !userExists {
+		if err == nil {
+			err = ErrNotFound
+		}
+		return UserRoleMappings{}, err
+	}
+	var realmRoleCount, clientRoleCount int
+	if err := tx.QueryRow(ctx, "SELECT count(*) FROM roles WHERE realm_id=$1 AND id=ANY($2::uuid[])", realmID, realmRoleIDs).Scan(&realmRoleCount); err != nil {
+		return UserRoleMappings{}, err
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM client_roles cr JOIN clients c ON c.id=cr.client_id
+		WHERE c.realm_id=$1 AND cr.id=ANY($2::uuid[])`, realmID, clientRoleIDs).Scan(&clientRoleCount); err != nil {
+		return UserRoleMappings{}, err
+	}
+	if realmRoleCount != len(realmRoleIDs) || clientRoleCount != len(clientRoleIDs) {
+		return UserRoleMappings{}, errors.New("one or more role mappings do not belong to the Realm")
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM user_roles ur WHERE ur.user_id=$1
+		AND NOT EXISTS(SELECT 1 FROM federation_role_assignments fra
+		    WHERE fra.user_id=ur.user_id AND fra.role_id=ur.role_id)`, userID); err != nil {
+		return UserRoleMappings{}, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO user_roles(user_id,role_id)
+		SELECT $1,unnest($2::uuid[]) ON CONFLICT DO NOTHING`, userID, realmRoleIDs); err != nil {
+		return UserRoleMappings{}, err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM user_client_roles WHERE user_id=$1", userID); err != nil {
+		return UserRoleMappings{}, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO user_client_roles(user_id,client_role_id)
+		SELECT $1,unnest($2::uuid[]) ON CONFLICT DO NOTHING`, userID, clientRoleIDs); err != nil {
+		return UserRoleMappings{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return UserRoleMappings{}, err
+	}
+	return s.GetUserRoleMappings(ctx, realmID, userID)
+}
+
 func (s *Store) ApprovalEnabled(ctx context.Context, realmID uuid.UUID) (bool, error) {
 	var enabled bool
 	err := s.Pool.QueryRow(ctx, "SELECT approval_enabled FROM realms WHERE id=$1", realmID).Scan(&enabled)
@@ -117,7 +323,8 @@ func (s *Store) ListApprovalRequests(ctx context.Context, realmID *uuid.UUID, re
 	return requests, rows.Err()
 }
 
-func (s *Store) DecideApprovalRequest(ctx context.Context, requestID, reviewerID uuid.UUID, platformAdmin bool, approve bool, note string) (domain.ApprovalRequest, error) {
+func (s *Store) DecideApprovalRequest(ctx context.Context, requestID, reviewerID uuid.UUID,
+	platformAdmin, realmAdmin bool, adminRealmID uuid.UUID, approve bool, note string) (domain.ApprovalRequest, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return domain.ApprovalRequest{}, err
@@ -131,7 +338,8 @@ func (s *Store) DecideApprovalRequest(ctx context.Context, requestID, reviewerID
 	if request.Status != "PENDING" {
 		return domain.ApprovalRequest{}, ErrConflict
 	}
-	if !platformAdmin && (request.ReviewerID == nil || *request.ReviewerID != reviewerID) {
+	adminForRealm := realmAdmin && request.RealmID == adminRealmID
+	if !platformAdmin && !adminForRealm && (request.ReviewerID == nil || *request.ReviewerID != reviewerID) {
 		return domain.ApprovalRequest{}, errors.New("reviewer is not authorized for this request")
 	}
 	status := "REJECTED"
