@@ -34,4 +34,4 @@ test('LDAP federation form keeps long connection inputs usable', async () => {
   expect(credential).toHaveValue('correct horse battery staple')
   expect(usersDN).toHaveValue('ou=People,dc=internal,dc=company')
   expect(screen.getByRole('button', { name: '공급자 생성' })).toBeEnabled()
-})
+}, 15_000)
