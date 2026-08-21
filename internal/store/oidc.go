@@ -220,8 +220,9 @@ func (s *Store) RotateRefreshToken(ctx context.Context, raw string, reducedScope
 	}
 	if old.SessionID != nil {
 		var sessionActive bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sso_sessions WHERE id=$1 AND
-            revoked_at IS NULL AND expires_at>now())`, old.SessionID).Scan(&sessionActive); err != nil || !sessionActive {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sso_sessions s
+            JOIN realms r ON r.id=s.realm_id WHERE s.id=$1 AND `+sessionIsLive+`)`,
+			old.SessionID).Scan(&sessionActive); err != nil || !sessionActive {
 			return RefreshToken{}, "", ErrNotFound
 		}
 	}

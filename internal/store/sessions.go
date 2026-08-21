@@ -13,6 +13,14 @@ import (
 	"github.com/hkjang/ReSSO/internal/domain"
 )
 
+// sessionIsLive is the single definition of an acceptable session, applied
+// wherever one is checked. Splitting it across call sites is how a path gets
+// forgotten: the absolute lifetime was enforced in four places and an idle
+// timeout added to only some of them would let a stale session keep issuing
+// tokens. `s` must alias sso_sessions and `r` the owning realm.
+const sessionIsLive = `s.revoked_at IS NULL AND s.expires_at>now()
+        AND (r.idle_timeout_seconds = 0 OR s.last_access > now()-make_interval(secs => r.idle_timeout_seconds))`
+
 type NewSession struct {
 	Session   domain.Session
 	Token     string
@@ -59,8 +67,8 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 		u.failed_attempts,u.locked_until,u.password_changed_at,u.created_at,u.updated_at,
 		EXISTS(SELECT 1 FROM user_roles ur JOIN roles rr ON rr.id=ur.role_id
 		    WHERE ur.user_id=u.id AND rr.name='realm-admin')
-        FROM sso_sessions s JOIN users u ON u.id=s.user_id
-        WHERE s.token_hash=ANY($1::bytea[]) AND s.revoked_at IS NULL AND s.expires_at>now() AND u.enabled=true`, s.Sealer.Digests(rawToken)).Scan(
+        FROM sso_sessions s JOIN users u ON u.id=s.user_id JOIN realms r ON r.id=s.realm_id
+        WHERE s.token_hash=ANY($1::bytea[]) AND `+sessionIsLive+` AND u.enabled=true`, s.Sealer.Digests(rawToken)).Scan(
 		&result.Session.ID, &result.Session.RealmID, &result.Session.UserID, &result.Session.Username,
 		&result.Session.IPAddress, &result.Session.UserAgent, &result.Session.AuthMethod, &result.Session.CreatedAt,
 		&result.Session.LastAccess, &result.Session.ExpiresAt, &result.Session.RevokedAt, &result.CSRFHash,
@@ -83,8 +91,9 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 
 func (s *Store) SessionAuthTime(ctx context.Context, id uuid.UUID) (time.Time, error) {
 	var authTime time.Time
-	err := s.Pool.QueryRow(ctx, `SELECT created_at FROM sso_sessions
-		WHERE id=$1 AND revoked_at IS NULL AND expires_at>now()`, id).Scan(&authTime)
+	err := s.Pool.QueryRow(ctx, `SELECT s.created_at FROM sso_sessions s
+		JOIN realms r ON r.id=s.realm_id
+		WHERE s.id=$1 AND `+sessionIsLive, id).Scan(&authTime)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, ErrNotFound
 	}
@@ -100,8 +109,9 @@ func (s *Store) ValidateActiveSessionBinding(ctx context.Context, sessionID, use
 	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(
 		SELECT 1 FROM sso_sessions s
 		JOIN users u ON u.id=s.user_id
+		JOIN realms r ON r.id=s.realm_id
 		WHERE s.id=$1 AND s.user_id=$2 AND s.realm_id=$3 AND u.realm_id=$3
-			AND s.revoked_at IS NULL AND s.expires_at>now() AND u.enabled=true
+			AND `+sessionIsLive+` AND u.enabled=true
 	)`, sessionID, userID, realmID).Scan(&valid)
 	if err != nil {
 		return err

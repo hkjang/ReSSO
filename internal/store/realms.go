@@ -22,14 +22,14 @@ var ErrFederationPasswordExternal = errors.New("password is managed by the sourc
 var ErrFederationOperation = errors.New("LDAP federation operation failed")
 
 const realmColumns = `id,name,display_name,issuer_url,enabled,approval_enabled,
-    access_token_ttl_seconds,refresh_token_ttl_seconds,session_ttl_seconds,
+    access_token_ttl_seconds,refresh_token_ttl_seconds,session_ttl_seconds,idle_timeout_seconds,
     password_min_length,max_login_attempts,lockout_seconds,created_at,updated_at`
 
 func scanRealm(row pgx.Row) (domain.Realm, error) {
 	var realm domain.Realm
 	err := row.Scan(&realm.ID, &realm.Name, &realm.DisplayName, &realm.IssuerURL, &realm.Enabled,
 		&realm.ApprovalEnabled, &realm.AccessTokenTTLSeconds, &realm.RefreshTokenTTLSeconds,
-		&realm.SessionTTLSeconds, &realm.PasswordMinLength, &realm.MaxLoginAttempts,
+		&realm.SessionTTLSeconds, &realm.IdleTimeoutSeconds, &realm.PasswordMinLength, &realm.MaxLoginAttempts,
 		&realm.LockoutSeconds, &realm.CreatedAt, &realm.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Realm{}, ErrNotFound
@@ -113,6 +113,8 @@ type UpdateRealmInput struct {
 	AccessTokenTTLSeconds  int    `json:"access_token_ttl_seconds"`
 	RefreshTokenTTLSeconds int    `json:"refresh_token_ttl_seconds"`
 	SessionTTLSeconds      int    `json:"session_ttl_seconds"`
+	// IdleTimeoutSeconds is zero to disable, otherwise within the bounds below.
+	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
 	// The password and lockout policy lived only in the database until now:
 	// it was enforced on every login and password change but could not be
 	// read or set by an administrator, and the console guessed at its value.
@@ -142,6 +144,14 @@ func validateRealmPolicy(input UpdateRealmInput) error {
 				bound.label, bound.low, bound.high)
 		}
 	}
+	// Zero is the documented way to turn the idle check off, so it is checked
+	// apart from the ranges above.
+	if input.IdleTimeoutSeconds != 0 && (input.IdleTimeoutSeconds < 300 || input.IdleTimeoutSeconds > 2592000) {
+		return fmt.Errorf("%w: idle_timeout_seconds must be 0 or between 300 and 2592000", ErrInvalidInput)
+	}
+	if input.IdleTimeoutSeconds != 0 && input.IdleTimeoutSeconds > input.SessionTTLSeconds {
+		return fmt.Errorf("%w: idle_timeout_seconds must not exceed session_ttl_seconds", ErrInvalidInput)
+	}
 	return nil
 }
 
@@ -156,10 +166,10 @@ func (s *Store) UpdateRealm(ctx context.Context, id uuid.UUID, input UpdateRealm
 	_, err := s.Pool.Exec(ctx, `UPDATE realms SET display_name=$2,issuer_url=$3,enabled=$4,
         approval_enabled=$5,access_token_ttl_seconds=$6,refresh_token_ttl_seconds=$7,
         session_ttl_seconds=$8,password_min_length=$9,max_login_attempts=$10,
-        lockout_seconds=$11,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.DisplayName),
+        lockout_seconds=$11,idle_timeout_seconds=$12,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.DisplayName),
 		issuerURL, input.Enabled, input.ApprovalEnabled,
 		input.AccessTokenTTLSeconds, input.RefreshTokenTTLSeconds, input.SessionTTLSeconds,
-		input.PasswordMinLength, input.MaxLoginAttempts, input.LockoutSeconds)
+		input.PasswordMinLength, input.MaxLoginAttempts, input.LockoutSeconds, input.IdleTimeoutSeconds)
 	if err != nil {
 		return domain.Realm{}, fmt.Errorf("update realm: %w", err)
 	}

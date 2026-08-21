@@ -16,6 +16,7 @@ export interface Realm {
   access_token_ttl_seconds: number
   refresh_token_ttl_seconds: number
   session_ttl_seconds: number
+  idle_timeout_seconds: number
   password_min_length: number
   max_login_attempts: number
   lockout_seconds: number
@@ -193,6 +194,7 @@ export interface PasswordPolicy {
   min_length: number
   max_login_attempts: number
   lockout_seconds: number
+  idle_timeout_seconds: number
 }
 
 export interface Me {

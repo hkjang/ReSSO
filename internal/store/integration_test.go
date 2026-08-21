@@ -1293,3 +1293,93 @@ func TestIntegrationLDAPSyncOutcomeReachesTheAuditTrail(t *testing.T) {
 		}
 	}
 }
+
+func TestIntegrationIdleTimeoutEndsUnusedSessionsEverywhere(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Zero is the default and must preserve the previous behaviour.
+	if realm.IdleTimeoutSeconds != 0 {
+		t.Fatalf("default idle timeout = %d, want 0", realm.IdleTimeoutSeconds)
+	}
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+
+	newSession := func() (NewSession, string) {
+		session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+			time.Hour, "127.0.0.1", "integration-test", "password")
+		if err != nil {
+			t.Fatal(err)
+		}
+		userID, sid := bootstrap.AdminUserID, session.Session.ID
+		refresh, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+			UserID: &userID, SessionID: &sid, Scope: []string{"openid"}, ExpiresAt: time.Now().UTC().Add(time.Hour)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return session, refresh
+	}
+	idle := func(session NewSession, seconds int) {
+		if _, err := data.Pool.Exec(ctx, `UPDATE sso_sessions SET last_access=now()-make_interval(secs => $2) WHERE id=$1`,
+			session.Session.ID, seconds); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// With the check off, an old last_access changes nothing.
+	session, refresh := newSession()
+	idle(session, 7200)
+	if _, err := data.SessionByToken(ctx, session.Token); err != nil {
+		t.Fatalf("idle session rejected while the timeout is disabled: %v", err)
+	}
+
+	base := UpdateRealmInput{DisplayName: realm.DisplayName, IssuerURL: realm.IssuerURL, Enabled: true,
+		AccessTokenTTLSeconds: realm.AccessTokenTTLSeconds, RefreshTokenTTLSeconds: realm.RefreshTokenTTLSeconds,
+		SessionTTLSeconds: realm.SessionTTLSeconds, PasswordMinLength: realm.PasswordMinLength,
+		MaxLoginAttempts: realm.MaxLoginAttempts, LockoutSeconds: realm.LockoutSeconds, IdleTimeoutSeconds: 900}
+	if _, err := data.UpdateRealm(ctx, realm.ID, base); err != nil {
+		t.Fatal(err)
+	}
+	// A successful validation counts as activity and refreshes last_access, so
+	// the session is put back into an idle state after the check above.
+	idle(session, 7200)
+
+	// Every path that accepts a session must apply the same rule; enforcing it
+	// in some but not others would leave a stale session issuing tokens.
+	if _, err := data.SessionByToken(ctx, session.Token); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SessionByToken accepted an idle session: %v", err)
+	}
+	if _, err := data.SessionAuthTime(ctx, session.Session.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SessionAuthTime accepted an idle session: %v", err)
+	}
+	if err := data.ValidateActiveSessionBinding(ctx, session.Session.ID, bootstrap.AdminUserID, realm.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ValidateActiveSessionBinding accepted an idle session: %v", err)
+	}
+	if _, _, err := data.RotateRefreshToken(ctx, refresh, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RotateRefreshToken accepted an idle session: %v", err)
+	}
+
+	// A session still in use is unaffected.
+	active, activeRefresh := newSession()
+	idle(active, 60)
+	if _, err := data.SessionByToken(ctx, active.Token); err != nil {
+		t.Fatalf("an active session was rejected: %v", err)
+	}
+	if _, _, err := data.RotateRefreshToken(ctx, activeRefresh, nil); err != nil {
+		t.Fatalf("refresh on an active session was rejected: %v", err)
+	}
+
+	for _, invalid := range []int{100, 2592001, realm.SessionTTLSeconds + 1} {
+		out := base
+		out.IdleTimeoutSeconds = invalid
+		if _, err := data.UpdateRealm(ctx, realm.ID, out); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("idle timeout %d was accepted: %v", invalid, err)
+		}
+	}
+}

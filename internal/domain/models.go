@@ -19,11 +19,14 @@ type Realm struct {
 	AccessTokenTTLSeconds  int       `json:"access_token_ttl_seconds"`
 	RefreshTokenTTLSeconds int       `json:"refresh_token_ttl_seconds"`
 	SessionTTLSeconds      int       `json:"session_ttl_seconds"`
-	PasswordMinLength      int       `json:"password_min_length"`
-	MaxLoginAttempts       int       `json:"max_login_attempts"`
-	LockoutSeconds         int       `json:"lockout_seconds"`
-	CreatedAt              time.Time `json:"created_at"`
-	UpdatedAt              time.Time `json:"updated_at"`
+	// IdleTimeoutSeconds ends a session that has gone unused for this long.
+	// Zero disables the check and keeps only the absolute lifetime.
+	IdleTimeoutSeconds int       `json:"idle_timeout_seconds"`
+	PasswordMinLength  int       `json:"password_min_length"`
+	MaxLoginAttempts   int       `json:"max_login_attempts"`
+	LockoutSeconds     int       `json:"lockout_seconds"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type User struct {

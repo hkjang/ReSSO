@@ -48,7 +48,7 @@ export function RealmsPage() {
       approval_enabled: form!.approval_enabled, access_token_ttl_seconds: Number(form!.access_token_ttl_seconds),
       refresh_token_ttl_seconds: Number(form!.refresh_token_ttl_seconds), session_ttl_seconds: Number(form!.session_ttl_seconds),
       password_min_length: Number(form!.password_min_length), max_login_attempts: Number(form!.max_login_attempts),
-      lockout_seconds: Number(form!.lockout_seconds),
+      lockout_seconds: Number(form!.lockout_seconds), idle_timeout_seconds: Number(form!.idle_timeout_seconds),
     }) }),
     onSuccess: async (saved) => { setSelected(saved); notify('Realm 설정을 저장했습니다.'); await queryClient.invalidateQueries({ queryKey: ['realms'] }) },
   })
@@ -92,7 +92,8 @@ export function RealmsPage() {
           <Typography variant="h3">Token · Session 수명</Typography>
           <TextField label="Access Token (초)" type="number" value={form.access_token_ttl_seconds} onChange={(e) => setForm({ ...form, access_token_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 60, max: 3600 }} />
           <TextField label="Refresh Token (초)" type="number" value={form.refresh_token_ttl_seconds} onChange={(e) => setForm({ ...form, refresh_token_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 300, max: 2592000 }} />
-          <TextField label="SSO Session (초)" type="number" value={form.session_ttl_seconds} onChange={(e) => setForm({ ...form, session_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 300, max: 2592000 }} />
+          <TextField label="SSO Session (초)" type="number" value={form.session_ttl_seconds} onChange={(e) => setForm({ ...form, session_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 300, max: 2592000 }} helperText="로그인 후 활동과 무관하게 세션이 유지되는 최대 시간" />
+          <TextField label="유휴 만료 (초)" type="number" value={form.idle_timeout_seconds} onChange={(e) => setForm({ ...form, idle_timeout_seconds: Number(e.target.value) })} inputProps={{ min: 0, max: 2592000 }} helperText={form.idle_timeout_seconds === 0 ? '0은 사용 안 함. 설정하면 이 시간 동안 사용되지 않은 세션이 만료됩니다.' : `약 ${Math.round(form.idle_timeout_seconds / 60)}분 동안 사용되지 않으면 만료됩니다. 300초 이상, SSO Session 이하로 설정하세요.`} />
           <Typography variant="h3">비밀번호 · 잠금 정책</Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mt: -1 }}>이 Realm의 모든 사용자에게 적용되며, 개인 설정의 비밀번호 변경 화면에도 그대로 안내됩니다.</Typography>
           <TextField label="비밀번호 최소 길이" type="number" value={form.password_min_length} onChange={(e) => setForm({ ...form, password_min_length: Number(e.target.value) })} inputProps={{ min: 8, max: 128 }} helperText="8자에서 128자 사이" />
