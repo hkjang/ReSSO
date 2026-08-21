@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
 )
 
 func TestOpenAPIIncludesUserMutationContracts(t *testing.T) {
@@ -66,5 +68,52 @@ func TestOpenAPIIncludesUserMutationContracts(t *testing.T) {
 			}
 			remaining = remaining[start+end+1:]
 		}
+	}
+}
+
+// TestOpenAPICoversEveryRegisteredRoute walks the router and fails when a route
+// the server answers is absent from the document it publishes as its contract.
+// Twenty-five routes were missing when this was written, including login and
+// logout, so a client generated from the document covered about half the API.
+func TestOpenAPICoversEveryRegisteredRoute(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/openapi.json", nil)
+	response := httptest.NewRecorder()
+	(&Server{}).openAPISpec(response, request)
+	var spec map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &spec); err != nil {
+		t.Fatal(err)
+	}
+	paths, ok := spec["paths"].(map[string]any)
+	if !ok {
+		t.Fatal("spec has no paths object")
+	}
+
+	router, ok := New(nil, nil, nil).Handler().(*chi.Mux)
+	if !ok {
+		t.Fatal("handler is not a chi router")
+	}
+	var missing []string
+	walkErr := chi.Walk(router, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		// The OIDC protocol contract lives in each Realm's discovery document,
+		// and the SPA fallback is not an API route.
+		route = strings.TrimSuffix(route, "/")
+		if !strings.HasPrefix(route, "/api/") {
+			return nil
+		}
+		item, ok := paths[route].(map[string]any)
+		if !ok {
+			missing = append(missing, method+" "+route)
+			return nil
+		}
+		if item[strings.ToLower(method)] == nil {
+			missing = append(missing, method+" "+route)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatal(walkErr)
+	}
+	if len(missing) > 0 {
+		t.Fatalf("routes missing from the OpenAPI document:\n  %s", strings.Join(missing, "\n  "))
 	}
 }

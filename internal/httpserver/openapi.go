@@ -104,6 +104,40 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 			"/api/admin/v1/audit":       openAPIReadPath("Administration", "감사 이벤트 조회"),
 			"/api/admin/v1/system-logs": openAPIReadPath("Administration", "서버 구조화 로그 조회"),
 			"/mcp":                      openAPIPath("post", "MCP", "MCP Streamable HTTP JSON-RPC endpoint", true),
+
+			// The document is served as the API contract, so it has to cover
+			// every route the server registers. A test walks the router and
+			// fails when one is missing, which is how these were found absent.
+			"/api/openapi.json":               openAPIPath("get", "Metadata", "이 OpenAPI 문서", false),
+			"/api/v1/auth/login":              openAPIPath("post", "Personal", "브라우저 로그인", false),
+			"/api/v1/auth/logout":             openAPIPath("post", "Personal", "브라우저 로그아웃", true),
+			"/api/v1/auth/challenge/{token}":  openAPIParameterizedPath("get", "Personal", "로그인 요청 컨텍스트 조회", false, "token"),
+			"/api/v1/me/sessions/{id}":        openAPIParameterizedPath("delete", "Personal", "내 세션 종료", true, "id"),
+			"/api/v1/me/api-keys/{id}":        openAPIParameterizedPath("delete", "Personal", "내 API 키 폐기", true, "id"),
+			"/api/v1/me/api-keys/{id}/rotate": openAPIParameterizedPath("post", "Personal", "내 API 키 회전", true, "id"),
+			"/api/v1/me/approval-capability":  openAPIReadPath("Personal", "내 검토 권한 조회"),
+			"/api/v1/me/requestable-roles":    openAPIReadPath("Personal", "요청 가능한 Role 조회"),
+			"/api/v1/me/requests": map[string]any{
+				"get":  openAPIReadOperation("Personal", "내 접근 요청 조회"),
+				"post": openAPIOperation("Personal", "Role 할당 요청 생성", true),
+			},
+			"/api/v1/me/reviews":                           openAPIReadPath("Personal", "내가 검토할 요청 조회"),
+			"/api/v1/me/reviews/{requestID}/decision":      openAPIParameterizedPath("post", "Personal", "요청 승인 또는 반려", true, "requestID"),
+			"/api/admin/v1/dashboard":                      openAPIReadPath("Administration", "운영 현황과 준비 상태 조회"),
+			"/api/admin/v1/quick-search":                   openAPIReadPath("Administration", "사용자와 Client 통합 검색"),
+			"/api/admin/v1/approvals":                      openAPIReadPath("Administration", "접근 요청 조회"),
+			"/api/admin/v1/approvals/{requestID}/decision": openAPIParameterizedPath("post", "Administration", "접근 요청 승인 또는 반려", true, "requestID"),
+			"/api/admin/v1/realms/{realmID}": map[string]any{
+				"parameters": []any{openAPIPathParameter("realmID")},
+				"get":        openAPIReadOperation("Administration", "Realm 조회"),
+				"put":        openAPIOperation("Administration", "Realm 설정 변경", true),
+			},
+			"/api/admin/v1/realms/{realmID}/keys":                              openAPIParameterizedPath("get", "Administration", "Realm 서명 키 목록", false, "realmID"),
+			"/api/admin/v1/realms/{realmID}/sessions":                          openAPIParameterizedPath("get", "Administration", "Realm SSO 세션 조회", false, "realmID"),
+			"/api/admin/v1/realms/{realmID}/sessions/{sessionID}":              openAPIParameterizedPath("delete", "Administration", "SSO 세션 강제 종료", true, "realmID", "sessionID"),
+			"/api/admin/v1/realms/{realmID}/clients/{clientID}":                openAPIParameterizedPath("put", "Administration", "OIDC Client 변경", true, "realmID", "clientID"),
+			"/api/admin/v1/realms/{realmID}/clients/{clientID}/rotate-secret":  openAPIParameterizedPath("post", "Administration", "Client Secret 회전", true, "realmID", "clientID"),
+			"/api/admin/v1/realms/{realmID}/clients/{clientID}/roles/{roleID}": openAPIParameterizedPath("delete", "Administration", "Client Role 삭제", true, "realmID", "clientID", "roleID"),
 		},
 		"components": map[string]any{
 			"securitySchemes": map[string]any{
