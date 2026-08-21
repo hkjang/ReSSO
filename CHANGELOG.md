@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0
 
 ### 사용성
 
@@ -20,6 +20,16 @@
 - 감사 이벤트와 서버 로그의 시각을 초 단위로 표시합니다. 이전에는 분까지만 표시되어 같은 분에 일어난 사건의 순서를 화면에서 구분할 수 없었습니다.
 - Client 목록과 SSO 세션 목록에 검색을 추가했습니다. "이 사용자가 연 세션"을 찾으려면 Realm 전체를 스크롤해야 했습니다.
 - 동일 공급자의 동시 동기화를 차단합니다. 이전에는 전체 디렉터리를 훑는 작업이 겹쳐 같은 사용자에 대한 쓰기가 교차될 수 있었습니다. 진행 중이면 `409`로 거절하고, 중단된 실행은 30분 후 자동 해제되어 공급자가 영구히 잠기지 않습니다. 예약 동기화가 수동 실행과 겹치면 실패가 아닌 건너뜀으로 기록합니다.
+
+### Upgrade notes
+
+- **`POST /api/admin/v1/realms/{realmID}/user-federations/{federationID}/sync`의 응답이 바뀝니다.** 이전에는 동기화가 끝날 때까지 기다린 뒤 `200`과 집계(`read`, `added`, `updated`, `failed`, `disabled`)를 반환했습니다. 이제 즉시 `202`와 `{status, message}`를 반환하고, 결과는 공급자 목록의 `last_sync_*` 필드에서 확인합니다. 이 endpoint를 호출하는 자동화가 있다면 수정이 필요합니다. 진행 중 재호출은 `409`입니다.
+- 관리 API에 정렬 파라미터가 추가되었습니다(`sort`, `order`). 지정하지 않으면 기존 정렬을 유지하므로 기존 호출은 그대로 동작합니다.
+- 감사 이벤트 조회에 `event_type`, `result`, `actor`, `trace_id`, `order` 필터가 추가되고 응답이 `{items, total}` 형태가 되었습니다. 이전에는 `{items}`만 반환했으므로 이 endpoint를 사용하는 자동화는 확인이 필요합니다.
+- Realm Role 목록 응답에 `assigned_users`, `builtin` 필드가, 승인 요청 목록 응답에 요청자·검토자·대상 Role 이름이 추가되었습니다. 모두 추가 필드입니다.
+- 새 endpoint: `GET /api/admin/v1/audit/event-types`.
+- 데이터베이스 마이그레이션은 없습니다.
+- 공식 오프라인 Docker 아카이브는 `linux/amd64` 전용입니다.
 
 ## v0.3.0
 

@@ -146,7 +146,7 @@ Archive:       resso-vX.Y.Z.tar.gz
 로컬에서 동일한 아카이브를 만들려면:
 
 ```bash
-./scripts/release-image.sh v0.3.0
+./scripts/release-image.sh v0.4.0
 ```
 
 ## 운영 지표
