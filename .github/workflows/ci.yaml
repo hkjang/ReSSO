@@ -37,6 +37,8 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Test backend
+        env:
+          RESSO_TEST_POSTGRES_DSN: postgres://resso:integration-password@127.0.0.1:5432/resso?sslmode=disable
         run: go test -race -coverprofile=coverage.out ./... && go tool cover -func=coverage.out && go vet ./...
       - name: Build frontend
         working-directory: web

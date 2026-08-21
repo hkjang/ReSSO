@@ -63,14 +63,14 @@ func scanAuthorizationRequest(row pgx.Row) (AuthorizationRequest, error) {
 func (s *Store) AuthorizationRequestByToken(ctx context.Context, token string) (AuthorizationRequest, error) {
 	return scanAuthorizationRequest(s.Pool.QueryRow(ctx, `SELECT id,realm_id,client_id,redirect_uri,response_type,
         scope,state,nonce,code_challenge,code_challenge_method,prompt,expires_at FROM authorization_requests
-        WHERE token_hash=$1 AND consumed_at IS NULL AND expires_at>now()`, s.Sealer.Digest(token)))
+        WHERE token_hash=ANY($1::bytea[]) AND consumed_at IS NULL AND expires_at>now()`, s.Sealer.Digests(token)))
 }
 
 func (s *Store) ConsumeAuthorizationRequest(ctx context.Context, token string) (AuthorizationRequest, error) {
 	return scanAuthorizationRequest(s.Pool.QueryRow(ctx, `UPDATE authorization_requests SET consumed_at=now()
-        WHERE token_hash=$1 AND consumed_at IS NULL AND expires_at>now()
+        WHERE token_hash=ANY($1::bytea[]) AND consumed_at IS NULL AND expires_at>now()
         RETURNING id,realm_id,client_id,redirect_uri,response_type,scope,state,nonce,code_challenge,
-        code_challenge_method,prompt,expires_at`, s.Sealer.Digest(token)))
+        code_challenge_method,prompt,expires_at`, s.Sealer.Digests(token)))
 }
 
 type AuthorizationCode struct {
@@ -127,7 +127,7 @@ func (s *Store) RedeemAuthorizationCode(ctx context.Context, raw string, validat
 	defer func() { _ = tx.Rollback(ctx) }()
 	code, err := scanAuthorizationCode(tx.QueryRow(ctx, `SELECT id,realm_id,client_id,user_id,session_id,
 		redirect_uri,scope,nonce,code_challenge,code_challenge_method,expires_at FROM authorization_codes
-		WHERE code_hash=$1 AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`, s.Sealer.Digest(raw)))
+		WHERE code_hash=ANY($1::bytea[]) AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`, s.Sealer.Digests(raw)))
 	if err != nil {
 		return AuthorizationCode{}, err
 	}
@@ -189,7 +189,7 @@ func (s *Store) RotateRefreshToken(ctx context.Context, raw string, reducedScope
 	var old RefreshToken
 	var rotatedAt, revokedAt *time.Time
 	err = tx.QueryRow(ctx, `SELECT id,family_id,parent_id,realm_id,client_id,user_id,session_id,scope,
-        expires_at,rotated_at,revoked_at FROM refresh_tokens WHERE token_hash=$1 FOR UPDATE`, s.Sealer.Digest(raw)).Scan(
+        expires_at,rotated_at,revoked_at FROM refresh_tokens WHERE token_hash=ANY($1::bytea[]) FOR UPDATE`, s.Sealer.Digests(raw)).Scan(
 		&old.ID, &old.FamilyID, &old.ParentID, &old.RealmID, &old.ClientID, &old.UserID,
 		&old.SessionID, &old.Scope, &old.ExpiresAt, &rotatedAt, &revokedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -245,7 +245,7 @@ func (s *Store) InspectRefreshToken(ctx context.Context, raw string) (RefreshTok
 	var active bool
 	err := s.Pool.QueryRow(ctx, `SELECT id,family_id,parent_id,realm_id,client_id,user_id,session_id,scope,
         expires_at,(rotated_at IS NULL AND revoked_at IS NULL AND expires_at>now()) FROM refresh_tokens
-        WHERE token_hash=$1`, s.Sealer.Digest(raw)).Scan(&token.ID, &token.FamilyID, &token.ParentID,
+        WHERE token_hash=ANY($1::bytea[])`, s.Sealer.Digests(raw)).Scan(&token.ID, &token.FamilyID, &token.ParentID,
 		&token.RealmID, &token.ClientID, &token.UserID, &token.SessionID, &token.Scope, &token.ExpiresAt, &active)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RefreshToken{}, false, ErrNotFound
@@ -255,7 +255,7 @@ func (s *Store) InspectRefreshToken(ctx context.Context, raw string) (RefreshTok
 
 func (s *Store) RevokeRefreshToken(ctx context.Context, raw string) error {
 	_, err := s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
-        WHERE family_id=(SELECT family_id FROM refresh_tokens WHERE token_hash=$1)`, s.Sealer.Digest(raw))
+        WHERE family_id=(SELECT family_id FROM refresh_tokens WHERE token_hash=ANY($1::bytea[]) LIMIT 1)`, s.Sealer.Digests(raw))
 	return err
 }
 

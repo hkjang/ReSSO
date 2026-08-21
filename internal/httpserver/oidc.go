@@ -325,7 +325,7 @@ func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 		result["preferred_username"] = user.Username
 		result["name"] = user.DisplayName
 	}
-	if slices.Contains(scopes, "email") {
+	if slices.Contains(scopes, "email") && user.Email != "" {
 		result["email"] = user.Email
 		result["email_verified"] = user.EmailVerified
 	}

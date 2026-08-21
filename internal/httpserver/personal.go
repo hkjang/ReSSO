@@ -43,6 +43,11 @@ func (s *Server) updateMyProfile(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
+	current, err := s.store.UserByID(r.Context(), principal.UserID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
 	user, err := s.store.UpdateProfile(r.Context(), principal.UserID, input)
 	if err != nil {
 		if errors.Is(err, store.ErrFederationReadOnly) {
@@ -56,7 +61,7 @@ func (s *Server) updateMyProfile(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err)
 		return
 	}
-	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "PROFILE_UPDATE", "SUCCESS", "user", principal.UserID.String(), nil)
+	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "PROFILE_UPDATE", "SUCCESS", "user", principal.UserID.String(), userAuditDetail(current, user))
 	writeJSON(w, http.StatusOK, user)
 }
 

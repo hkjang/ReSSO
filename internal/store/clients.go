@@ -105,6 +105,10 @@ func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClie
 	if err != nil {
 		return domain.Client{}, fmt.Errorf("web_origins: %w", err)
 	}
+	input.RedirectURIs = nonNilStrings(input.RedirectURIs)
+	input.PostLogoutRedirectURIs = nonNilStrings(input.PostLogoutRedirectURIs)
+	input.GrantTypes = nonNilStrings(input.GrantTypes)
+	input.DefaultScopes = nonNilStrings(input.DefaultScopes)
 	command, err := s.Pool.Exec(ctx, `UPDATE clients SET name=$2,redirect_uris=$3,
         post_logout_redirect_uris=$4,web_origins=$5,grant_types=$6,default_scopes=$7,
         require_pkce=$8,enabled=$9,access_token_ttl_seconds=$10,refresh_token_ttl_seconds=$11,
@@ -143,6 +147,8 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 		return CreatedClient{}, fmt.Errorf("web_origins: %w", err)
 	}
 	input.WebOrigins = normalizedOrigins
+	input.RedirectURIs = nonNilStrings(input.RedirectURIs)
+	input.PostLogoutRedirectURIs = nonNilStrings(input.PostLogoutRedirectURIs)
 	client := domain.Client{ID: uuid.New(), RealmID: realmID, ClientID: input.ClientID, Name: input.Name,
 		Type: input.Type, RedirectURIs: input.RedirectURIs, PostLogoutRedirectURIs: input.PostLogoutRedirectURIs,
 		WebOrigins: input.WebOrigins, GrantTypes: input.GrantTypes, DefaultScopes: input.DefaultScopes,
@@ -172,6 +178,13 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 		return CreatedClient{}, fmt.Errorf("create client: %w", err)
 	}
 	return CreatedClient{Client: client, ClientSecret: secret}, nil
+}
+
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func validateURIs(values []string, allowFragment bool) error {

@@ -140,7 +140,7 @@ export function AppShell() {
           <Box sx={{ flex: 1 }} />
           <Tooltip title="프로필 메뉴"><IconButton onClick={(event) => setProfileAnchor(event.currentTarget)} aria-label="프로필 메뉴"><Avatar sx={{ width: 34, height: 34, bgcolor: 'primary.main', fontSize: 14 }}>{me?.user.display_name?.slice(0, 1) || me?.user.username.slice(0, 1).toUpperCase()}</Avatar></IconButton></Tooltip>
           <Menu anchorEl={profileAnchor} open={Boolean(profileAnchor)} onClose={() => setProfileAnchor(null)} slotProps={{ paper: { sx: { width: 270, mt: 1 } } }}>
-            <Box sx={{ px: 2, py: 1.5 }}><Typography fontWeight={700}>{me?.user.display_name}</Typography><Typography variant="body2" color="text.secondary">{me?.user.email}</Typography></Box>
+            <Box sx={{ px: 2, py: 1.5 }}><Typography fontWeight={700}>{me?.user.display_name}</Typography><Typography variant="body2" color="text.secondary">{me?.user.email || (me?.user.username ? `@${me.user.username}` : '이메일 미등록')}</Typography></Box>
             <Divider />
             <MenuItem onClick={() => { setProfileAnchor(null); navigate('/personal') }}><ListItemIcon><AccountCircleRoundedIcon fontSize="small" /></ListItemIcon>개인 설정</MenuItem>
             {me?.permissions.admin && <MenuItem onClick={() => { setProfileAnchor(null); navigate('/admin') }}><ListItemIcon><AdminPanelSettingsRoundedIcon fontSize="small" /></ListItemIcon>서비스 관리</MenuItem>}

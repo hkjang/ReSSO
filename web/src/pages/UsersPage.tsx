@@ -6,12 +6,13 @@ import { api, jsonBody } from '../lib/api'
 import { useRealms, useRealmSelection } from '../lib/realms'
 import type { User, UserRoleMappings } from '../types'
 import { formatDate } from '../lib/format'
+import { EMAIL_MAX_LENGTH, normalizeEmail } from '../lib/email'
 import { RealmPicker } from '../components/RealmPicker'
 import { PageHeader, ContentCard, StatusChip } from '../components/Page'
 import { DetailDrawer } from '../components/DetailDrawer'
 import { EmptyState, ErrorAlert, PageLoading } from '../components/Feedback'
 
-const blankUser = { username: '', email: '', display_name: '', password: '', enabled: true, manager_id: '' }
+const blankUser = { username: '', email: '', email_verified: false, display_name: '', password: '', enabled: true, manager_id: '' }
 
 export function UsersPage() {
   const queryClient = useQueryClient()
@@ -58,7 +59,7 @@ export function UsersPage() {
     onSuccess: async () => { setCreateOpen(false); setCreateForm(blankUser); await invalidate() },
   })
   const update = useMutation({
-    mutationFn: () => api<User>(`/api/admin/v1/realms/${selection.realmID}/users/${editForm!.id}`, { method: 'PUT', ...jsonBody({ email: editForm!.email, display_name: editForm!.display_name, enabled: editForm!.enabled, manager_id: editForm!.manager_id || undefined }) }),
+    mutationFn: () => api<User>(`/api/admin/v1/realms/${selection.realmID}/users/${editForm!.id}`, { method: 'PUT', ...jsonBody({ email: editForm!.email, email_verified: editForm!.email_verified, display_name: editForm!.display_name, enabled: editForm!.enabled, manager_id: editForm!.manager_id || undefined }) }),
     onSuccess: async (saved) => { setSelected(saved); await invalidate() },
   })
   const reset = useMutation({
@@ -79,6 +80,7 @@ export function UsersPage() {
     },
   })
   const toggle = (values: string[], value: string, setter: (next: string[]) => void) => setter(values.includes(value) ? values.filter((item) => item !== value) : [...values, value])
+  const emailMatchesSelected = normalizeEmail(editForm?.email) === normalizeEmail(selected?.email)
   if (realms.isLoading) return <PageLoading />
   if (realms.error) return <ErrorAlert error={realms.error} />
   return (
@@ -91,7 +93,7 @@ export function UsersPage() {
       <ContentCard noPadding>
         {users.isLoading ? <PageLoading /> : users.error ? <Box sx={{ p: 2 }}><ErrorAlert error={users.error} /></Box> : !users.data?.items.length ? <EmptyState title="사용자가 없습니다" description="검색 조건을 바꾸거나 새 사용자를 추가하세요." /> : <>
           <TableContainer sx={{ maxHeight: 'calc(100vh - 315px)' }}><Table stickyHeader aria-label="사용자 목록"><TableHead><TableRow><TableCell>사용자</TableCell><TableCell>이메일</TableCell><TableCell>소스</TableCell><TableCell>상태</TableCell><TableCell>마지막 비밀번호 변경</TableCell></TableRow></TableHead><TableBody>
-            {users.data.items.map((user) => <TableRow hover key={user.id} onClick={() => setSelected(user)} sx={{ cursor: 'pointer' }} tabIndex={0} onKeyDown={(e) => { if (e.key === 'Enter') setSelected(user) }}><TableCell><Typography fontWeight={680}>{user.display_name}</Typography><Typography variant="caption" color="text.secondary" className="mono">{user.username}</Typography></TableCell><TableCell>{user.email}</TableCell><TableCell>{user.federation_id ? <Chip label="LDAP" size="small" color="secondary" variant="outlined" /> : <Chip label="Local" size="small" variant="outlined" />}</TableCell><TableCell><StatusChip active={user.enabled && !user.locked_until} activeLabel="정상" inactiveLabel={user.locked_until ? '잠김' : '비활성'} /></TableCell><TableCell>{formatDate(user.password_changed_at)}</TableCell></TableRow>)}
+            {users.data.items.map((user) => <TableRow hover key={user.id} onClick={() => setSelected(user)} sx={{ cursor: 'pointer' }} tabIndex={0} onKeyDown={(e) => { if (e.key === 'Enter') setSelected(user) }}><TableCell><Typography fontWeight={680}>{user.display_name}</Typography><Typography variant="caption" color="text.secondary" className="mono">{user.username}</Typography></TableCell><TableCell>{user.email ? <Stack direction="row" spacing={.7} alignItems="center"><span>{user.email}</span>{user.email_verified && <Chip label="확인됨" size="small" color="success" variant="outlined" />}</Stack> : '—'}</TableCell><TableCell>{user.federation_id ? <Chip label="LDAP" size="small" color="secondary" variant="outlined" /> : <Chip label="Local" size="small" variant="outlined" />}</TableCell><TableCell><StatusChip active={user.enabled && !user.locked_until} activeLabel="정상" inactiveLabel={user.locked_until ? '잠김' : '비활성'} /></TableCell><TableCell>{formatDate(user.password_changed_at)}</TableCell></TableRow>)}
           </TableBody></Table></TableContainer>
           <TablePagination component="div" count={users.data.total ?? users.data.items.length} page={page} rowsPerPage={rowsPerPage} rowsPerPageOptions={[25, 50, 100]} onPageChange={(_, next) => setPage(next)} onRowsPerPageChange={(event) => { setRowsPerPage(Number(event.target.value)); setPage(0) }} labelRowsPerPage="페이지당" />
         </>}
@@ -100,7 +102,8 @@ export function UsersPage() {
         {create.error && <ErrorAlert error={create.error} />}
         <TextField label="아이디" required autoComplete="off" value={createForm.username} onChange={(e) => setCreateForm({ ...createForm, username: e.target.value })} inputProps={{ maxLength: 128 }} />
         <TextField label="표시 이름" required value={createForm.display_name} onChange={(e) => setCreateForm({ ...createForm, display_name: e.target.value })} />
-        <TextField label="이메일" required type="email" value={createForm.email} onChange={(e) => setCreateForm({ ...createForm, email: e.target.value })} />
+        <TextField label="이메일 (선택)" type="email" value={createForm.email} inputProps={{ maxLength: EMAIL_MAX_LENGTH }} onChange={(e) => { const email = e.target.value; setCreateForm({ ...createForm, email, email_verified: email.trim() ? createForm.email_verified : false }) }} />
+        <FormControlLabel control={<Switch checked={createForm.email_verified} disabled={!createForm.email.trim()} onChange={(e) => setCreateForm({ ...createForm, email_verified: e.target.checked })} />} label="관리자가 이메일을 확인함" />
         <TextField label="초기 비밀번호" required type="password" autoComplete="new-password" value={createForm.password} onChange={(e) => setCreateForm({ ...createForm, password: e.target.value })} helperText="Realm 비밀번호 정책의 최소 길이를 충족해야 합니다." />
         <TextField select label="팀장" value={createForm.manager_id} onChange={(e) => setCreateForm({ ...createForm, manager_id: e.target.value })}><MenuItem value="">지정 안 함</MenuItem>{managers.data?.items.map((user) => <MenuItem key={user.id} value={user.id}>{user.display_name} ({user.username})</MenuItem>)}</TextField>
         <FormControlLabel control={<Switch checked={createForm.enabled} onChange={(e) => setCreateForm({ ...createForm, enabled: e.target.checked })} />} label="즉시 활성화" />
@@ -111,7 +114,8 @@ export function UsersPage() {
             {update.error && <ErrorAlert error={update.error} />}{update.isSuccess && <Alert severity="success">사용자 정보를 저장했습니다.</Alert>}
             <TextField label="아이디" value={editForm.username} disabled helperText="아이디는 변경할 수 없습니다." />
             <TextField label="표시 이름" required value={editForm.display_name} onChange={(e) => setEditForm({ ...editForm, display_name: e.target.value })} />
-            <TextField label="이메일" required type="email" value={editForm.email} onChange={(e) => setEditForm({ ...editForm, email: e.target.value })} />
+            <TextField label="이메일 (선택)" type="email" value={editForm.email} inputProps={{ maxLength: EMAIL_MAX_LENGTH }} onChange={(e) => { const email = e.target.value; setEditForm({ ...editForm, email, email_verified: normalizeEmail(email) === normalizeEmail(selected?.email) ? Boolean(selected?.email_verified) : false }) }} helperText={emailMatchesSelected ? '이메일을 변경하거나 비우면 확인 상태가 자동으로 해제됩니다.' : '새 이메일을 먼저 저장한 뒤 관리자가 확인 상태로 변경할 수 있습니다.'} />
+            <FormControlLabel control={<Switch checked={editForm.email_verified} disabled={!editForm.email.trim() || !emailMatchesSelected} onChange={(e) => setEditForm({ ...editForm, email_verified: e.target.checked })} />} label="관리자가 이메일을 확인함" />
             <TextField select label="팀장" value={editForm.manager_id ?? ''} onChange={(e) => setEditForm({ ...editForm, manager_id: e.target.value || undefined })}><MenuItem value="">지정 안 함</MenuItem>{managers.data?.items.filter((u) => u.id !== editForm.id).map((user) => <MenuItem key={user.id} value={user.id}>{user.display_name} ({user.username})</MenuItem>)}</TextField>
             <FormControlLabel control={<Switch checked={editForm.enabled} onChange={(e) => setEditForm({ ...editForm, enabled: e.target.checked })} />} label="계정 활성" />
             <Button type="submit" variant="contained" disabled={update.isPending}>변경 저장</Button>

@@ -182,17 +182,29 @@ func UpdateUser(ctx context.Context, config RuntimeConfig, dn, email, displayNam
 		return err
 	}
 	defer connection.Close()
-	request := ldap.NewModifyRequest(dn, nil)
-	if config.Provider.EmailLDAPAttribute != "" {
-		request.Replace(config.Provider.EmailLDAPAttribute, []string{email})
-	}
-	if config.Provider.DisplayNameLDAPAttribute != "" {
-		request.Replace(config.Provider.DisplayNameLDAPAttribute, []string{displayName})
-	}
+	request := userModifyRequest(config.Provider, dn, email, displayName)
 	if err := connection.Modify(request); err != nil {
 		return fmt.Errorf("update LDAP user: %w", err)
 	}
 	return nil
+}
+
+func userModifyRequest(provider domain.LDAPFederation, dn, email, displayName string) *ldap.ModifyRequest {
+	request := ldap.NewModifyRequest(dn, nil)
+	if provider.EmailLDAPAttribute != "" {
+		if email == "" {
+			// RFC 4511 deletes the complete attribute when a delete change has
+			// no values. Replacing it with a single empty value is rejected by
+			// common LDAP schemas instead of clearing optional mail attributes.
+			request.Delete(provider.EmailLDAPAttribute, nil)
+		} else {
+			request.Replace(provider.EmailLDAPAttribute, []string{email})
+		}
+	}
+	if provider.DisplayNameLDAPAttribute != "" {
+		request.Replace(provider.DisplayNameLDAPAttribute, []string{displayName})
+	}
+	return request
 }
 
 func ChangePassword(ctx context.Context, config RuntimeConfig, dn, current, replacement string) error {

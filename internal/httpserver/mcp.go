@@ -120,21 +120,37 @@ func (s *Server) authenticateMCPPrincipal(r *http.Request) (domain.Principal, er
 	if err != nil {
 		return domain.Principal{}, err
 	}
+	if !realm.Enabled {
+		return domain.Principal{}, errors.New("MCP authorization Realm is unavailable")
+	}
 	verified, err := s.oidc.Verify(r.Context(), realm, raw, "")
-	if err != nil || !slices.Contains(strings.Fields(verified.Extra.Scope), "mcp:read") {
+	scopes := strings.Fields(verified.Extra.Scope)
+	if err != nil || verified.Extra.Type != "Bearer" ||
+		!slices.Contains(scopes, "mcp:read") || verified.Extra.AuthorizedParty == "" ||
+		len(verified.Claims.Audience) != 1 || verified.Claims.Audience[0] != verified.Extra.AuthorizedParty {
 		return domain.Principal{}, errors.New("invalid MCP bearer token")
 	}
 	userID, err := uuid.Parse(verified.Claims.Subject)
 	if err != nil {
 		return domain.Principal{}, errors.New("MCP access token must represent a user")
 	}
+	sessionID, err := uuid.Parse(verified.Extra.SessionID)
+	if err != nil || verified.Extra.SessionState != verified.Extra.SessionID {
+		return domain.Principal{}, errors.New("MCP access token must be bound to a user session")
+	}
+	if err := s.store.ValidateActiveSessionBinding(r.Context(), sessionID, userID, realm.ID); err != nil {
+		return domain.Principal{}, errors.New("MCP access token session is unavailable")
+	}
 	user, err := s.store.UserByID(r.Context(), userID)
-	if err != nil || !user.Enabled {
+	if err != nil || !user.Enabled || user.RealmID != realm.ID {
 		return domain.Principal{}, errors.New("MCP user is unavailable")
 	}
-	realmAdmin, _ := s.store.UserHasRealmRole(r.Context(), user.ID, "realm-admin")
+	realmAdmin, err := s.store.UserHasRealmRole(r.Context(), user.ID, "realm-admin")
+	if err != nil {
+		return domain.Principal{}, errors.New("MCP user authorization is unavailable")
+	}
 	return domain.Principal{UserID: user.ID, RealmID: user.RealmID, Username: user.Username,
-		PlatformAdmin: user.PlatformAdmin, RealmAdmin: realmAdmin, Scopes: strings.Fields(verified.Extra.Scope)}, nil
+		PlatformAdmin: user.PlatformAdmin, RealmAdmin: realmAdmin, Scopes: scopes}, nil
 }
 
 func (s *Server) writeMCPError(w http.ResponseWriter, id json.RawMessage, code int, message string, data any) {

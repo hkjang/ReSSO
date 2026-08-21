@@ -90,7 +90,7 @@ func (s *Service) IssueUserTokens(ctx context.Context, realm domain.Realm, clien
 		extra.PreferredUsername = user.Username
 		extra.Name = user.DisplayName
 	}
-	if containsScope(scopes, "email") {
+	if containsScope(scopes, "email") && user.Email != "" {
 		extra.Email = user.Email
 		verified := user.EmailVerified
 		extra.EmailVerified = &verified

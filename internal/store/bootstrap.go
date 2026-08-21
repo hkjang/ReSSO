@@ -49,9 +49,9 @@ func (s *Store) Bootstrap(ctx context.Context, adminUsername, adminPassword stri
 		}
 		result.AdminUserID = uuid.New()
 		_, err = tx.Exec(ctx, `INSERT INTO users(
-            id,realm_id,username,email,display_name,password_hash,platform_admin,password_changed_at)
-            VALUES($1,$2,$3,$4,$5,$6,true,$7)`, result.AdminUserID, result.RealmID,
-			adminUsername, adminUsername+"@localhost", "Bootstrap Administrator", hashed, time.Now().UTC())
+			id,realm_id,username,email,email_verified,display_name,password_hash,platform_admin,password_changed_at)
+			VALUES($1,$2,$3,'',false,$4,$5,true,$6)`, result.AdminUserID, result.RealmID,
+			adminUsername, "Bootstrap Administrator", hashed, time.Now().UTC())
 		result.Created = err == nil
 	}
 	if err != nil {

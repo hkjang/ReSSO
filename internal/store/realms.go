@@ -16,6 +16,7 @@ import (
 
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
+var ErrInvalidInput = errors.New("invalid input")
 var ErrFederationReadOnly = errors.New("LDAP federation is read-only")
 var ErrFederationPasswordExternal = errors.New("password is managed by the source LDAP directory")
 var ErrFederationOperation = errors.New("LDAP federation operation failed")

@@ -19,25 +19,28 @@ ReSSO는 Go와 React로 만든 오프라인 운영용 Keycloak-compatible OIDC S
 
 ## 환경변수
 
-아래 네 값은 필수이며, Reverse Proxy를 사용하는 경우 신뢰할 Proxy CIDR을 선택적으로 지정합니다.
+PostgreSQL과 최초 관리자 값이 필요하며, 키 보호 설정은 분리형 Keyring 또는 기존 단일 키 중 하나를 선택합니다. Reverse Proxy를 사용하는 경우 신뢰할 Proxy CIDR을 선택적으로 지정합니다.
 
 | 이름 | 설명 |
 |---|---|
 | `POSTGRES_DSN` | PostgreSQL 연결 문자열. 운영에서는 `sslmode=require` 이상을 권장합니다. |
 | `BOOTSTRAP_ADMIN` | 최초 `master` Realm 서비스 관리자 아이디 |
 | `BOOTSTRAP_ADMIN_PASSWORD` | 최초 관리자 비밀번호, 최소 12자 |
-| `ENCRYPTION_KEY` | Signing Private Key와 비밀값 보호용 32바이트 키의 Base64 또는 64자리 Hex 인코딩 |
+| `DATA_ENCRYPTION_KEYS` | 권장. 암호화 Keyring. `key-id:encoded-key`를 쉼표로 구분하며 첫 키가 신규 Signing Private Key·LDAP Credential 암호화에 사용됩니다. |
+| `DIGEST_KEYS` | 권장. Session·Token·API Key HMAC Keyring. 형식은 위와 같고 첫 키가 신규 Digest에 사용됩니다. |
+| `ENCRYPTION_KEY` | v0.2.0 호환 단일 32바이트 키. 분리형 Keyring이 없으면 양쪽 용도로 사용하며, Keyring과 함께 설정하면 Upgrade용 읽기 키로 자동 추가됩니다. |
 | `TRUSTED_PROXY_CIDRS` | 선택. 쉼표로 구분한 Reverse Proxy CIDR. 설정된 Proxy에서 온 `X-Forwarded-For`와 `X-Forwarded-Proto`만 신뢰합니다. |
 
 `BOOTSTRAP_ADMIN_PASSWORD`는 최초 계정 생성에만 사용됩니다. 컨테이너 재시작이나 값 변경으로 기존 비밀번호가 재설정되지 않습니다.
 
-키 생성 예:
+서로 다른 키를 생성하는 예:
 
 ```bash
-openssl rand -base64 32
+printf 'DATA_ENCRYPTION_KEYS=data-2026-08:%s\n' "$(openssl rand -base64 32)"
+printf 'DIGEST_KEYS=digest-2026-08:%s\n' "$(openssl rand -base64 32)"
 ```
 
-`ENCRYPTION_KEY`를 잃으면 저장된 Signing Private Key를 복호화할 수 없습니다. 데이터베이스와 별도로 안전하게 백업하세요.
+두 Keyring은 각각 최소 하나의 32바이트 키가 필요합니다. 기존 `ENCRYPTION_KEY` 단일 키 모드는 v0.2.0 암호문 형식을 유지하므로 모든 인스턴스를 먼저 새 버전으로 안전하게 올릴 수 있습니다. 이후 기존 키를 `legacy` 읽기 키로 유지하며 분리형 Keyring을 활성화하세요. 암호문에는 Data Encryption Key ID가 저장되므로 ID는 키 재료와 함께 불변 식별자로 관리하고, 같은 키 재료라도 ID를 바꾸거나 다른 키에 재사용하지 마세요. `crypto rewrap`은 Signing Private Key와 LDAP Bind Credential만 활성 Data Encryption Key로 다시 암호화합니다. 암호화 키는 rewrap과 진단을 마친 뒤 제거할 수 있지만, Digest Key는 재작성할 수 없으므로 해당 키로 만든 Session·Token·API Key가 모두 만료되거나 회전될 때까지 유지해야 합니다.
 
 ## 실행
 
@@ -45,13 +48,29 @@ PostgreSQL 데이터베이스를 먼저 준비한 후:
 
 ```bash
 cp .env.example .env
-# .env의 네 값을 실제 운영값으로 변경
+# .env의 필수 설정과 키를 실제 운영값으로 변경
 docker compose -f compose.offline.yaml up -d
 ```
 
 브라우저에서 `http://localhost:8080`으로 접속합니다. 운영에서는 TLS를 종료하는 Reverse Proxy 뒤에 배치하고 Realm의 Issuer URL을 외부 HTTPS 주소로 설정하세요. 이때 `TRUSTED_PROXY_CIDRS`를 실제 Proxy 네트워크로 제한해야 Secure Cookie와 원본 Client IP가 올바르게 처리됩니다.
 
 기본 `master` Realm issuer는 최초 기동 시 `http://localhost:8080/realms/master`입니다. 운영 배포 직후 관리자 화면의 Realm 설정에서 실제 외부 URL로 변경해야 합니다.
+
+## 운영 유지보수 CLI
+
+다음 명령은 HTTP 서버를 시작하지 않고 PostgreSQL에 직접 연결합니다. 진단과 복구에는 `POSTGRES_DSN` 및 현재 Keyring이 필요하지만 Bootstrap 관리자 환경변수는 필요하지 않습니다.
+
+```bash
+docker compose -f compose.maintenance.yaml --profile maintenance run --rm resso-maintenance admin diagnose
+docker compose -f compose.maintenance.yaml --profile maintenance run --rm resso-maintenance crypto rewrap
+
+read -rsp 'New recovery password: ' RESSO_RECOVERY_PASSWORD; echo
+printf '%s\n' "$RESSO_RECOVERY_PASSWORD" | docker compose -f compose.maintenance.yaml --profile maintenance run --rm -T resso-maintenance \
+  admin recover --username recovery-admin --password-stdin
+unset RESSO_RECOVERY_PASSWORD
+```
+
+`admin recover`는 `master` Realm의 로컬 관리자를 생성하거나 비밀번호·잠금·권한을 복구하고 기존 Session, Refresh Token, 개인 API Key를 폐기합니다. LDAP 계정을 로컬 계정으로 변환하지 않습니다. 자세한 Keyring 전환 순서는 [운영 가이드](docs/operations.md)를 참고하세요.
 
 ## OIDC 연동
 
@@ -102,6 +121,7 @@ MCP 도구는 기본적으로 읽기 전용이며 Secret이나 Private Key를 �
 ## 오프라인 이미지 반입
 
 GitHub Release에서 `resso-vX.Y.Z.tar.gz`를 내려받아 오프라인망으로 옮깁니다.
+공식 오프라인 아카이브는 `linux/amd64` 전용입니다. ARM64 환경에서는 동일 태그의 소스에서 대상 플랫폼용 이미지를 별도로 빌드해야 합니다.
 
 ```bash
 sha256sum resso-vX.Y.Z.tar.gz
@@ -119,7 +139,7 @@ Archive:       resso-vX.Y.Z.tar.gz
 로컬에서 동일한 아카이브를 만들려면:
 
 ```bash
-./scripts/release-image.sh v0.2.0
+./scripts/release-image.sh v0.2.1
 ```
 
 ## 개발 및 검증
@@ -143,13 +163,13 @@ Smoke test는 PKCE, Scope 기반 Claim, Refresh Token 재사용 탐지, Web Orig
 
 ## 운영 보안
 
-- `POSTGRES_DSN`, Bootstrap Password, `ENCRYPTION_KEY`를 로그에 남기지 마세요.
+- `POSTGRES_DSN`, Bootstrap Password와 모든 Keyring 값을 로그에 남기지 마세요.
 - TLS를 강제하고 PostgreSQL TLS도 활성화하세요.
-- `ENCRYPTION_KEY`와 PostgreSQL 백업을 분리 보관하세요.
+- Data Encryption·Digest Keyring과 PostgreSQL 백업을 서로 분리 보관하세요.
 - 개인 API Key와 Client Secret은 생성 직후 한 번만 표시됩니다.
 - 관리자 화면의 감사 이벤트와 서버 로그를 정기적으로 검토하세요.
 - Signing Key 회전 후 이전 키는 기존 Token 검증을 위해 일정 시간 JWKS에 유지됩니다.
-- LDAP Bind Credential도 `ENCRYPTION_KEY`로 암호화되며 API·MCP·감사로그에 평문으로 반환하지 않습니다.
+- LDAP Bind Credential도 Data Encryption Keyring으로 암호화되며 API·MCP·감사로그에 평문으로 반환하지 않습니다.
 - 현재 릴리즈는 Kerberos/SPNEGO, MFA/TOTP, SAML, WebAuthn, 외부 Identity Broker를 포함하지 않습니다. 해당 기능이 필요한 조직은 별도 보안 검토와 단계적 확장이 필요합니다.
 
 자세한 운영 절차는 [docs/operations.md](docs/operations.md), [LDAP User Federation 가이드](docs/user-federation.md), 호환 범위는 [docs/compatibility.md](docs/compatibility.md)를 참고하세요.

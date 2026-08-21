@@ -60,7 +60,7 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 		EXISTS(SELECT 1 FROM user_roles ur JOIN roles rr ON rr.id=ur.role_id
 		    WHERE ur.user_id=u.id AND rr.name='realm-admin')
         FROM sso_sessions s JOIN users u ON u.id=s.user_id
-        WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now() AND u.enabled=true`, s.Sealer.Digest(rawToken)).Scan(
+        WHERE s.token_hash=ANY($1::bytea[]) AND s.revoked_at IS NULL AND s.expires_at>now() AND u.enabled=true`, s.Sealer.Digests(rawToken)).Scan(
 		&result.Session.ID, &result.Session.RealmID, &result.Session.UserID, &result.Session.Username,
 		&result.Session.IPAddress, &result.Session.UserAgent, &result.Session.AuthMethod, &result.Session.CreatedAt,
 		&result.Session.LastAccess, &result.Session.ExpiresAt, &result.Session.RevokedAt, &result.CSRFHash,
@@ -89,6 +89,27 @@ func (s *Store) SessionAuthTime(ctx context.Context, id uuid.UUID) (time.Time, e
 		return time.Time{}, ErrNotFound
 	}
 	return authTime, err
+}
+
+// ValidateActiveSessionBinding verifies that a user access token's signed sid
+// still names an active session for the exact subject and Realm. Checking all
+// three identifiers prevents a non-user token from borrowing an unrelated
+// user's UUID as its subject.
+func (s *Store) ValidateActiveSessionBinding(ctx context.Context, sessionID, userID, realmID uuid.UUID) error {
+	var valid bool
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM sso_sessions s
+		JOIN users u ON u.id=s.user_id
+		WHERE s.id=$1 AND s.user_id=$2 AND s.realm_id=$3 AND u.realm_id=$3
+			AND s.revoked_at IS NULL AND s.expires_at>now() AND u.enabled=true
+	)`, sessionID, userID, realmID).Scan(&valid)
+	if err != nil {
+		return err
+	}
+	if !valid {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) ValidateCSRF(session AuthenticatedSession, csrf string) bool {

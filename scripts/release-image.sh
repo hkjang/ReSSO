@@ -7,10 +7,22 @@ if [ "$#" -ne 1 ]; then
 fi
 
 release_version="$1"
-case "$release_version" in
-  v[0-9]*.[0-9]*.[0-9]*) ;;
-  *) echo "version must look like vX.Y.Z" >&2; exit 2 ;;
-esac
+is_release_version() {
+  numeric_version="${1#v}"
+  [ "$numeric_version" != "$1" ] || return 1
+  case "$numeric_version" in
+    *[!0-9.]*|.*|*.|*..*) return 1 ;;
+  esac
+  previous_ifs="$IFS"
+  IFS=.
+  set -- $numeric_version
+  IFS="$previous_ifs"
+  [ "$#" -eq 3 ] && [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ]
+}
+if ! is_release_version "$release_version"; then
+  echo "version must look like vX.Y.Z" >&2
+  exit 2
+fi
 
 commit="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

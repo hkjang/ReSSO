@@ -35,7 +35,9 @@
 - Keycloak Theme 또는 전체 Admin Console 호환
 - LDAP Changed Users Sync, 중첩 Group 탐색, LDAP Connection Pool
 
-Claim은 Scope에 따라 최소화됩니다. `profile`은 이름·사용자명, `email`은 이메일과 검증 상태, `roles`는 `realm_access`와 `resource_access`를 제공합니다. v0.2.0 Migration은 기존 Client에 `roles` 기본 Scope를 추가해 이전 동작을 유지합니다.
+Claim은 Scope에 따라 최소화됩니다. `profile`은 이름·사용자명, `email`은 등록된 이메일과 검증 상태, `roles`는 `realm_access`와 `resource_access`를 제공합니다. 이메일이 비어 있으면 `email`과 `email_verified` Claim도 생략합니다. v0.2.0 Migration은 기존 Client에 `roles` 기본 Scope를 추가해 이전 동작을 유지합니다.
+
+`email_verified=true`는 ReSSO가 확인 메일을 발송해 소유권을 검증했다는 뜻이 아니라, Realm 관리자가 조직의 절차와 외부 근거에 따라 해당 이메일을 확인했다는 관리적 attestation입니다. Relying Party는 이 Claim을 조직의 관리자 확인 정책 수준으로 해석해야 하며, 이메일 링크 challenge가 필요한 계정 연결·복구 흐름에서는 별도의 검증을 수행해야 합니다.
 
 ReSSO의 목표는 Keycloak 전체 복제가 아니라 issuer 변경만으로 일반 OIDC Client가 연동되는 핵심 L3~L4 호환 서버입니다. 기존 애플리케이션이 Keycloak Admin API, SAML 또는 고유 SPI를 사용한다면 별도의 Migration 분석이 필요합니다.
 

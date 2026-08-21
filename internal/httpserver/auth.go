@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,6 +51,20 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
+	ip := s.clientIP(r)
+	ipDecision, rateErr := s.store.ConsumeLoginRateLimit(r.Context(), "login/ip/"+ip, 100, 5*time.Minute)
+	if rateErr != nil {
+		s.logger.Error("login IP rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", rateErr)
+		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
+		return
+	}
+	if !ipDecision.Allowed {
+		if ipDecision.Attempts == 101 {
+			s.audit(r, nil, nil, strings.TrimSpace(input.Username), "LOGIN_RATE_LIMITED", "FAILURE", "user", "", map[string]any{"bucket": "ip"})
+		}
+		writeLoginRateLimited(w, r, ipDecision.RetryAfterSeconds)
+		return
+	}
 	var authRequest *store.AuthorizationRequest
 	var realm domain.Realm
 	var err error
@@ -71,18 +86,15 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusUnauthorized, "invalid_credentials", "아이디 또는 비밀번호가 올바르지 않습니다.")
 		return
 	}
-	ip := s.clientIP(r)
-	ipAllowed, rateErr := s.store.AllowLoginAttempt(r.Context(), "login/ip/"+ip, 100, 5*time.Minute)
 	accountBucket := "login/account/" + realm.ID.String() + "/" + strings.ToLower(strings.TrimSpace(input.Username))
-	accountAllowed, accountErr := s.store.AllowLoginAttempt(r.Context(), accountBucket, 30, 5*time.Minute)
-	if rateErr != nil || accountErr != nil {
-		s.logger.Error("login rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", errors.Join(rateErr, accountErr))
+	accountDecision, accountErr := s.store.CheckLoginRateLimit(r.Context(), accountBucket, 30, 5*time.Minute)
+	if accountErr != nil {
+		s.logger.Error("login account rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", accountErr)
 		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
 		return
 	}
-	if !ipAllowed || !accountAllowed {
-		w.Header().Set("Retry-After", "300")
-		writeError(w, r, http.StatusTooManyRequests, "rate_limited", "로그인 요청이 너무 많습니다. 잠시 후 다시 시도하세요.")
+	if !accountDecision.Allowed {
+		writeLoginRateLimited(w, r, accountDecision.RetryAfterSeconds)
 		return
 	}
 	result, err := s.store.Authenticate(r.Context(), realm, input.Username, input.Password)
@@ -92,9 +104,26 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !result.Success {
-		s.audit(r, &realm.ID, nil, strings.TrimSpace(input.Username), "LOGIN_FAILURE", "FAILURE", "user", "", map[string]any{"reason": result.FailureReason})
+		failureDecision, rateErr := s.store.RecordLoginFailure(r.Context(), accountBucket, 30, 5*time.Minute)
+		if rateErr != nil {
+			s.logger.Error("record login failure rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", rateErr)
+			writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
+			return
+		}
+		s.audit(r, &realm.ID, nil, strings.TrimSpace(input.Username), "LOGIN_FAILURE", "FAILURE", "user", "", map[string]any{
+			"reason": result.FailureReason, "rate_limited": !failureDecision.Allowed,
+		})
+		if !failureDecision.Allowed {
+			writeLoginRateLimited(w, r, failureDecision.RetryAfterSeconds)
+			return
+		}
 		message := "아이디 또는 비밀번호가 올바르지 않습니다."
 		writeError(w, r, http.StatusUnauthorized, "invalid_credentials", message)
+		return
+	}
+	if err := s.store.ResetLoginRateLimit(r.Context(), accountBucket); err != nil {
+		s.logger.Error("reset login failure rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", err)
+		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
 		return
 	}
 	authMethod := result.AuthMethod
@@ -131,6 +160,14 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, &realm.ID, &result.User.ID, result.User.Username, "LOGIN_SUCCESS", "SUCCESS", "session", newSession.Session.ID.String(), nil)
 	writeJSON(w, http.StatusOK, response)
+}
+
+func writeLoginRateLimited(w http.ResponseWriter, r *http.Request, retryAfterSeconds int) {
+	if retryAfterSeconds < 1 {
+		retryAfterSeconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+	writeError(w, r, http.StatusTooManyRequests, "rate_limited", "로그인 요청이 너무 많습니다. 잠시 후 다시 시도하세요.")
 }
 
 func (s *Server) setBrowserCookies(w http.ResponseWriter, r *http.Request, session, csrf string, expires time.Time) {
@@ -175,6 +212,16 @@ func (s *Server) audit(r *http.Request, realmID, actorID *uuid.UUID, actorName, 
 		IPAddress: s.clientIP(r), UserAgent: r.UserAgent(), TraceID: traceIDFrom(r.Context()), Detail: detail})
 	if err != nil && !errors.Is(err, contextCanceled(r)) {
 		s.logger.Warn("write audit event failed", "trace_id", traceIDFrom(r.Context()), "error", err)
+	}
+}
+
+func userAuditDetail(before, after domain.User) map[string]any {
+	return map[string]any{
+		"email_changed":         !strings.EqualFold(strings.TrimSpace(before.Email), strings.TrimSpace(after.Email)),
+		"email_verified_before": before.EmailVerified,
+		"email_verified_after":  after.EmailVerified,
+		"enabled_before":        before.Enabled,
+		"enabled_after":         after.Enabled,
 	}
 }
 

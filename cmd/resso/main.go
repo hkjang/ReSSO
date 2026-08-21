@@ -28,6 +28,13 @@ func main() {
 		_ = response.Body.Close()
 		return
 	}
+	if len(os.Args) > 1 && (os.Args[1] == "admin" || os.Args[1] == "crypto") {
+		if err := runMaintenanceCommand(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
+			_, _ = os.Stderr.WriteString("ReSSO maintenance command failed: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		return
+	}
 	console := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
 	bootstrapLogger := slog.New(console)
 	cfg, err := config.Load()
@@ -35,7 +42,7 @@ func main() {
 		bootstrapLogger.Error("configuration validation failed", "error", err)
 		os.Exit(1)
 	}
-	sealer, err := cryptoutil.NewSealer(cfg.EncryptionKey)
+	sealer, err := newSealer(cfg)
 	if err != nil {
 		bootstrapLogger.Error("encryption service initialization failed", "error", err)
 		os.Exit(1)
@@ -105,6 +112,21 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("ReSSO stopped")
+}
+
+func newSealer(cfg config.Config) (*cryptoutil.Sealer, error) {
+	if cfg.LegacySingleKey {
+		return cryptoutil.NewSealer(cfg.DataEncryptionKeys[0].Material)
+	}
+	dataKeys := make([]cryptoutil.NamedKey, 0, len(cfg.DataEncryptionKeys))
+	for _, key := range cfg.DataEncryptionKeys {
+		dataKeys = append(dataKeys, cryptoutil.NamedKey{ID: key.ID, Material: key.Material})
+	}
+	digestKeys := make([]cryptoutil.NamedKey, 0, len(cfg.DigestKeys))
+	for _, key := range cfg.DigestKeys {
+		digestKeys = append(digestKeys, cryptoutil.NamedKey{ID: key.ID, Material: key.Material})
+	}
+	return cryptoutil.NewKeyring(dataKeys, digestKeys)
 }
 
 func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.Logger) {

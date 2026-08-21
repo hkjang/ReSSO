@@ -27,6 +27,8 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, messag
 
 func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	case errors.Is(err, store.ErrInvalidInput):
+		writeError(w, r, http.StatusBadRequest, "invalid_input", "입력값이 올바르지 않습니다.")
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, r, http.StatusNotFound, "not_found", "요청한 항목을 찾을 수 없습니다.")
 	case errors.Is(err, store.ErrConflict):

@@ -4,7 +4,7 @@
 
 1. PostgreSQL 전용 Database와 최소 권한 사용자를 준비합니다.
 2. PostgreSQL 연결에 TLS를 사용합니다.
-3. 32바이트 `ENCRYPTION_KEY`를 생성해 Password Vault에 보관합니다.
+3. 서로 다른 32바이트 Data Encryption Key와 Digest Key를 생성해 Password Vault에 보관합니다.
 4. 12자 이상의 임시 Bootstrap 관리자 비밀번호를 준비합니다.
 5. Reverse Proxy에서 TLS를 종료하고 `/`, `/api`, `/realms`, `/mcp`, `/.well-known` 경로를 변경 없이 전달합니다.
    Proxy 네트워크만 `TRUSTED_PROXY_CIDRS`에 등록합니다. 등록되지 않은 발신지의 전달 Header는 무시됩니다.
@@ -13,13 +13,13 @@
 
 ## 데이터 보호와 백업
 
-PostgreSQL에는 사용자, Client, Session, Refresh Token의 HMAC digest, 감사 이벤트와 AES-256-GCM으로 암호화된 Signing Private Key 및 LDAP Bind Credential이 저장됩니다. 백업 복구에는 동일한 `ENCRYPTION_KEY`가 반드시 필요합니다.
+PostgreSQL에는 사용자, Client, Session, Refresh Token의 HMAC digest, 감사 이벤트와 AES-256-GCM으로 암호화된 Signing Private Key 및 LDAP Bind Credential이 저장됩니다. 백업 복구에는 해당 시점의 Data Encryption·Digest Keyring이 모두 필요합니다.
 
 - PostgreSQL: 조직의 RPO/RTO에 맞춰 PITR 가능한 백업 사용
-- `ENCRYPTION_KEY`: DB와 다른 보안 경계에 복제 보관
+- Data Encryption·Digest Keyring: DB와 다른 보안 경계에 복제 보관
 - 복구 훈련: 격리 환경에서 분기별 수행 권장
 
-`ENCRYPTION_KEY`를 임의 변경한 상태로 서비스를 시작하면 기존 Private Key를 사용할 수 없어 Token 발급이 실패합니다.
+필요한 읽기 키를 제외한 상태로 서비스를 시작하면 기존 Private Key, Session, Token 또는 API Key를 사용할 수 없습니다. Keyring은 쉼표로 구분한 `key-id:base64-or-hex-key` 형식이며 첫 항목이 신규 쓰기에 사용됩니다. 암호문은 Data Encryption Key ID를 참조하므로 ID는 키 재료와 함께 백업하고 rewrap이 끝나기 전에는 이름을 바꾸지 마세요. 같은 ID를 다른 키 재료에 재사용해서도 안 됩니다.
 
 ## 로그와 감사
 
@@ -58,6 +58,39 @@ Docker 이미지에는 `/resso healthcheck`가 포함됩니다.
 
 개인 API Key는 개인 설정에서 회전합니다. 회전 성공과 동시에 이전 키가 폐기되고 새 Secret은 한 번만 표시됩니다.
 
+### Data Encryption·Digest Keyring 회전
+
+다중 인스턴스에서 혼합 배포 중에도 서로의 값을 읽을 수 있도록 다음 두 단계로 순서를 바꿉니다. 예시는 `old`에서 `new`로 회전하는 경우입니다.
+
+1. 모든 인스턴스에 `old:OLD_KEY,new:NEW_KEY`를 배포합니다. 아직 첫 키는 `old`이므로 신규 쓰기는 바뀌지 않습니다.
+2. 모든 인스턴스가 두 키를 가진 것을 확인합니다.
+3. `new:NEW_KEY,old:OLD_KEY` 순서로 Rolling Restart합니다. 어느 인스턴스도 상대가 쓴 값을 읽지 못하는 구간이 없습니다.
+4. 전체 전환 후 아래 명령으로 암호화된 Signing Key와 LDAP Credential을 검증·재암호화합니다.
+
+```bash
+docker compose -f compose.maintenance.yaml --profile maintenance run --rm resso-maintenance admin diagnose
+docker compose -f compose.maintenance.yaml --profile maintenance run --rm resso-maintenance crypto rewrap
+```
+
+`crypto rewrap`은 PostgreSQL의 Signing Private Key와 LDAP Bind Credential을 검증하고 활성 Data Encryption Key로 다시 암호화합니다. Session·Authorization Request/Code·Refresh Token·개인 API Key의 Digest는 원문을 저장하지 않아 재작성하지 않습니다. rewrap 후 `admin diagnose` 결과와 서비스 동작을 확인한 뒤에만 이전 Data Encryption Key를 제거하세요. 이전 Digest Key는 기존 Session과 Token이 만료되고, 그 키로 만든 모든 개인 API Key가 회전 또는 폐기될 때까지 읽기 키로 유지합니다.
+
+v0.2.0의 단일 `ENCRYPTION_KEY`에서 전환할 때는 먼저 기존 설정 그대로 모든 인스턴스를 v0.2.1로 업그레이드합니다. 이 모드에서는 v0.2.0 암호문 형식으로 계속 쓰므로 혼합 배포와 이미지 롤백이 가능합니다. 그 다음 분리형 Keyring을 설정하면서 `ENCRYPTION_KEY`도 유지하면 ReSSO가 기존 키를 `legacy` ID로 양쪽 읽기 Keyring에 자동 추가합니다. 첫 단계에는 `legacy:OLD_KEY,new:NEW_KEY`, 두 번째 단계에는 `new:NEW_KEY,legacy:OLD_KEY` 순서를 사용하세요. 새 Keyring을 활성화하거나 `crypto rewrap`을 실행한 뒤에는 v0.2.0으로 롤백하지 마세요.
+
+## 관리자 진단과 Break-glass 복구
+
+HTTP 서비스가 시작되지 않거나 관리자 계정이 잠긴 경우 유지보수 CLI를 사용합니다.
+
+```bash
+docker compose -f compose.maintenance.yaml --profile maintenance run --rm resso-maintenance admin diagnose
+
+read -rsp 'New recovery password: ' RESSO_RECOVERY_PASSWORD; echo
+printf '%s\n' "$RESSO_RECOVERY_PASSWORD" | docker compose -f compose.maintenance.yaml --profile maintenance run --rm -T resso-maintenance \
+  admin recover --username recovery-admin --password-stdin
+unset RESSO_RECOVERY_PASSWORD
+```
+
+복구 명령은 `master` Realm의 로컬 사용자를 만들거나 재설정하고 `platform_admin`·`realm-admin` 권한을 복구합니다. 계정 잠금을 해제하며 기존 Session, Refresh Token, 개인 API Key를 즉시 폐기하고 감사 이벤트를 기록합니다. Federated 사용자는 로컬 계정으로 바꾸지 않으므로 별도의 로컬 사용자명을 지정해야 합니다.
+
 ## 승인 프로세스
 
 Realm 설정의 “팀장 검토·승인 프로세스 사용”이 켜진 경우에만:
@@ -71,13 +104,15 @@ Realm 설정의 “팀장 검토·승인 프로세스 사용”이 켜진 경우
 
 ## 업그레이드와 롤백
 
-1. PostgreSQL 백업과 `ENCRYPTION_KEY` 복구 가능성을 확인합니다.
+1. PostgreSQL 백업과 모든 Keyring의 복구 가능성을 확인합니다.
 2. 새 `resso:vX.Y.Z` 이미지를 로드합니다.
 3. 단일 인스턴스를 교체하고 `/health/ready`를 확인합니다.
 4. Discovery, 로그인, Token, JWKS, UserInfo smoke test를 수행합니다.
 5. 문제가 있으면 이전 이미지로 Container를 되돌립니다.
 
 DB Migration은 기동 시 Advisory Lock 아래 자동 적용됩니다. Migration 적용 후 애플리케이션 이미지 롤백이 필요한 경우에는 릴리즈 노트의 DB 호환성을 먼저 확인해야 합니다.
+
+GitHub Release에 첨부되는 공식 오프라인 Docker 아카이브는 `linux/amd64` 전용입니다. ARM64 운영 환경은 대상 플랫폼에서 별도 이미지를 빌드하고 동일한 검증 절차를 수행해야 합니다.
 
 ## LDAP Federation 운영
 

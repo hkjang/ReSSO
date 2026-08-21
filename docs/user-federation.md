@@ -12,7 +12,7 @@ ReSSO의 User Federation은 Realm별로 여러 LDAP/Active Directory 공급자�
 6. 수동 전체 동기화 결과와 사용자 화면의 `LDAP` 소스를 확인합니다.
 7. 필요할 때만 자동 동기화 주기와 누락 사용자 `DISABLE` 정책을 켭니다.
 
-Bind Credential은 `ENCRYPTION_KEY`를 이용한 AES-256-GCM envelope로 PostgreSQL에 저장됩니다. 조회 API는 Secret을 반환하지 않고 설정 여부만 제공합니다.
+Bind Credential은 Data Encryption Keyring을 이용한 AES-256-GCM envelope로 PostgreSQL에 저장됩니다. 조회 API는 Secret을 반환하지 않고 설정 여부만 제공합니다.
 
 ## 주요 설정
 

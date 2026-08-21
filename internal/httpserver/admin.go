@@ -225,6 +225,10 @@ func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.store.CreateUser(r.Context(), realmID, input)
 	if err != nil {
+		if errors.Is(err, store.ErrInvalidInput) {
+			writeStoreError(w, r, err)
+			return
+		}
 		writeError(w, r, http.StatusBadRequest, "user_creation_failed", err.Error())
 		return
 	}
@@ -269,7 +273,7 @@ func (s *Server) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err)
 		return
 	}
-	s.audit(r, &realmID, &principal.UserID, principal.Username, "USER_UPDATE", "SUCCESS", "user", user.ID.String(), map[string]any{"enabled": user.Enabled})
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "USER_UPDATE", "SUCCESS", "user", user.ID.String(), userAuditDetail(current, user))
 	writeJSON(w, http.StatusOK, user)
 }
 

@@ -14,6 +14,8 @@ import (
 	"github.com/hkjang/ReSSO/internal/password"
 )
 
+const maxEmailLength = 320
+
 const userColumns = `id,realm_id,username,email,email_verified,display_name,enabled,platform_admin,manager_id,
     federation_id,external_id,external_dn,federation_synced_at,failed_attempts,locked_until,
     password_changed_at,created_at,updated_at`
@@ -67,17 +69,22 @@ func (s *Store) CountUsers(ctx context.Context, realmID uuid.UUID, query string)
 }
 
 type CreateUserInput struct {
-	Username    string     `json:"username"`
-	Email       string     `json:"email"`
-	DisplayName string     `json:"display_name"`
-	Password    string     `json:"password"`
-	Enabled     bool       `json:"enabled"`
-	ManagerID   *uuid.UUID `json:"manager_id,omitempty"`
+	Username      string     `json:"username"`
+	Email         string     `json:"email"`
+	EmailVerified bool       `json:"email_verified"`
+	DisplayName   string     `json:"display_name"`
+	Password      string     `json:"password"`
+	Enabled       bool       `json:"enabled"`
+	ManagerID     *uuid.UUID `json:"manager_id,omitempty"`
 }
 
 func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateUserInput) (domain.User, error) {
 	input.Username = strings.TrimSpace(input.Username)
-	input.Email = strings.TrimSpace(strings.ToLower(input.Email))
+	var err error
+	input.Email, err = normalizeOptionalEmail(input.Email)
+	if err != nil {
+		return domain.User{}, err
+	}
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 	if input.Username == "" || input.Password == "" {
 		return domain.User{}, errors.New("username and password are required")
@@ -98,11 +105,12 @@ func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateU
 	}
 	now := time.Now().UTC()
 	user := domain.User{ID: uuid.New(), RealmID: realmID, Username: input.Username, Email: input.Email,
-		DisplayName: input.DisplayName, Enabled: input.Enabled, ManagerID: input.ManagerID,
+		EmailVerified: input.Email != "" && input.EmailVerified,
+		DisplayName:   input.DisplayName, Enabled: input.Enabled, ManagerID: input.ManagerID,
 		PasswordChanged: now, CreatedAt: now, UpdatedAt: now}
-	_, err = s.Pool.Exec(ctx, `INSERT INTO users(id,realm_id,username,email,display_name,password_hash,enabled,
-        manager_id,password_changed_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$9)`,
-		user.ID, realmID, user.Username, user.Email, user.DisplayName, hashed, user.Enabled, user.ManagerID, now)
+	_, err = s.Pool.Exec(ctx, `INSERT INTO users(id,realm_id,username,email,email_verified,display_name,password_hash,enabled,
+		manager_id,password_changed_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$10)`,
+		user.ID, realmID, user.Username, user.Email, user.EmailVerified, user.DisplayName, hashed, user.Enabled, user.ManagerID, now)
 	if err != nil {
 		return domain.User{}, fmt.Errorf("create user: %w", err)
 	}
@@ -117,10 +125,11 @@ type UpdateProfileInput struct {
 }
 
 type UpdateUserInput struct {
-	Email       string     `json:"email"`
-	DisplayName string     `json:"display_name"`
-	Enabled     bool       `json:"enabled"`
-	ManagerID   *uuid.UUID `json:"manager_id,omitempty"`
+	Email         string     `json:"email"`
+	EmailVerified *bool      `json:"email_verified,omitempty"`
+	DisplayName   string     `json:"display_name"`
+	Enabled       bool       `json:"enabled"`
+	ManagerID     *uuid.UUID `json:"manager_id,omitempty"`
 }
 
 func (s *Store) UpdateUser(ctx context.Context, userID uuid.UUID, input UpdateUserInput) (domain.User, error) {
@@ -128,16 +137,22 @@ func (s *Store) UpdateUser(ctx context.Context, userID uuid.UUID, input UpdateUs
 	if err != nil {
 		return domain.User{}, err
 	}
-	email := strings.TrimSpace(strings.ToLower(input.Email))
+	email, err := normalizeOptionalEmail(input.Email)
+	if err != nil {
+		return domain.User{}, err
+	}
 	displayName := strings.TrimSpace(input.DisplayName)
-	if current.Email != email || current.DisplayName != displayName {
+	emailChanged := !strings.EqualFold(strings.TrimSpace(current.Email), email)
+	if emailChanged || current.DisplayName != displayName {
 		if err := s.updateFederatedAttributes(ctx, current, email, displayName); err != nil {
 			return domain.User{}, err
 		}
 	}
-	command, err := s.Pool.Exec(ctx, `UPDATE users SET email_verified=CASE WHEN email<>$2 THEN false ELSE email_verified END,
+	command, err := s.Pool.Exec(ctx, `UPDATE users SET email_verified=CASE
+		WHEN $2='' OR $7::boolean THEN false
+		WHEN $6::boolean IS NULL THEN email_verified ELSE $6 END,
 		email=$2,display_name=$3,enabled=$4,
-		manager_id=$5,updated_at=now() WHERE id=$1`, userID, email, displayName, input.Enabled, input.ManagerID)
+		manager_id=$5,updated_at=now() WHERE id=$1`, userID, email, displayName, input.Enabled, input.ManagerID, input.EmailVerified, emailChanged)
 	if err != nil {
 		return domain.User{}, fmt.Errorf("update user: %w", err)
 	}
@@ -152,18 +167,81 @@ func (s *Store) UpdateProfile(ctx context.Context, userID uuid.UUID, input Updat
 	if err != nil {
 		return domain.User{}, err
 	}
-	email := strings.TrimSpace(strings.ToLower(input.Email))
-	displayName := strings.TrimSpace(input.DisplayName)
-	if err := s.updateFederatedAttributes(ctx, current, email, displayName); err != nil {
+	email, err := normalizeOptionalEmail(input.Email)
+	if err != nil {
 		return domain.User{}, err
 	}
-	_, err = s.Pool.Exec(ctx, `UPDATE users SET email_verified=CASE WHEN email<>$2 THEN false ELSE email_verified END,
+	displayName := strings.TrimSpace(input.DisplayName)
+	emailChanged := !strings.EqualFold(strings.TrimSpace(current.Email), email)
+	if emailChanged || current.DisplayName != displayName {
+		if err := s.updateFederatedAttributes(ctx, current, email, displayName); err != nil {
+			return domain.User{}, err
+		}
+	}
+	_, err = s.Pool.Exec(ctx, `UPDATE users SET email_verified=CASE WHEN $2='' OR $4::boolean THEN false ELSE email_verified END,
 		email=$2,display_name=$3,updated_at=now() WHERE id=$1`,
-		userID, email, displayName)
+		userID, email, displayName, emailChanged)
 	if err != nil {
 		return domain.User{}, fmt.Errorf("update profile: %w", err)
 	}
 	return s.UserByID(ctx, userID)
+}
+
+func normalizeOptionalEmail(value string) (string, error) {
+	email := strings.ToLower(strings.TrimSpace(value))
+	if email == "" {
+		return "", nil
+	}
+	if len([]rune(email)) > maxEmailLength {
+		return "", fmt.Errorf("%w: email must contain at most %d characters", ErrInvalidInput, maxEmailLength)
+	}
+	if !validMailbox(email) {
+		return "", fmt.Errorf("%w: email must be a single RFC address", ErrInvalidInput)
+	}
+	return email, nil
+}
+
+// validMailbox deliberately accepts the conservative ASCII dot-atom subset of
+// RFC 5322. Display names, comments, quoted local parts, domain literals and
+// internationalized addresses are rejected rather than normalized ambiguously.
+func validMailbox(value string) bool {
+	if strings.Count(value, "@") != 1 {
+		return false
+	}
+	local, domain, _ := strings.Cut(value, "@")
+	if len(local) < 1 || len(local) > 64 || len(domain) < 1 || len(domain) > 255 {
+		return false
+	}
+	if local[0] == '.' || local[len(local)-1] == '.' || strings.Contains(local, "..") {
+		return false
+	}
+	for i := 0; i < len(local); i++ {
+		if !isEmailLocalByte(local[i]) {
+			return false
+		}
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) < 1 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			if !isASCIILetterOrDigit(label[i]) && label[i] != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isEmailLocalByte(value byte) bool {
+	if isASCIILetterOrDigit(value) {
+		return true
+	}
+	return strings.ContainsRune("!#$%&'*+-/=?^_`{|}~.", rune(value))
+}
+
+func isASCIILetterOrDigit(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9'
 }
 
 func (s *Store) ChangePassword(ctx context.Context, userID uuid.UUID, current, replacement string, adminReset bool) error {

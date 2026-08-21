@@ -7,6 +7,14 @@ import (
 )
 
 func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
+	profileUpdate := openAPIJSONOperation("Personal", "내 프로필 변경", true,
+		"UpdateProfileInput", "User", "200", "Updated user")
+	createUser := openAPIJSONOperation("Administration", "사용자 생성", true,
+		"CreateUserInput", "User", "201", "Created user")
+	updateUser := openAPIJSONOperation("Administration", "사용자 변경", true,
+		"UpdateUserInput", "User", "200", "Updated user")
+	resetPassword := openAPIJSONOperation("Administration", "사용자 비밀번호 재설정", true,
+		"ResetPasswordInput", "", "204", "Password reset")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
@@ -22,7 +30,7 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 		"paths": map[string]any{
 			"/api/v1/meta":        openAPIPath("get", "Metadata", "서비스 버전 조회", false),
 			"/api/v1/me":          openAPIReadPath("Personal", "현재 사용자 컨텍스트 조회"),
-			"/api/v1/me/profile":  openAPIPath("put", "Personal", "내 프로필 변경", true),
+			"/api/v1/me/profile":  map[string]any{"put": profileUpdate},
 			"/api/v1/me/password": openAPIPath("put", "Personal", "내 비밀번호 변경", true),
 			"/api/v1/me/sessions": openAPIReadPath("Personal", "내 로그인 세션 조회"),
 			"/api/v1/me/api-keys": map[string]any{
@@ -34,56 +42,195 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 				"post": openAPIOperation("Administration", "Realm 생성", true),
 			},
 			"/api/admin/v1/realms/{realmID}/users": map[string]any{
-				"get":  openAPIReadOperation("Administration", "사용자 목록"),
-				"post": openAPIOperation("Administration", "사용자 생성", true),
+				"parameters": []any{openAPIPathParameter("realmID")},
+				"get":        openAPIReadOperation("Administration", "사용자 목록"),
+				"post":       createUser,
+			},
+			"/api/admin/v1/realms/{realmID}/users/{userID}": map[string]any{
+				"parameters": []any{openAPIPathParameter("realmID"), openAPIPathParameter("userID")},
+				"put":        updateUser,
+			},
+			"/api/admin/v1/realms/{realmID}/users/{userID}/password": map[string]any{
+				"parameters": []any{openAPIPathParameter("realmID"), openAPIPathParameter("userID")},
+				"put":        resetPassword,
 			},
 			"/api/admin/v1/realms/{realmID}/clients": map[string]any{
-				"get":  openAPIReadOperation("Administration", "OIDC Client 목록"),
-				"post": openAPIOperation("Administration", "OIDC Client 생성", true),
+				"parameters": []any{openAPIPathParameter("realmID")},
+				"get":        openAPIReadOperation("Administration", "OIDC Client 목록"),
+				"post":       openAPIOperation("Administration", "OIDC Client 생성", true),
 			},
 			"/api/admin/v1/realms/{realmID}/roles": map[string]any{
-				"get":  openAPIReadOperation("Administration", "Realm Role 목록"),
-				"post": openAPIOperation("Administration", "Realm Role 생성", true),
+				"parameters": []any{openAPIPathParameter("realmID")},
+				"get":        openAPIReadOperation("Administration", "Realm Role 목록"),
+				"post":       openAPIOperation("Administration", "Realm Role 생성", true),
 			},
 			"/api/admin/v1/realms/{realmID}/roles/{roleID}": map[string]any{
-				"put":    openAPIOperation("Administration", "Realm Role 설명 변경", true),
-				"delete": openAPIOperation("Administration", "Realm Role 삭제", true),
+				"parameters": []any{openAPIPathParameter("realmID"), openAPIPathParameter("roleID")},
+				"put":        openAPIOperation("Administration", "Realm Role 설명 변경", true),
+				"delete":     openAPIOperation("Administration", "Realm Role 삭제", true),
 			},
 			"/api/admin/v1/realms/{realmID}/users/{userID}/role-mappings": map[string]any{
-				"get": openAPIReadOperation("Administration", "사용자 Role 매핑 조회"),
-				"put": openAPIOperation("Administration", "사용자 Role 매핑 교체", true),
+				"parameters": []any{openAPIPathParameter("realmID"), openAPIPathParameter("userID")},
+				"get":        openAPIReadOperation("Administration", "사용자 Role 매핑 조회"),
+				"put":        openAPIOperation("Administration", "사용자 Role 매핑 교체", true),
 			},
 			"/api/admin/v1/realms/{realmID}/clients/{clientID}/roles": map[string]any{
-				"get":  openAPIReadOperation("Administration", "Client Role 목록"),
-				"post": openAPIOperation("Administration", "Client Role 생성", true),
+				"parameters": []any{openAPIPathParameter("realmID"), openAPIPathParameter("clientID")},
+				"get":        openAPIReadOperation("Administration", "Client Role 목록"),
+				"post":       openAPIOperation("Administration", "Client Role 생성", true),
 			},
 			"/api/admin/v1/realms/{realmID}/user-federations": map[string]any{
-				"get":  openAPIReadOperation("User Federation", "LDAP 공급자 목록"),
-				"post": openAPIOperation("User Federation", "LDAP 공급자 생성", true),
+				"parameters": []any{openAPIPathParameter("realmID")},
+				"get":        openAPIReadOperation("User Federation", "LDAP 공급자 목록"),
+				"post":       openAPIOperation("User Federation", "LDAP 공급자 생성", true),
 			},
 			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}": map[string]any{
-				"get":    openAPIReadOperation("User Federation", "LDAP 공급자 조회"),
-				"put":    openAPIOperation("User Federation", "LDAP 공급자 변경", true),
-				"delete": openAPIOperation("User Federation", "LDAP 공급자 삭제", true),
+				"parameters": []any{openAPIPathParameter("realmID"), openAPIPathParameter("federationID")},
+				"get":        openAPIReadOperation("User Federation", "LDAP 공급자 조회"),
+				"put":        openAPIOperation("User Federation", "LDAP 공급자 변경", true),
+				"delete":     openAPIOperation("User Federation", "LDAP 공급자 삭제", true),
 			},
-			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}/test-connection":     openAPIPath("post", "User Federation", "LDAP 연결 테스트", true),
-			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}/test-authentication": openAPIPath("post", "User Federation", "LDAP 사용자 인증 테스트", true),
-			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}/sync":                openAPIPath("post", "User Federation", "LDAP 전체 사용자 동기화", true),
-			"/api/admin/v1/realms/{realmID}/keys/rotate":                                         openAPIPath("post", "Administration", "Realm 서명 키 회전", true),
+			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}/test-connection":     openAPIParameterizedPath("post", "User Federation", "LDAP 연결 테스트", true, "realmID", "federationID"),
+			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}/test-authentication": openAPIParameterizedPath("post", "User Federation", "LDAP 사용자 인증 테스트", true, "realmID", "federationID"),
+			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}/sync":                openAPIParameterizedPath("post", "User Federation", "LDAP 전체 사용자 동기화", true, "realmID", "federationID"),
+			"/api/admin/v1/realms/{realmID}/keys/rotate":                                         openAPIParameterizedPath("post", "Administration", "Realm 서명 키 회전", true, "realmID"),
 			"/api/admin/v1/audit":       openAPIReadPath("Administration", "감사 이벤트 조회"),
 			"/api/admin/v1/system-logs": openAPIReadPath("Administration", "서버 구조화 로그 조회"),
 			"/mcp":                      openAPIPath("post", "MCP", "MCP Streamable HTTP JSON-RPC endpoint", true),
 		},
-		"components": map[string]any{"securitySchemes": map[string]any{
-			"SessionCookie": map[string]any{"type": "apiKey", "in": "cookie", "name": sessionCookieName},
-			"PersonalAPIKey": map[string]any{"type": "http", "scheme": "bearer", "bearerFormat": "ReSSO personal API key",
-				"description": "GET 요청은 api:read, 관리자 GET 요청은 추가로 admin:read 범위가 필요합니다."},
-		}},
+		"components": map[string]any{
+			"securitySchemes": map[string]any{
+				"SessionCookie": map[string]any{"type": "apiKey", "in": "cookie", "name": sessionCookieName},
+				"PersonalAPIKey": map[string]any{"type": "http", "scheme": "bearer", "bearerFormat": "ReSSO personal API key",
+					"description": "GET 요청은 api:read, 관리자 GET 요청은 추가로 admin:read 범위가 필요합니다."},
+			},
+			"schemas": openAPIUserSchemas(),
+		},
 	})
+}
+
+func openAPIPathParameter(name string) map[string]any {
+	return map[string]any{
+		"name": name, "in": "path", "required": true,
+		"schema": map[string]any{"type": "string", "format": "uuid"},
+	}
+}
+
+func openAPIJSONOperation(tag, summary string, secured bool, requestSchema, responseSchema, status, description string) map[string]any {
+	operation := openAPIOperation(tag, summary, secured)
+	operation["requestBody"] = map[string]any{
+		"required": true,
+		"content": map[string]any{"application/json": map[string]any{
+			"schema": map[string]any{"$ref": "#/components/schemas/" + requestSchema},
+		}},
+	}
+	response := map[string]any{"description": description}
+	if responseSchema != "" {
+		response["content"] = map[string]any{"application/json": map[string]any{
+			"schema": map[string]any{"$ref": "#/components/schemas/" + responseSchema},
+		}}
+	}
+	operation["responses"] = map[string]any{
+		status: response,
+		"4XX":  map[string]any{"description": "Request error"},
+	}
+	return operation
+}
+
+func openAPIUserSchemas() map[string]any {
+	optionalEmail := map[string]any{
+		"description": "빈 문자열은 이메일 미등록을 뜻합니다. 비어 있지 않으면 단일 ASCII RFC mailbox여야 합니다.",
+		"oneOf": []any{
+			map[string]any{"type": "string", "const": ""},
+			map[string]any{"type": "string", "format": "email", "maxLength": 320},
+		},
+	}
+	emailVerified := map[string]any{
+		"type":        "boolean",
+		"description": "관리자가 이메일 소유 또는 외부 검증 근거를 확인한 상태입니다. 이메일 변경·삭제 시 false로 초기화됩니다.",
+	}
+	return map[string]any{
+		"OptionalEmail": optionalEmail,
+		"User": map[string]any{
+			"type":     "object",
+			"required": []string{"id", "realm_id", "username", "email", "email_verified", "display_name", "enabled"},
+			"properties": map[string]any{
+				"id":             map[string]any{"type": "string", "format": "uuid"},
+				"realm_id":       map[string]any{"type": "string", "format": "uuid"},
+				"username":       map[string]any{"type": "string"},
+				"email":          map[string]any{"$ref": "#/components/schemas/OptionalEmail"},
+				"email_verified": emailVerified,
+				"display_name":   map[string]any{"type": "string"},
+				"enabled":        map[string]any{"type": "boolean"},
+			},
+		},
+		"CreateUserInput": map[string]any{
+			"type":     "object",
+			"required": []string{"username", "password"},
+			"properties": map[string]any{
+				"username":       map[string]any{"type": "string", "minLength": 1, "maxLength": 128},
+				"email":          map[string]any{"$ref": "#/components/schemas/OptionalEmail"},
+				"email_verified": emailVerified,
+				"display_name":   map[string]any{"type": "string"},
+				"password":       map[string]any{"type": "string", "format": "password", "minLength": 1},
+				"enabled":        map[string]any{"type": "boolean"},
+				"manager_id":     nullableUUIDSchema(),
+			},
+		},
+		"UpdateUserInput": map[string]any{
+			"type":     "object",
+			"required": []string{"email", "display_name", "enabled"},
+			"properties": map[string]any{
+				"email": map[string]any{"$ref": "#/components/schemas/OptionalEmail"},
+				"email_verified": map[string]any{
+					"type":        []string{"boolean", "null"},
+					"description": "생략 또는 null이면 기존 상태를 유지합니다. 이메일을 바꾸는 요청에서는 true도 무시되고 false로 초기화됩니다.",
+				},
+				"display_name": map[string]any{"type": "string"},
+				"enabled":      map[string]any{"type": "boolean"},
+				"manager_id":   nullableUUIDSchema(),
+			},
+		},
+		"UpdateProfileInput": map[string]any{
+			"type":     "object",
+			"required": []string{"email", "display_name"},
+			"properties": map[string]any{
+				"email":        map[string]any{"$ref": "#/components/schemas/OptionalEmail"},
+				"display_name": map[string]any{"type": "string"},
+			},
+		},
+		"ResetPasswordInput": map[string]any{
+			"type":     "object",
+			"required": []string{"new_password"},
+			"properties": map[string]any{
+				"new_password": map[string]any{"type": "string", "format": "password", "minLength": 1},
+			},
+		},
+	}
+}
+
+func nullableUUIDSchema() map[string]any {
+	return map[string]any{
+		"oneOf": []any{
+			map[string]any{"type": "string", "format": "uuid"},
+			map[string]any{"type": "null"},
+		},
+	}
 }
 
 func openAPIPath(method, tag, summary string, secured bool) map[string]any {
 	return map[string]any{method: openAPIOperation(tag, summary, secured)}
+}
+
+func openAPIParameterizedPath(method, tag, summary string, secured bool, parameters ...string) map[string]any {
+	items := make([]any, 0, len(parameters))
+	for _, parameter := range parameters {
+		items = append(items, openAPIPathParameter(parameter))
+	}
+	return map[string]any{
+		"parameters": items,
+		method:       openAPIOperation(tag, summary, secured),
+	}
 }
 
 func openAPIReadPath(tag, summary string) map[string]any {

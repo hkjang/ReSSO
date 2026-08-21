@@ -452,6 +452,10 @@ func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederati
 }
 
 func (s *Store) upsertFederatedUser(ctx context.Context, provider domain.LDAPFederation, external federation.User, syncedAt time.Time) (bool, error) {
+	email, err := normalizeOptionalEmail(external.Email)
+	if err != nil {
+		return false, fmt.Errorf("normalize LDAP user email: %w", err)
+	}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -469,7 +473,6 @@ func (s *Store) upsertFederatedUser(ctx context.Context, provider domain.LDAPFed
 	if errors.Is(err, pgx.ErrNoRows) {
 		added = true
 		userID = uuid.New()
-		email := federatedEmail(external)
 		_, err = tx.Exec(ctx, `INSERT INTO users(id,realm_id,username,email,display_name,password_hash,enabled,
             federation_id,external_id,external_dn,federation_synced_at,password_changed_at,created_at,updated_at)
             VALUES($1,$2,$3,$4,$5,$6,true,$7,$8,$9,$10,$10,$10,$10)`, userID, provider.RealmID,
@@ -483,9 +486,11 @@ func (s *Store) upsertFederatedUser(ctx context.Context, provider domain.LDAPFed
 			_, err = tx.Exec(ctx, `UPDATE users SET external_id=$2,external_dn=$3,federation_synced_at=$4,
                 enabled=true,updated_at=now() WHERE id=$1`, userID, external.ExternalID, external.DN, syncedAt)
 		} else {
-			_, err = tx.Exec(ctx, `UPDATE users SET username=$2,email=$3,display_name=$4,external_id=$5,
-                external_dn=$6,federation_synced_at=$7,enabled=true,updated_at=now() WHERE id=$1`, userID,
-				external.Username, federatedEmail(external), external.DisplayName, external.ExternalID, external.DN, syncedAt)
+			_, err = tx.Exec(ctx, `UPDATE users SET username=$2,
+				email_verified=CASE WHEN $3='' OR lower(btrim(email))<>$3 THEN false ELSE email_verified END,
+				email=$3,display_name=$4,external_id=$5,
+				external_dn=$6,federation_synced_at=$7,enabled=true,updated_at=now() WHERE id=$1`, userID,
+				external.Username, email, external.DisplayName, external.ExternalID, external.DN, syncedAt)
 		}
 	}
 	if err != nil {
@@ -550,13 +555,6 @@ func syncFederatedRoles(ctx context.Context, tx pgx.Tx, provider domain.LDAPFede
 		}
 	}
 	return nil
-}
-
-func federatedEmail(user federation.User) string {
-	if user.Email != "" {
-		return user.Email
-	}
-	return strings.ToLower(user.Username) + "@ldap.invalid"
 }
 
 func (s *Store) ClaimDueLDAPFederations(ctx context.Context, limit int) ([]uuid.UUID, error) {
