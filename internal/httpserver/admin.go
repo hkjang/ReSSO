@@ -55,6 +55,7 @@ func (s *Server) adminRoutes(r chi.Router) {
 	r.Get("/approvals", s.adminListApprovals)
 	r.Post("/approvals/{requestID}/decision", s.adminDecideApproval)
 	r.Get("/audit", s.adminListAudit)
+	r.Get("/audit/event-types", s.adminListAuditEventTypes)
 	r.With(s.requirePlatformAdmin).Get("/system-logs", s.adminListSystemLogs)
 }
 
@@ -765,12 +766,36 @@ func (s *Server) adminListAudit(w http.ResponseWriter, r *http.Request) {
 		}
 		realmID = &parsed
 	}
-	items, err := s.store.ListAudit(r.Context(), realmID, queryInt(r, "limit", 100), queryInt(r, "offset", 0))
+	page, err := s.store.ListAudit(r.Context(), store.AuditFilter{
+		RealmID:   realmID,
+		EventType: r.URL.Query().Get("event_type"),
+		Result:    strings.ToUpper(r.URL.Query().Get("result")),
+		Actor:     r.URL.Query().Get("actor"),
+		TraceID:   r.URL.Query().Get("trace_id"),
+		Limit:     queryInt(r, "limit", 100),
+		Offset:    queryInt(r, "offset", 0),
+	})
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, page)
+}
+
+// adminListAuditEventTypes backs the console's event filter with the types the
+// deployment has actually recorded.
+func (s *Server) adminListAuditEventTypes(w http.ResponseWriter, r *http.Request) {
+	var realmID *uuid.UUID
+	principal, _ := principalFrom(r.Context())
+	if !principal.PlatformAdmin {
+		realmID = &principal.RealmID
+	}
+	types, err := s.store.AuditEventTypes(r.Context(), realmID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": types})
 }
 
 func (s *Server) adminListSystemLogs(w http.ResponseWriter, r *http.Request) {

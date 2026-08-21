@@ -130,7 +130,7 @@ export function UsersPage() {
       <PageHeader title="사용자" description="Realm별 계정 수명주기, 잠금과 팀장 관계를 관리합니다." action={{ label: '사용자 추가', onClick: () => setCreateOpen(true) }} />
       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} sx={{ mb: 2 }}>
         <RealmPicker realms={realms.data?.items ?? []} value={selection.realmID} onChange={selection.setRealmID} />
-        <TextField value={searchInput} onChange={(e) => setSearchInput(e.target.value)} placeholder="아이디, 이메일, 이름 검색" aria-label="사용자 검색" sx={{ maxWidth: 400 }} InputProps={{ startAdornment: <InputAdornment position="start"><SearchRoundedIcon /></InputAdornment> }} />
+        <TextField value={searchInput} onChange={(e) => setSearchInput(e.target.value)} placeholder="아이디, 이메일, 이름 검색" sx={{ maxWidth: 400 }} inputProps={{ 'aria-label': '사용자 검색' }} InputProps={{ startAdornment: <InputAdornment position="start"><SearchRoundedIcon /></InputAdornment> }} />
         <ToggleButtonGroup exclusive size="small" value={statusFilter} onChange={(_, value: StatusFilter | null) => value && setStatusFilter(value)} aria-label="상태 필터" sx={{ alignSelf: { sm: 'center' } }}>
           <ToggleButton value="all">전체</ToggleButton>
           <ToggleButton value="locked">잠김</ToggleButton>

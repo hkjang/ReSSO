@@ -136,6 +136,8 @@ export interface Role {
   name: string
   description: string
   created_at: string
+  assigned_users: number
+  builtin: boolean
 }
 
 export interface ClientRole {
@@ -179,6 +181,12 @@ export interface ApprovalRequest {
   decision_note: string
   created_at: string
   decided_at?: string
+  realm_name: string
+  requester_username: string
+  requester_display_name: string
+  reviewer_username?: string
+  /** Set for ROLE_ASSIGNMENT: the role approving would grant. */
+  target_role_name?: string
 }
 
 export interface PasswordPolicy {

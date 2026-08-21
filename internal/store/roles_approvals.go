@@ -21,11 +21,18 @@ type Role struct {
 	Description string    `json:"description"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+	// AssignedUsers lets the console say what deleting a role would take away
+	// and from how many people, instead of asking for a blind confirmation.
+	AssignedUsers int `json:"assigned_users"`
+	// Builtin marks the Realm roles that cannot be deleted.
+	Builtin bool `json:"builtin"`
 }
 
 func (s *Store) ListRoles(ctx context.Context, realmID uuid.UUID) ([]Role, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id,realm_id,name,description,created_at,updated_at
-        FROM roles WHERE realm_id=$1 ORDER BY name`, realmID)
+	rows, err := s.Pool.Query(ctx, `SELECT r.id,r.realm_id,r.name,r.description,r.created_at,r.updated_at,
+        (SELECT count(*) FROM user_roles ur WHERE ur.role_id=r.id),
+        r.name = ANY($2::text[])
+        FROM roles r WHERE r.realm_id=$1 ORDER BY r.name`, realmID, builtinRoleNames)
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +40,8 @@ func (s *Store) ListRoles(ctx context.Context, realmID uuid.UUID) ([]Role, error
 	roles := make([]Role, 0)
 	for rows.Next() {
 		var role Role
-		if err := rows.Scan(&role.ID, &role.RealmID, &role.Name, &role.Description, &role.CreatedAt, &role.UpdatedAt); err != nil {
+		if err := rows.Scan(&role.ID, &role.RealmID, &role.Name, &role.Description, &role.CreatedAt,
+			&role.UpdatedAt, &role.AssignedUsers, &role.Builtin); err != nil {
 			return nil, err
 		}
 		roles = append(roles, role)
@@ -69,9 +77,12 @@ func (s *Store) UpdateRole(ctx context.Context, realmID, roleID uuid.UUID, descr
 	return role, err
 }
 
+// builtinRoleNames are created with every Realm and cannot be removed.
+var builtinRoleNames = []string{"user", "realm-admin", "offline_access"}
+
 func (s *Store) DeleteRole(ctx context.Context, realmID, roleID uuid.UUID) error {
 	command, err := s.Pool.Exec(ctx, `DELETE FROM roles WHERE id=$1 AND realm_id=$2
-		AND name NOT IN ('user','realm-admin','offline_access')`, roleID, realmID)
+		AND NOT (name = ANY($3::text[]))`, roleID, realmID, builtinRoleNames)
 	if err != nil {
 		return err
 	}
@@ -303,22 +314,50 @@ func scanApproval(row pgx.Row) (domain.ApprovalRequest, error) {
 	return request, err
 }
 
-func (s *Store) ListApprovalRequests(ctx context.Context, realmID *uuid.UUID, requesterID, reviewerID *uuid.UUID) ([]domain.ApprovalRequest, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id,realm_id,requester_id,reviewer_id,kind,payload,reason,status,
-        decision_note,created_at,decided_at FROM approval_requests
-        WHERE ($1::uuid IS NULL OR realm_id=$1) AND ($2::uuid IS NULL OR requester_id=$2)
-        AND ($3::uuid IS NULL OR reviewer_id=$3) ORDER BY created_at DESC LIMIT 500`, realmID, requesterID, reviewerID)
+// ApprovalRequestView resolves the identifiers an approval request stores into
+// the names a reviewer needs. Listing the raw record showed a truncated
+// requester UUID and the bare kind, so a reviewer granting a role could see
+// neither who was asking nor which role they would receive.
+type ApprovalRequestView struct {
+	domain.ApprovalRequest
+	RealmName            string `json:"realm_name"`
+	RequesterUsername    string `json:"requester_username"`
+	RequesterDisplayName string `json:"requester_display_name"`
+	ReviewerUsername     string `json:"reviewer_username,omitempty"`
+	// TargetRoleName is set for ROLE_ASSIGNMENT requests and names the role
+	// that approving would grant.
+	TargetRoleName string `json:"target_role_name,omitempty"`
+}
+
+func (s *Store) ListApprovalRequests(ctx context.Context, realmID *uuid.UUID, requesterID, reviewerID *uuid.UUID) ([]ApprovalRequestView, error) {
+	// The role identifier inside the payload is compared as text: it is
+	// untrusted JSON, and casting it to uuid would fail the whole query on a
+	// malformed value rather than simply not matching.
+	rows, err := s.Pool.Query(ctx, `SELECT a.id,a.realm_id,a.requester_id,a.reviewer_id,a.kind,a.payload,a.reason,
+        a.status,a.decision_note,a.created_at,a.decided_at,
+        COALESCE(rl.name,''),COALESCE(u.username,''),COALESCE(u.display_name,''),
+        COALESCE(rv.username,''),COALESCE(ro.name,'')
+        FROM approval_requests a
+        LEFT JOIN realms rl ON rl.id=a.realm_id
+        LEFT JOIN users u ON u.id=a.requester_id
+        LEFT JOIN users rv ON rv.id=a.reviewer_id
+        LEFT JOIN roles ro ON a.kind='ROLE_ASSIGNMENT' AND ro.id::text=a.payload->>'role_id'
+        WHERE ($1::uuid IS NULL OR a.realm_id=$1) AND ($2::uuid IS NULL OR a.requester_id=$2)
+        AND ($3::uuid IS NULL OR a.reviewer_id=$3) ORDER BY a.created_at DESC LIMIT 500`, realmID, requesterID, reviewerID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	requests := make([]domain.ApprovalRequest, 0)
+	requests := make([]ApprovalRequestView, 0)
 	for rows.Next() {
-		request, err := scanApproval(rows)
-		if err != nil {
+		var view ApprovalRequestView
+		if err := rows.Scan(&view.ID, &view.RealmID, &view.RequesterID, &view.ReviewerID, &view.Kind,
+			&view.Payload, &view.Reason, &view.Status, &view.DecisionNote, &view.CreatedAt, &view.DecidedAt,
+			&view.RealmName, &view.RequesterUsername, &view.RequesterDisplayName,
+			&view.ReviewerUsername, &view.TargetRoleName); err != nil {
 			return nil, err
 		}
-		requests = append(requests, request)
+		requests = append(requests, view)
 	}
 	return requests, rows.Err()
 }

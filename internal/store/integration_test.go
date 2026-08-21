@@ -944,3 +944,178 @@ func TestIntegrationUpdateRealmPersistsAndValidatesThePolicy(t *testing.T) {
 		}
 	}
 }
+
+func TestIntegrationApprovalListResolvesRequesterAndTargetRole(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx, `UPDATE realms SET approval_enabled=true WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "team-lead", DisplayName: "Team Lead", Password: "manager-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "requester", DisplayName: "Req Uester", Password: "requester-password-1234",
+		Enabled: true, ManagerID: &manager.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, err := data.CreateRole(ctx, bootstrap.RealmID, "warehouse-operator", "창고 운영")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester, err = data.UserByID(ctx, requester.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateRoleApprovalRequest(ctx, requester, role.ID, "야간 출고 담당"); err != nil {
+		t.Fatal(err)
+	}
+
+	views, err := data.ListApprovalRequests(ctx, &bootstrap.RealmID, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("expected one request, got %d", len(views))
+	}
+	view := views[0]
+	// A reviewer must be able to see who is asking and what approving grants,
+	// not just a truncated identifier and the word ROLE_ASSIGNMENT.
+	if view.RequesterUsername != "requester" || view.RequesterDisplayName != "Req Uester" {
+		t.Fatalf("requester was not resolved: %+v", view)
+	}
+	if view.TargetRoleName != "warehouse-operator" {
+		t.Fatalf("target role was not resolved: %q", view.TargetRoleName)
+	}
+	if view.ReviewerUsername != "team-lead" {
+		t.Fatalf("reviewer was not resolved: %q", view.ReviewerUsername)
+	}
+	if view.RealmName == "" {
+		t.Fatalf("realm was not resolved: %+v", view)
+	}
+
+	// A payload whose role_id is not a UUID must not fail the whole listing.
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO approval_requests(id,realm_id,requester_id,kind,payload,reason,status)
+		VALUES($1,$2,$3,'ROLE_ASSIGNMENT','{"role_id":"not-a-uuid"}','malformed','PENDING')`,
+		uuid.New(), bootstrap.RealmID, requester.ID); err != nil {
+		t.Fatal(err)
+	}
+	views, err = data.ListApprovalRequests(ctx, &bootstrap.RealmID, nil, nil)
+	if err != nil {
+		t.Fatalf("a malformed payload broke the listing: %v", err)
+	}
+	if len(views) != 2 {
+		t.Fatalf("expected two requests, got %d", len(views))
+	}
+}
+
+func TestIntegrationAuditFilterNarrowsAndCountsMatches(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	events := []AuditEvent{
+		{RealmID: &bootstrap.RealmID, ActorName: "alice", EventType: "LOGIN_SUCCESS", Result: "SUCCESS", TraceID: "trace-a"},
+		{RealmID: &bootstrap.RealmID, ActorName: "alice", EventType: "LOGIN_FAILURE", Result: "FAILURE", TraceID: "trace-b"},
+		{RealmID: &bootstrap.RealmID, ActorName: "bob", EventType: "LOGIN_FAILURE", Result: "FAILURE", TraceID: "trace-c"},
+		{RealmID: &bootstrap.RealmID, ActorName: "bob", EventType: "TOKEN_ISSUED", Result: "SUCCESS", TraceID: "trace-d"},
+	}
+	for _, event := range events {
+		if err := data.WriteAudit(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	all, err := data.ListAudit(ctx, AuditFilter{RealmID: &bootstrap.RealmID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all.Total != len(events) || len(all.Items) != len(events) {
+		t.Fatalf("unfiltered listing: total=%d items=%d", all.Total, len(all.Items))
+	}
+
+	for name, tc := range map[string]struct {
+		filter AuditFilter
+		want   int
+	}{
+		"by event type": {AuditFilter{RealmID: &bootstrap.RealmID, EventType: "LOGIN_FAILURE"}, 2},
+		"by result":     {AuditFilter{RealmID: &bootstrap.RealmID, Result: "SUCCESS"}, 2},
+		"by actor":      {AuditFilter{RealmID: &bootstrap.RealmID, Actor: "ali"}, 2},
+		"by trace":      {AuditFilter{RealmID: &bootstrap.RealmID, TraceID: "trace-c"}, 1},
+		"combined":      {AuditFilter{RealmID: &bootstrap.RealmID, EventType: "LOGIN_FAILURE", Actor: "bob"}, 1},
+		"no match":      {AuditFilter{RealmID: &bootstrap.RealmID, EventType: "NOT_AN_EVENT"}, 0},
+	} {
+		page, err := data.ListAudit(ctx, tc.filter)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if page.Total != tc.want || len(page.Items) != tc.want {
+			t.Fatalf("%s: total=%d items=%d, want %d", name, page.Total, len(page.Items), tc.want)
+		}
+	}
+
+	// Paging must report the full match count, not the page size, so the
+	// console can show that older events exist.
+	page, err := data.ListAudit(ctx, AuditFilter{RealmID: &bootstrap.RealmID, Limit: 2, Offset: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != len(events) || len(page.Items) != 2 {
+		t.Fatalf("paged listing: total=%d items=%d", page.Total, len(page.Items))
+	}
+
+	types, err := data.AuditEventTypes(ctx, &bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(types, "LOGIN_FAILURE") || !slices.Contains(types, "TOKEN_ISSUED") {
+		t.Fatalf("event types = %v", types)
+	}
+}
+
+func TestIntegrationRoleListReportsUsageAndBuiltins(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	role, err := data.CreateRole(ctx, bootstrap.RealmID, "warehouse", "창고")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"holder-one", "holder-two"} {
+		user, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+			Username: name, Password: "holder-password-1234", Enabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := data.Pool.Exec(ctx, `INSERT INTO user_roles(user_id,role_id) VALUES($1,$2)`, user.ID, role.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	roles, err := data.ListRoles(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Role{}
+	for _, item := range roles {
+		byName[item.Name] = item
+	}
+	// Deleting a role should not be a blind confirmation.
+	if byName["warehouse"].AssignedUsers != 2 || byName["warehouse"].Builtin {
+		t.Fatalf("warehouse role = %+v", byName["warehouse"])
+	}
+	for _, builtin := range []string{"user", "realm-admin"} {
+		if !byName[builtin].Builtin {
+			t.Fatalf("%s should be reported as built in: %+v", builtin, byName[builtin])
+		}
+	}
+	if err := data.DeleteRole(ctx, bootstrap.RealmID, byName["user"].ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("deleting a built-in role: %v", err)
+	}
+	if err := data.DeleteRole(ctx, bootstrap.RealmID, role.ID); err != nil {
+		t.Fatalf("deleting an assigned role: %v", err)
+	}
+}
