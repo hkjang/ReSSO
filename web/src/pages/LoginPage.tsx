@@ -29,6 +29,7 @@ export function LoginPage() {
   const { meta, refresh } = useAuth()
   const requestToken = useMemo(() => new URLSearchParams(location.search).get('request') ?? '', [location.search])
   const loggedOut = new URLSearchParams(location.search).get('logged_out') === '1'
+  const expired = new URLSearchParams(location.search).get('expired') === '1'
   const [realmInput, setRealmInput] = useState('master')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -98,6 +99,7 @@ export function LoginPage() {
             {challenge.data ? `${challenge.data.client.name}에서 ${challenge.data.realm.display_name} 계정 인증을 요청했습니다.` : 'ReSSO 서비스 관리 및 개인 설정에 접속합니다.'}
           </Typography>
           {loggedOut && <Alert severity="success" sx={{ mb: 2 }}>안전하게 로그아웃되었습니다.</Alert>}
+          {expired && !errorMessage && <Alert severity="warning" sx={{ mb: 2 }}>세션이 만료되어 로그아웃되었습니다. 다시 로그인하세요.</Alert>}
           {challenge.isError && <Alert severity="error" sx={{ mb: 2 }}>로그인 요청이 만료되었습니다. 연결한 서비스에서 다시 시작하세요.</Alert>}
           {errorMessage && !rateLimited && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
           {rateLimited && (

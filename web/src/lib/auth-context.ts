@@ -8,6 +8,8 @@ export interface AuthContextValue {
   authenticated: boolean
   refresh: () => Promise<unknown>
   logout: () => Promise<void>
+  /** True when a signed-in session was rejected by the server. */
+  sessionExpired: boolean
 }
 
 // The context and its hook live apart from the provider component so that

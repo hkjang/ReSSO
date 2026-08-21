@@ -1,3 +1,5 @@
+import { reportUnauthenticated } from './session'
+
 export class APIError extends Error {
   status: number
   code: string
@@ -22,6 +24,10 @@ function retryAfter(response: Response): number | undefined {
   return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : undefined
 }
 
+// The login endpoint answers 401 for a wrong password, which is not an expired
+// session; the identity probe answers 401 when nobody is signed in yet.
+const unauthenticatedIsExpected = ['/api/v1/auth/login', '/api/v1/me']
+
 function cookie(name: string): string {
   const prefix = `${name}=`
   const value = document.cookie.split(';').map((part) => part.trim()).find((part) => part.startsWith(prefix))
@@ -38,6 +44,9 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (csrf) headers.set('X-CSRF-Token', csrf)
   }
   const response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  if (response.status === 401 && !unauthenticatedIsExpected.includes(path.split('?')[0])) {
+    reportUnauthenticated()
+  }
   if (!response.ok) {
     let body: { error?: string; message?: string; error_description?: string; trace_id?: string } = {}
     try { body = await response.json() } catch { /* non-JSON proxy error */ }

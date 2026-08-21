@@ -24,9 +24,11 @@ const APIKeysPage = lazy(() => import('./pages/PersonalPages').then((module) => 
 const PersonalRequestsPage = lazy(() => import('./pages/PersonalPages').then((module) => ({ default: module.PersonalRequestsPage })))
 
 function ProtectedLayout() {
-  const { loading, authenticated } = useAuth()
+  const { loading, authenticated, sessionExpired } = useAuth()
   if (loading) return <PageLoading label="세션을 확인하는 중" />
-  if (!authenticated) return <Navigate to="/login" replace />
+  // An expired session is announced on the login page so the user knows why
+  // they were sent back rather than assuming the console broke.
+  if (!authenticated) return <Navigate to={sessionExpired ? '/login?expired=1' : '/login'} replace />
   return <AppShell />
 }
 
