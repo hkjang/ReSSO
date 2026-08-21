@@ -9,7 +9,7 @@ COPY webui ./webui
 RUN cd web && npm run build
 
 FROM golang:1.26.7-alpine AS go-builder
-ARG VERSION=v0.4.0-dev
+ARG VERSION=v0.4.1-dev
 ARG COMMIT=unknown
 ARG BUILD_TIME=unknown
 WORKDIR /src
@@ -25,7 +25,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     -o /out/resso ./cmd/resso
 
 FROM scratch
-ARG VERSION=v0.4.0-dev
+ARG VERSION=v0.4.1-dev
 ARG COMMIT=unknown
 LABEL org.opencontainers.image.title="ReSSO" \
       org.opencontainers.image.description="Offline-ready Keycloak-compatible OIDC SSO service" \
