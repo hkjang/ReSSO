@@ -9,7 +9,7 @@ ReSSO의 User Federation은 Realm별로 여러 LDAP/Active Directory 공급자�
 3. Connection URL, Bind DN/Credential, Users DN을 입력합니다.
 4. 조직 CA를 PEM으로 넣고 LDAPS 또는 StartTLS를 사용합니다.
 5. 연결 테스트 후 전용 시험 사용자의 인증 테스트를 수행합니다.
-6. 수동 전체 동기화 결과와 사용자 화면의 `LDAP` 소스를 확인합니다.
+6. 수동 전체 동기화를 실행하고, 완료된 뒤 결과와 사용자 화면의 `LDAP` 소스를 확인합니다.
 7. 필요할 때만 자동 동기화 주기와 누락 사용자 `DISABLE` 정책을 켭니다.
 
 Bind Credential은 Data Encryption Keyring을 이용한 AES-256-GCM envelope로 PostgreSQL에 저장됩니다. 조회 API는 Secret을 반환하지 않고 설정 여부만 제공합니다.
@@ -52,6 +52,17 @@ Developers => developer
 ```
 
 전체 Group DN 또는 첫 RDN의 CN으로 일치시킬 수 있습니다. 대상 Realm Role은 먼저 생성되어 있어야 합니다. ReSSO가 추가한 Federation Role만 추적해 제거하므로 관리자가 직접 할당한 동일 Role을 동기화가 임의로 제거하지 않습니다.
+
+## 전체 동기화 실행
+
+전체 동기화는 디렉터리 전체를 조회하고 사용자마다 갱신하므로 규모에 따라 수 분이 걸립니다. 요청은 즉시 반환되고 동기화는 백그라운드에서 계속됩니다.
+
+- 관리 화면은 진행 중에는 `동기화 중`을 표시하고 자동으로 상태를 갱신하며, 완료되면 조회·추가·갱신·실패 건수를 보여줍니다.
+- 같은 공급자에 대해 동기화가 진행 중이면 새 실행은 거부됩니다. 예약 동기화도 같은 규칙을 따르며, 겹치는 경우 실패가 아니라 건너뜀으로 기록됩니다.
+- 서버가 중단되어 실행이 끊기면 30분 뒤 자동으로 해제되어 공급자가 잠긴 상태로 남지 않습니다.
+- 시작과 완료(성공·실패, 건수 포함)는 모두 감사 이벤트로 기록됩니다.
+
+REST API로 실행할 때는 `POST /api/admin/v1/realms/{realmID}/user-federations/{federationID}/sync`가 `202`와 `{status, message}`를 반환합니다. 결과는 공급자 목록의 `last_sync_status`, `last_sync_at`, `last_sync_added`, `last_sync_updated`, `last_sync_failed`에서 확인합니다. 진행 중 재호출은 `409`입니다.
 
 ## 장애 및 보안 동작
 

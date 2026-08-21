@@ -1255,3 +1255,41 @@ func TestIntegrationAuditOrderDirection(t *testing.T) {
 		t.Fatalf("ascending order started with %q", oldest.Items[0].ActorName)
 	}
 }
+
+func TestIntegrationLDAPSyncOutcomeReachesTheAuditTrail(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	created, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldaps://ldap.invalid:636",
+		UsersDN: "ou=people,dc=example,dc=com", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The directory is unreachable, so the run fails; the point is that the
+	// outcome is recorded where it is retained for a year, not only in the
+	// server log. A run under the DISABLE policy deactivates accounts.
+	if _, err := data.SyncLDAPFederation(ctx, created.ID); err == nil {
+		t.Fatal("expected the unreachable directory to fail the sync")
+	}
+	page, err := data.ListAudit(ctx, AuditFilter{RealmID: &bootstrap.RealmID, EventType: "LDAP_FEDERATION_SYNC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 {
+		t.Fatalf("audit events for the sync outcome = %d, want 1", page.Total)
+	}
+	event := page.Items[0]
+	if event.Result != "FAILURE" || event.TargetID != created.ID.String() {
+		t.Fatalf("unexpected audit event: %+v", event)
+	}
+	for _, key := range []string{"provider", "read", "added", "updated", "failed", "disabled", "error"} {
+		if !strings.Contains(string(event.Detail), `"`+key+`"`) {
+			t.Fatalf("audit detail is missing %q: %s", key, event.Detail)
+		}
+	}
+}

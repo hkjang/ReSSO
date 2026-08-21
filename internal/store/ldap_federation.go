@@ -489,6 +489,21 @@ func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederati
         last_sync_added=$4,last_sync_updated=$5,last_sync_failed=$6,
         next_sync_at=CASE WHEN sync_period_seconds>0 THEN now()+make_interval(secs=>sync_period_seconds) END,
         updated_at=now() WHERE id=$1`, provider.ID, status, message, summary.Added, summary.Updated, summary.Failed)
+
+	// The outcome belongs in the audit trail, not only in the server log: a
+	// run under the DISABLE policy deactivates accounts and ends their
+	// sessions, and audit events are retained far longer than logs. Recording
+	// it here covers the scheduled sweep as well as a manual run, neither of
+	// which reported its result to the trail before.
+	realmID := provider.RealmID
+	detail := map[string]any{"provider": provider.Name, "read": summary.Read, "added": summary.Added,
+		"updated": summary.Updated, "failed": summary.Failed, "disabled": summary.Disabled}
+	if message != "" {
+		detail["error"] = message
+	}
+	_ = s.WriteAudit(ctx, AuditEvent{RealmID: &realmID, ActorName: "system",
+		EventType: "LDAP_FEDERATION_SYNC", Result: status, TargetType: "user_federation",
+		TargetID: provider.ID.String(), Detail: detail})
 }
 
 func (s *Store) upsertFederatedUser(ctx context.Context, provider domain.LDAPFederation, external federation.User, syncedAt time.Time) (bool, error) {
