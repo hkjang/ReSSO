@@ -26,7 +26,7 @@ jobs:
       - name: Check for known vulnerabilities
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./internal/... ./cmd/...
+          govulncheck ./cmd/... ./internal/... ./webui/...
       - uses: actions/setup-node@v7
         with:
           node-version: 22.23.0

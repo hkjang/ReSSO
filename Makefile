@@ -4,9 +4,14 @@ VERSION ?= v0.3.0-dev
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
+# The package list mirrors what CI lints. CI runs golangci-lint before the
+# frontend install, so its ./... covers exactly these; locally web/node_modules
+# exists and ships a vendored Go package that must not be linted.
+GO_PACKAGES = ./cmd/... ./internal/... ./webui/...
+
 lint:
-	golangci-lint run ./internal/... ./cmd/...
-	govulncheck ./internal/... ./cmd/...
+	golangci-lint run $(GO_PACKAGES)
+	govulncheck $(GO_PACKAGES)
 	cd web && npm run lint
 
 test:
