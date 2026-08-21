@@ -1119,3 +1119,56 @@ func TestIntegrationRoleListReportsUsageAndBuiltins(t *testing.T) {
 		t.Fatalf("deleting an assigned role: %v", err)
 	}
 }
+
+func TestIntegrationLDAPSyncClaimIsExclusiveAndReleasesWhenStale(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	created, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldaps://ldap.invalid:636",
+		UsersDN: "ou=people,dc=example,dc=com", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if running, err := data.LDAPSyncRunning(ctx, created.ID); err != nil || running {
+		t.Fatalf("a fresh provider reported running: %v %v", running, err)
+	}
+	// The first claim wins; a second must be refused so two full walks of the
+	// directory cannot interleave writes to the same users.
+	claimed, err := data.ClaimLDAPSyncForTest(ctx, created.ID)
+	if err != nil || !claimed {
+		t.Fatalf("first claim: claimed=%v err=%v", claimed, err)
+	}
+	if running, err := data.LDAPSyncRunning(ctx, created.ID); err != nil || !running {
+		t.Fatalf("claimed provider did not report running: %v %v", running, err)
+	}
+	again, err := data.ClaimLDAPSyncForTest(ctx, created.ID)
+	if err != nil || again {
+		t.Fatalf("second claim was granted: claimed=%v err=%v", again, err)
+	}
+	// Starting a sync while one is claimed reports the dedicated error.
+	if _, err := data.SyncLDAPFederation(ctx, created.ID); !errors.Is(err, ErrSyncInProgress) {
+		t.Fatalf("SyncLDAPFederation error = %v, want ErrSyncInProgress", err)
+	}
+
+	// A claim whose owner disappeared must not wedge the provider forever.
+	if _, err := data.Pool.Exec(ctx, `UPDATE user_federations SET updated_at=now()-interval '2 hours' WHERE id=$1`, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if running, err := data.LDAPSyncRunning(ctx, created.ID); err != nil || running {
+		t.Fatalf("a stale claim still reported running: %v %v", running, err)
+	}
+	stale, err := data.ClaimLDAPSyncForTest(ctx, created.ID)
+	if err != nil || !stale {
+		t.Fatalf("stale claim was not released: claimed=%v err=%v", stale, err)
+	}
+
+	if _, err := data.LDAPSyncRunning(ctx, uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown provider error = %v, want ErrNotFound", err)
+	}
+}

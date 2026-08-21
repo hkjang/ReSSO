@@ -187,6 +187,13 @@ func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.
 				syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Minute)
 				summary, syncErr := data.SyncLDAPFederation(syncCtx, id)
 				syncCancel()
+				if errors.Is(syncErr, store.ErrSyncInProgress) {
+					// An administrator started this provider by hand; skipping
+					// is the correct outcome, not a failure.
+					metrics.Add(httpserver.MetricFederationSync, 1, "skipped")
+					logger.Info("scheduled LDAP federation sync skipped: already running", "federation_id", id)
+					continue
+				}
 				if syncErr != nil {
 					metrics.Add(httpserver.MetricFederationSync, 1, "failure")
 					logger.Error("scheduled LDAP federation sync failed", "federation_id", id,

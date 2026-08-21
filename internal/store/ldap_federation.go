@@ -387,6 +387,40 @@ func (s *Store) TestLDAPAuthentication(ctx context.Context, id uuid.UUID, userna
 	return LDAPAuthenticationTestResult{Username: user.Username, DN: user.DN, Email: user.Email, DisplayName: user.DisplayName}, nil
 }
 
+// ErrSyncInProgress reports that a synchronization is already running for the
+// provider. A full synchronization walks the whole directory, so starting a
+// second one concurrently duplicates the work and interleaves writes to the
+// same users.
+var ErrSyncInProgress = errors.New("a synchronization is already running for this provider")
+
+// staleSyncAfter releases a claim whose owner disappeared, so a crash or a
+// restart mid-synchronization cannot wedge the provider permanently.
+const staleSyncAfter = 30 * time.Minute
+
+// LDAPSyncRunning reports whether a run is currently claimed, so the console
+// can refuse to start a second one and show progress for the first.
+func (s *Store) LDAPSyncRunning(ctx context.Context, id uuid.UUID) (bool, error) {
+	var running bool
+	err := s.Pool.QueryRow(ctx, `SELECT last_sync_status='RUNNING'
+        AND updated_at >= now()-make_interval(secs => $2) FROM user_federations WHERE id=$1`,
+		id, int(staleSyncAfter.Seconds())).Scan(&running)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	return running, err
+}
+
+func (s *Store) claimLDAPSync(ctx context.Context, id uuid.UUID) (bool, error) {
+	command, err := s.Pool.Exec(ctx, `UPDATE user_federations
+        SET last_sync_status='RUNNING',last_sync_error='',updated_at=now()
+        WHERE id=$1 AND (last_sync_status <> 'RUNNING' OR updated_at < now()-make_interval(secs => $2))`,
+		id, int(staleSyncAfter.Seconds()))
+	if err != nil {
+		return false, err
+	}
+	return command.RowsAffected() == 1, nil
+}
+
 func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncSummary, error) {
 	runtime, err := s.ldapRuntimeByID(ctx, id)
 	if err != nil {
@@ -398,7 +432,13 @@ func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncS
 		s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, err)
 		return summary, err
 	}
-	_, _ = s.Pool.Exec(ctx, `UPDATE user_federations SET last_sync_status='RUNNING',last_sync_error='',updated_at=now() WHERE id=$1`, id)
+	claimed, err := s.claimLDAPSync(ctx, id)
+	if err != nil {
+		return summary, err
+	}
+	if !claimed {
+		return summary, ErrSyncInProgress
+	}
 	users, err := federation.FetchUsers(ctx, federation.RuntimeConfig{Provider: runtime.Provider, BindCredential: runtime.BindCredential})
 	if err != nil {
 		s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, err)
@@ -752,4 +792,10 @@ func (s *Store) changeFederatedPassword(ctx context.Context, user domain.User, c
 		return fmt.Errorf("%w: %v", ErrFederationOperation, err)
 	}
 	return nil
+}
+
+// ClaimLDAPSyncForTest exposes the claim for tests that need to simulate a run
+// already in progress without reaching a directory server.
+func (s *Store) ClaimLDAPSyncForTest(ctx context.Context, id uuid.UUID) (bool, error) {
+	return s.claimLDAPSync(ctx, id)
 }

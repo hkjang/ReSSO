@@ -4,7 +4,7 @@ import LanRoundedIcon from '@mui/icons-material/LanRounded'
 import PlayArrowRoundedIcon from '@mui/icons-material/PlayArrowRounded'
 import SyncRoundedIcon from '@mui/icons-material/SyncRounded'
 import {
-  Alert, Box, Button, Chip, Dialog, DialogActions, DialogContent, DialogTitle, Divider,
+  Alert, Box, Button, Chip, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, Divider,
   FormControlLabel, Grid, MenuItem, Stack, Switch, Table, TableBody, TableCell, TableContainer,
   TableHead, TableRow, TextField, Typography,
 } from '@mui/material'
@@ -13,6 +13,7 @@ import { ContentCard, PageHeader, StatusChip } from '../components/Page'
 import { DetailDrawer } from '../components/DetailDrawer'
 import { EmptyState, ErrorAlert, PageLoading } from '../components/Feedback'
 import { RealmPicker } from '../components/RealmPicker'
+import { useToast } from '../components/toast-context'
 import { api, jsonBody } from '../lib/api'
 import { formatDate } from '../lib/format'
 import { useRealms, useRealmSelection } from '../lib/realms'
@@ -114,6 +115,7 @@ function requestBody(form: FederationForm, editing: boolean) {
 
 export function UserFederationPage() {
   const queryClient = useQueryClient()
+  const { notify } = useToast()
   const realms = useRealms()
   const selection = useRealmSelection(realms.data?.items)
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -127,6 +129,9 @@ export function UserFederationPage() {
     queryKey: ['ldap-federations', selection.realmID],
     queryFn: () => api<{ items: LDAPFederation[] }>(`/api/admin/v1/realms/${selection.realmID}/user-federations`),
     enabled: Boolean(selection.realmID),
+    // Poll only while something is running, so a finished synchronization
+    // reports itself without the page refetching forever.
+    refetchInterval: (query) => query.state.data?.items.some((item) => item.last_sync_status === 'RUNNING') ? 5_000 : false,
   })
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['ldap-federations', selection.realmID] })
   const save = useMutation({
@@ -140,9 +145,11 @@ export function UserFederationPage() {
   const testConnection = useMutation({
     mutationFn: () => api<{ connected: boolean; duration_ms: number }>(`/api/admin/v1/realms/${selection.realmID}/user-federations/${editing!.id}/test-connection`, { method: 'POST' }),
   })
+  // The server starts the run and answers immediately; progress is followed
+  // through the provider's own status rather than by holding the request open.
   const sync = useMutation({
-    mutationFn: () => api<{ read: number; added: number; updated: number; failed: number; disabled: number }>(`/api/admin/v1/realms/${selection.realmID}/user-federations/${editing!.id}/sync`, { method: 'POST' }),
-    onSuccess: invalidate,
+    mutationFn: () => api<{ status: string; message: string }>(`/api/admin/v1/realms/${selection.realmID}/user-federations/${editing!.id}/sync`, { method: 'POST' }),
+    onSuccess: async (result) => { notify(result.message, 'info'); await invalidate() },
   })
   const testAuth = useMutation({
     mutationFn: () => api<{ authenticated: boolean; user: { username: string; dn: string; display_name: string } }>(`/api/admin/v1/realms/${selection.realmID}/user-federations/${editing!.id}/test-authentication`, { method: 'POST', ...jsonBody({ username: testUsername, password: testPassword }) }),
@@ -152,6 +159,8 @@ export function UserFederationPage() {
     mutationFn: () => api<void>(`/api/admin/v1/realms/${selection.realmID}/user-federations/${editing!.id}${unlinkUsers ? '?unlink_users=true' : ''}`, { method: 'DELETE' }),
     onSuccess: async () => { setDeleteOpen(false); setUnlinkUsers(false); setDrawerOpen(false); setEditing(null); await invalidate() },
   })
+  const liveEditing = providers.data?.items.find((item) => item.id === editing?.id) ?? editing
+  const syncRunning = liveEditing?.last_sync_status === 'RUNNING'
   const openCreate = () => { setEditing(null); setForm({ ...presets.OTHER }); setDrawerOpen(true) }
   const openEdit = (item: LDAPFederation) => { setEditing(item); setForm(toForm(item)); setDrawerOpen(true); setTestUsername(''); setTestPassword('') }
   const applyPreset = (vendor: 'OTHER' | 'AD') => setForm({ ...presets[vendor], name: form.name || presets[vendor].name, priority: form.priority, enabled: form.enabled })
@@ -229,12 +238,18 @@ export function UserFederationPage() {
           </Section>
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} justifyContent="flex-end"><Button type="submit" variant="contained" disabled={save.isPending || !canSave}>{editing ? '설정 저장' : '공급자 생성'}</Button></Stack>
 
-          {editing && <><Divider /><Section title="연결 검증 및 동기화" description="저장된 설정으로 실제 LDAP 서버에 연결합니다. 인증 테스트 비밀번호는 저장하거나 감사로그에 기록하지 않습니다.">
+          {editing && liveEditing && <><Divider /><Section title="연결 검증 및 동기화" description="저장된 설정으로 실제 LDAP 서버에 연결합니다. 인증 테스트 비밀번호는 저장하거나 감사로그에 기록하지 않습니다.">
             <Stack spacing={2}>
               {testConnection.error && <ErrorAlert error={testConnection.error} />}{testConnection.data && <Alert severity="success">LDAP 연결 성공 · {testConnection.data.duration_ms}ms</Alert>}
-              {sync.error && <ErrorAlert error={sync.error} />}{sync.data && <Alert severity="success">사용자 {sync.data.read}명 조회 · 추가 {sync.data.added} · 갱신 {sync.data.updated} · 비활성 {sync.data.disabled}</Alert>}
-              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}><Button startIcon={<PlayArrowRoundedIcon />} variant="outlined" onClick={() => testConnection.mutate()} disabled={testConnection.isPending}>연결 테스트</Button><Button startIcon={<SyncRoundedIcon />} variant="outlined" onClick={() => sync.mutate()} disabled={sync.isPending || !editing.import_enabled}>전체 사용자 동기화</Button></Stack>
-              {editing.last_sync_error && <Alert severity="warning">최근 동기화 오류: {editing.last_sync_error}</Alert>}
+              {sync.error && <ErrorAlert error={sync.error} />}
+              {syncRunning
+                ? <Alert severity="info" icon={<CircularProgress size={18} />}>동기화가 진행 중입니다. 완료되면 아래 결과가 갱신됩니다.</Alert>
+                : liveEditing.last_sync_at && <Alert severity={liveEditing.last_sync_status === 'FAILURE' ? 'warning' : 'success'}>
+                    최근 동기화 {formatDate(liveEditing.last_sync_at)} · 추가 {liveEditing.last_sync_added ?? 0} · 갱신 {liveEditing.last_sync_updated ?? 0} · 실패 {liveEditing.last_sync_failed ?? 0}
+                  </Alert>}
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}><Button startIcon={<PlayArrowRoundedIcon />} variant="outlined" onClick={() => testConnection.mutate()} disabled={testConnection.isPending}>연결 테스트</Button><Button startIcon={syncRunning ? <CircularProgress size={16} /> : <SyncRoundedIcon />} variant="outlined" onClick={() => sync.mutate()} disabled={sync.isPending || syncRunning || !editing.import_enabled}>{syncRunning ? '동기화 중…' : '전체 사용자 동기화'}</Button></Stack>
+              {!editing.import_enabled && <Typography variant="caption" color="text.secondary">사용자 가져오기가 꺼져 있어 전체 동기화를 실행할 수 없습니다.</Typography>}
+              {liveEditing.last_sync_error && !syncRunning && <Alert severity="warning">최근 동기화 오류: {liveEditing.last_sync_error}</Alert>}
               <Divider /><Typography variant="h3">사용자 인증 테스트</Typography>
               {testAuth.error && <ErrorAlert error={testAuth.error} />}{testAuth.data && <Alert severity="success">{testAuth.data.user.display_name} ({testAuth.data.user.username}) 인증 성공</Alert>}
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}><TextField label="LDAP 사용자 아이디" value={testUsername} onChange={(e) => setTestUsername(e.target.value)} autoComplete="off" /><TextField label="LDAP 비밀번호" type="password" value={testPassword} onChange={(e) => setTestPassword(e.target.value)} autoComplete="new-password" /><Button variant="outlined" onClick={() => testAuth.mutate()} disabled={testAuth.isPending || !testUsername.trim() || !testPassword} sx={{ whiteSpace: 'nowrap' }}>인증 테스트</Button></Stack>

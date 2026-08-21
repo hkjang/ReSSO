@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -154,26 +155,47 @@ func (s *Server) adminTestLDAPAuthentication(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "user": result})
 }
 
+// ldapSyncTimeout bounds a manually started run. It matches the window after
+// which store.SyncLDAPFederation treats a claim as abandoned.
+const ldapSyncTimeout = 30 * time.Minute
+
 func (s *Server) adminSyncLDAPFederation(w http.ResponseWriter, r *http.Request) {
 	realmID, federationID, ok := federationParams(w, r)
 	if !ok || !s.ensureFederationRealm(w, r, realmID, federationID) {
 		return
 	}
-	summary, err := s.store.SyncLDAPFederation(r.Context(), federationID)
-	principal, _ := principalFrom(r.Context())
-	result := "SUCCESS"
-	if err != nil {
-		result = "FAILURE"
-	}
-	s.audit(r, &realmID, &principal.UserID, principal.Username, "LDAP_FEDERATION_SYNC", result,
-		"user_federation", federationID.String(), map[string]any{"read": summary.Read, "added": summary.Added,
-			"updated": summary.Updated, "failed": summary.Failed, "disabled": summary.Disabled})
-	if err != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "ldap_sync_failed", "message": err.Error(),
-			"trace_id": traceIDFrom(r.Context()), "summary": summary})
+	// A full synchronization walks the entire directory and routinely outlives
+	// the server's write timeout, so running it inside the request left the
+	// administrator staring at a failed request while the work continued, with
+	// nothing to stop them starting a second one. It is started here and
+	// followed through the provider's own last_sync fields instead.
+	if running, err := s.store.LDAPSyncRunning(r.Context(), federationID); err != nil {
+		writeStoreError(w, r, err)
+		return
+	} else if running {
+		writeError(w, r, http.StatusConflict, "sync_in_progress", "이미 동기화가 진행 중입니다. 완료된 뒤 다시 시도하세요.")
 		return
 	}
-	writeJSON(w, http.StatusOK, summary)
+	principal, _ := principalFrom(r.Context())
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "LDAP_FEDERATION_SYNC_STARTED", "SUCCESS",
+		"user_federation", federationID.String(), nil)
+	// Detach from the request so writing the response does not cancel the run,
+	// while keeping the trace identifier for the log lines it produces.
+	syncCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), ldapSyncTimeout)
+	traceID := traceIDFrom(r.Context())
+	go func() {
+		defer cancel()
+		summary, err := s.store.SyncLDAPFederation(syncCtx, federationID)
+		if err != nil {
+			s.logger.Error("LDAP federation sync failed", "trace_id", traceID, "federation_id", federationID,
+				"read", summary.Read, "failed", summary.Failed, "error", err)
+			return
+		}
+		s.logger.Info("LDAP federation sync completed", "trace_id", traceID, "federation_id", federationID,
+			"read", summary.Read, "added", summary.Added, "updated", summary.Updated, "disabled", summary.Disabled)
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "RUNNING",
+		"message": "동기화를 시작했습니다. 진행 상황은 목록의 동기화 상태에서 확인할 수 있습니다."})
 }
 
 func federationParams(w http.ResponseWriter, r *http.Request) (uuid.UUID, uuid.UUID, bool) {
