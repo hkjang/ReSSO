@@ -1,3 +1,5 @@
+// Package domain holds the entities shared by the storage, OIDC and HTTP
+// layers: Realms, users, clients, roles, sessions and signing keys.
 package domain
 
 import (
@@ -17,6 +19,9 @@ type Realm struct {
 	AccessTokenTTLSeconds  int       `json:"access_token_ttl_seconds"`
 	RefreshTokenTTLSeconds int       `json:"refresh_token_ttl_seconds"`
 	SessionTTLSeconds      int       `json:"session_ttl_seconds"`
+	PasswordMinLength      int       `json:"password_min_length"`
+	MaxLoginAttempts       int       `json:"max_login_attempts"`
+	LockoutSeconds         int       `json:"lockout_seconds"`
 	CreatedAt              time.Time `json:"created_at"`
 	UpdatedAt              time.Time `json:"updated_at"`
 }

@@ -1,0 +1,51 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - bodyclose      # an unclosed response body leaks a connection per request
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - nilerr         # returning nil after a non-nil error hides failures
+    - noctx          # outbound requests must carry a context
+    - rowserrcheck   # pgx rows.Err() is easy to forget and silently truncates
+    - sqlclosecheck
+    - staticcheck
+    - unconvert
+    - unused
+    - usetesting
+
+  settings:
+    errcheck:
+      # Deliberate best-effort writes are marked with `_ =` at the call site.
+      check-type-assertions: true
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+        - shadow
+    staticcheck:
+      checks:
+        - all
+        # QF1001 rewrites explicit negations via De Morgan's law. The existing
+        # "not HTTPS and not loopback HTTP" form states the security rule the
+        # way it is reasoned about, so the rewrite is not an improvement.
+        - -QF1001
+
+  exclusions:
+    generated: lax
+    rules:
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errcheck
+          - noctx
+
+formatters:
+  enable:
+    - gofmt

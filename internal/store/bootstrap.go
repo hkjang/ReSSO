@@ -43,7 +43,7 @@ func (s *Store) Bootstrap(ctx context.Context, adminUsername, adminPassword stri
 	err = tx.QueryRow(ctx, `SELECT id FROM users
         WHERE realm_id=$1 AND username=$2`, result.RealmID, adminUsername).Scan(&result.AdminUserID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		hashed, hashErr := password.Hash(adminPassword)
+		hashed, hashErr := password.HashContext(ctx, adminPassword)
 		if hashErr != nil {
 			return BootstrapResult{}, hashErr
 		}

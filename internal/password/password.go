@@ -1,11 +1,16 @@
+// Package password hashes and verifies user passwords with Argon2id, and
+// bounds how many hashes may run at once so that a burst of authentication
+// attempts cannot exhaust the process.
 package password
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -85,4 +90,58 @@ func parseParam(value, name string) (uint64, error) {
 		return 0, errors.New("invalid password hash parameter")
 	}
 	return n, nil
+}
+
+// Argon2id deliberately trades memory for brute-force resistance: every call
+// allocates DefaultParams.Memory. Without a bound, a burst of authentication
+// attempts multiplies that allocation by the number of in-flight requests and
+// exhausts the process. The gate below keeps peak usage proportional to the
+// available CPUs instead of to the request rate, so excess attempts queue (and
+// observe their caller's deadline) rather than pushing the service into OOM.
+var hashGate = make(chan struct{}, gateCapacity())
+
+func gateCapacity() int {
+	capacity := runtime.GOMAXPROCS(0)
+	if capacity < 2 {
+		capacity = 2
+	}
+	if capacity > 8 {
+		capacity = 8
+	}
+	return capacity
+}
+
+func acquire(ctx context.Context) error {
+	select {
+	case hashGate <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case hashGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func release() { <-hashGate }
+
+// HashContext derives a new password hash, waiting for a free Argon2 slot.
+func HashContext(ctx context.Context, value string) (string, error) {
+	if err := acquire(ctx); err != nil {
+		return "", err
+	}
+	defer release()
+	return Hash(value)
+}
+
+// VerifyContext compares a password against an encoded hash, waiting for a
+// free Argon2 slot. Malformed hashes are rejected before the slot is taken.
+func VerifyContext(ctx context.Context, value, encoded string) (bool, error) {
+	if err := acquire(ctx); err != nil {
+		return false, err
+	}
+	defer release()
+	return Verify(value, encoded)
 }

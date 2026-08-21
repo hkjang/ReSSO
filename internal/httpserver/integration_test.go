@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -17,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -287,4 +290,211 @@ func openHTTPIntegrationStore(t *testing.T) *store.Store {
 		admin.Close()
 	})
 	return data
+}
+
+func TestIntegrationBackchannelLogoutTokenIsSignedAndScoped(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	bootstrap, err := data.Bootstrap(context.Background(), "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "logout-rp", Name: "Logout RP", Type: "confidential",
+		RedirectURIs:         []string{"https://rp.example.com/callback"},
+		BackchannelLogoutURI: "https://rp.example.com/backchannel-logout",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID, userID := uuid.New(), bootstrap.AdminUserID
+
+	service := &ressooidc.Service{Store: data}
+	raw, err := service.IssueLogoutToken(ctx, realm, created.Client, sessionID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify against the Realm's published JWKS, exactly as a relying party
+	// would, then assert the claims required by Back-Channel Logout 1.0.
+	keys, err := data.PublishedSigningKeys(ctx, realm.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := jwt.ParseSigned(raw, []jose.SignatureAlgorithm{jose.RS256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ, _ := parsed.Headers[0].ExtraHeaders[jose.HeaderType].(string); typ != "logout+jwt" {
+		t.Fatalf("logout token typ header = %q, want logout+jwt", typ)
+	}
+	var jwk jose.JSONWebKey
+	if err := json.Unmarshal(keys[0].PublicJWK, &jwk); err != nil {
+		t.Fatal(err)
+	}
+	var standard jwt.Claims
+	var extra map[string]any
+	if err := parsed.Claims(jwk.Key, &standard, &extra); err != nil {
+		t.Fatalf("logout token did not verify against the published JWKS: %v", err)
+	}
+	if standard.Issuer != realm.IssuerURL {
+		t.Fatalf("iss = %q, want %q", standard.Issuer, realm.IssuerURL)
+	}
+	if len(standard.Audience) != 1 || standard.Audience[0] != "logout-rp" {
+		t.Fatalf("aud = %v", standard.Audience)
+	}
+	if standard.Subject != userID.String() {
+		t.Fatalf("sub = %q, want %q", standard.Subject, userID)
+	}
+	if standard.ID == "" || standard.IssuedAt == nil || standard.Expiry == nil {
+		t.Fatalf("logout token is missing jti/iat/exp: %+v", standard)
+	}
+	if extra["sid"] != sessionID.String() {
+		t.Fatalf("sid = %v, want %q", extra["sid"], sessionID)
+	}
+	events, ok := extra["events"].(map[string]any)
+	if !ok {
+		t.Fatalf("events claim = %v", extra["events"])
+	}
+	if _, ok := events["http://schemas.openid.net/event/backchannel-logout"]; !ok {
+		t.Fatalf("events claim is missing the back-channel logout event: %v", events)
+	}
+	// A logout token must never carry a nonce.
+	if _, present := extra["nonce"]; present {
+		t.Fatal("logout token carries a nonce")
+	}
+}
+
+func TestIntegrationMetricsRequireAdminAuthorizationAndRecordRequests(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	if _, bootstrapErr := data.Bootstrap(context.Background(), "admin", "bootstrap-password-123"); bootstrapErr != nil {
+		t.Fatal(bootstrapErr)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Jar = jar
+
+	// Operational detail must not be readable by anyone who can reach the port.
+	response, err := client.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("anonymous /metrics status = %d, want 401", response.StatusCode)
+	}
+
+	login := postIntegrationLogin(t, client, server.URL, "admin", "bootstrap-password-123")
+	if login.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(login.Body)
+		t.Fatalf("login status = %d, body=%s", login.StatusCode, body)
+	}
+	_ = login.Body.Close()
+
+	response, err = client.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated /metrics status = %d, body=%s", response.StatusCode, body)
+	}
+	rendered := string(body)
+	for _, want := range []string{
+		"# TYPE resso_http_requests_total counter",
+		`resso_login_attempts_total{result="success"} 1`,
+		"resso_http_request_duration_seconds_bucket",
+		"resso_uptime_seconds",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("metrics output missing %q:\n%s", want, rendered)
+		}
+	}
+	// Route patterns, not raw paths, keep the series count bounded.
+	if strings.Contains(rendered, `route="/api/v1/auth/login"`) == false {
+		t.Fatalf("login route was not recorded:\n%s", rendered)
+	}
+}
+
+func TestIntegrationClientSecretBruteForceIsLimitedWithoutBlockingNeighbours(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	bootstrap, err := data.Bootstrap(context.Background(), "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	newClient := func(identifier string) store.CreatedClient {
+		created, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+			ClientID: identifier, Name: identifier, Type: "confidential",
+			RedirectURIs:  []string{"https://rp.example.com/callback"},
+			GrantTypes:    []string{"client_credentials"},
+			DefaultScopes: []string{"openid"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return created
+	}
+	target := newClient("target-client")
+	neighbour := newClient("neighbour-client")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+
+	tokenRequest := func(identifier, secret string) int {
+		form := url.Values{"grant_type": {"client_credentials"}, "client_id": {identifier}, "client_secret": {secret}}
+		response, err := client.PostForm(server.URL+"/realms/master/protocol/openid-connect/token", form)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+
+	blockedAfter := 0
+	for attempt := 1; attempt <= clientAuthMaxFailures+5; attempt++ {
+		status := tokenRequest("target-client", "wrong-secret")
+		if status == http.StatusTooManyRequests {
+			blockedAfter = attempt
+			break
+		}
+		if status != http.StatusUnauthorized {
+			t.Fatalf("attempt %d returned %d, want 401", attempt, status)
+		}
+	}
+	if blockedAfter == 0 {
+		t.Fatalf("guessing was never rate limited within %d attempts", clientAuthMaxFailures+5)
+	}
+	if blockedAfter > clientAuthMaxFailures+1 {
+		t.Fatalf("guessing was limited only after %d attempts", blockedAfter)
+	}
+
+	// Relying parties routinely share one egress address. A neighbour with a
+	// correct secret must not be locked out by the client being guessed.
+	if status := tokenRequest("neighbour-client", neighbour.ClientSecret); status != http.StatusOK {
+		t.Fatalf("an unrelated client was blocked by another client's failures: status %d", status)
+	}
+	// The blocked client stays blocked even with the right secret.
+	if status := tokenRequest("target-client", target.ClientSecret); status != http.StatusTooManyRequests {
+		t.Fatalf("the limited client was not still blocked: status %d", status)
+	}
 }

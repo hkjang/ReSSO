@@ -115,6 +115,7 @@ func (s *Store) RewrapEncryptedSecrets(ctx context.Context) (RewrapResult, error
 	if err := tx.Commit(ctx); err != nil {
 		return RewrapResult{}, err
 	}
+	s.InvalidateAllSigningKeys()
 	return result, nil
 }
 
@@ -148,7 +149,7 @@ func (s *Store) RecoverPlatformAdmin(ctx context.Context, username, replacement 
 	if len([]rune(replacement)) < minimum || len([]rune(replacement)) > 1024 {
 		return RecoveryResult{}, fmt.Errorf("recovery password must contain between %d and 1024 characters", minimum)
 	}
-	hashed, err := password.Hash(replacement)
+	hashed, err := password.HashContext(ctx, replacement)
 	if err != nil {
 		return RecoveryResult{}, err
 	}

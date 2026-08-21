@@ -1,8 +1,11 @@
+// Package store is ReSSO's PostgreSQL data layer. It owns every query,
+// migration and encrypted value, and performs no outbound network requests.
 package store
 
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,6 +18,10 @@ type Store struct {
 	Pool              *pgxpool.Pool
 	Sealer            *cryptoutil.Sealer
 	dummyPasswordHash string
+	signingKeys       sync.Map
+
+	// OnSessionRevoked is optional and set once during startup.
+	OnSessionRevoked SessionRevocationHook
 }
 
 func Open(ctx context.Context, dsn string, sealer *cryptoutil.Sealer) (*Store, error) {

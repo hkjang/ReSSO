@@ -52,6 +52,7 @@ curl -fsS -b "$cookie_jar" -D "$work_dir/headers" -o /dev/null --get \
   --data-urlencode 'response_type=code' \
   --data-urlencode 'scope=openid profile email' \
   --data-urlencode 'state=smoke-state' \
+  --data-urlencode 'nonce=smoke-nonce' \
   --data-urlencode "code_challenge=$challenge" \
   --data-urlencode 'code_challenge_method=S256' \
   "$base_url/realms/master/protocol/openid-connect/auth"
@@ -84,10 +85,27 @@ curl -fsS -H "Authorization: Bearer $access_token" "$base_url/realms/master/prot
 refreshed="$(curl -fsS -X POST --data-urlencode 'grant_type=refresh_token' --data-urlencode "client_id=$client_identifier" --data-urlencode "refresh_token=$refresh_token" "$base_url/realms/master/protocol/openid-connect/token")"
 rotated_refresh="$(echo "$refreshed" | jq -er '.refresh_token')"
 echo "$refreshed" | jq -e '.access_token != null' >/dev/null
-reuse_status="$(curl -sS -o "$work_dir/reuse.json" -w '%{http_code}' -X POST --data-urlencode 'grant_type=refresh_token' --data-urlencode "client_id=$client_identifier" --data-urlencode "refresh_token=$refresh_token" "$base_url/realms/master/protocol/openid-connect/token")"
-[ "$reuse_status" = 400 ] || { echo "refresh token reuse was not rejected" >&2; exit 1; }
-family_status="$(curl -sS -o "$work_dir/family.json" -w '%{http_code}' -X POST --data-urlencode 'grant_type=refresh_token' --data-urlencode "client_id=$client_identifier" --data-urlencode "refresh_token=$rotated_refresh" "$base_url/realms/master/protocol/openid-connect/token")"
-[ "$family_status" = 400 ] || { echo "refresh token family was not revoked after reuse" >&2; exit 1; }
+# Presenting the same token again immediately is a retry, not theft: parallel
+# tabs and network retries do this routinely, so it must yield a fresh token
+# instead of logging the user out of every client. Reuse outside the grace
+# window still revokes the family; that path is covered by the Go integration
+# test, which can age the recorded rotation without waiting.
+grace="$(curl -fsS -X POST --data-urlencode 'grant_type=refresh_token' --data-urlencode "client_id=$client_identifier" --data-urlencode "refresh_token=$refresh_token" "$base_url/realms/master/protocol/openid-connect/token")"
+grace_refresh="$(echo "$grace" | jq -er '.refresh_token')"
+[ "$grace_refresh" != "$rotated_refresh" ] || { echo "grace rotation returned the same refresh token" >&2; exit 1; }
+echo "$grace" | jq -e '.access_token != null' >/dev/null
+
+# Revoking any member of the family must invalidate every sibling.
+curl -fsS -o /dev/null -X POST --data-urlencode "client_id=$client_identifier" --data-urlencode "token=$grace_refresh" "$base_url/realms/master/protocol/openid-connect/revoke"
+for revoked_token in "$rotated_refresh" "$grace_refresh"; do
+  family_status="$(curl -sS -o "$work_dir/family.json" -w '%{http_code}' -X POST --data-urlencode 'grant_type=refresh_token' --data-urlencode "client_id=$client_identifier" --data-urlencode "refresh_token=$revoked_token" "$base_url/realms/master/protocol/openid-connect/token")"
+  [ "$family_status" = 400 ] || { echo "refresh token family was not revoked" >&2; exit 1; }
+done
+
+# The ID token must bind to its access token so strict relying parties accept it.
+echo "$tokens" | jq -er '.id_token' | cut -d. -f2 | tr '_-' '/+' | \
+  awk '{ while (length($0) % 4 != 0) $0 = $0 "="; print }' | base64 -d 2>/dev/null | \
+  jq -e '.at_hash != null and .nonce != null' >/dev/null || { echo "id_token is missing at_hash" >&2; exit 1; }
 
 role_name="smoke-role-$suffix"
 role_response="$(curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \

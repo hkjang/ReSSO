@@ -1,3 +1,5 @@
+// Package httpserver exposes ReSSO's OIDC endpoints, administrative and
+// personal REST APIs, MCP endpoint and the embedded single-page console.
 package httpserver
 
 import (
@@ -6,11 +8,14 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/hkjang/ReSSO/internal/observability"
 	"github.com/hkjang/ReSSO/internal/oidc"
+	"github.com/hkjang/ReSSO/internal/ratelimit"
 	"github.com/hkjang/ReSSO/internal/store"
 	"github.com/hkjang/ReSSO/webui"
 )
@@ -18,18 +23,45 @@ import (
 const (
 	sessionCookieName = "resso_session"
 	csrfCookieName    = "resso_csrf"
+
+	// Client credential guessing is bounded per instance rather than in
+	// PostgreSQL: these endpoints run on every token refresh of every relying
+	// party, so they must not take a lock per call. See internal/ratelimit.
+	//
+	// The two buckets answer different questions. The per-client bucket is the
+	// precise control on guessing one client's secret. The per-address bucket
+	// only bounds spraying across many client identifiers, so it is far more
+	// tolerant: relying parties commonly share one egress address, and a
+	// single client with a stale secret must not lock out its neighbours. A
+	// blocked attempt is not counted, so one client's failures stop feeding
+	// the address bucket once that client is blocked on its own.
+	clientAuthMaxFailures  = 20
+	addressAuthMaxFailures = 200
+	clientAuthWindow       = 5 * time.Minute
+	clientAuthTrackedKeys  = 8192
 )
 
 type Server struct {
-	store             *store.Store
-	oidc              *oidc.Service
-	logger            *slog.Logger
-	trustedProxyCIDRs []*net.IPNet
+	store              *store.Store
+	oidc               *oidc.Service
+	logger             *slog.Logger
+	trustedProxyCIDRs  []*net.IPNet
+	clientAuthLimiter  *ratelimit.FailureLimiter
+	addressAuthLimiter *ratelimit.FailureLimiter
+	metrics            *observability.Registry
 }
 
 func New(data *store.Store, logger *slog.Logger, trustedProxyCIDRs []*net.IPNet) *Server {
-	return &Server{store: data, oidc: &oidc.Service{Store: data}, logger: logger, trustedProxyCIDRs: trustedProxyCIDRs}
+	return &Server{store: data, oidc: &oidc.Service{Store: data}, logger: logger,
+		trustedProxyCIDRs:  trustedProxyCIDRs,
+		clientAuthLimiter:  ratelimit.NewFailureLimiter(clientAuthMaxFailures, clientAuthWindow, clientAuthTrackedKeys),
+		addressAuthLimiter: ratelimit.NewFailureLimiter(addressAuthMaxFailures, clientAuthWindow, clientAuthTrackedKeys),
+		metrics:            newMetrics()}
 }
+
+// Metrics exposes the registry so that background workers outside the HTTP
+// layer, such as the scheduled federation sync, can record outcomes too.
+func (s *Server) Metrics() *observability.Registry { return s.metrics }
 
 func (s *Server) Handler() http.Handler {
 	router := chi.NewRouter()
@@ -37,6 +69,10 @@ func (s *Server) Handler() http.Handler {
 	router.Use(s.commonMiddleware)
 	router.Get("/health/live", s.live)
 	router.Get("/health/ready", s.ready)
+	// Scraping requires the same admin:read authorization as the rest of the
+	// administrative API, so operational detail is not exposed to anyone who
+	// can reach the port. Prometheus supports bearer token authorization.
+	router.With(s.requireSessionOrAPIKey, s.requireAdmin).Get("/metrics", s.serveMetrics)
 	router.Get("/api/v1/meta", s.meta)
 	router.Route("/api/v1/auth", func(r chi.Router) {
 		r.Get("/challenge/{token}", s.authChallenge)

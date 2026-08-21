@@ -116,24 +116,91 @@ func (s *Store) ValidateCSRF(session AuthenticatedSession, csrf string) bool {
 	return csrf != "" && s.Sealer.MatchDigest(csrf, session.CSRFHash)
 }
 
+// RevokedSession identifies a session that has just ended, so that relying
+// parties registered for back-channel logout can be told about it.
+type RevokedSession struct {
+	RealmID   uuid.UUID
+	SessionID uuid.UUID
+	UserID    uuid.UUID
+}
+
+// SessionRevocationHook is called after each session is revoked. Store.
+// OnSessionRevoked is wired to the back-channel logout notifier in cmd/resso;
+// the Store itself performs no outbound requests, keeping HTTP and JWT signing
+// out of the data layer. Implementations must not block the caller.
+type SessionRevocationHook func(RevokedSession)
+
+func (s *Store) notifyRevoked(sessions []RevokedSession) {
+	if s.OnSessionRevoked == nil {
+		return
+	}
+	for _, session := range sessions {
+		s.OnSessionRevoked(session)
+	}
+}
+
 func (s *Store) RevokeSession(ctx context.Context, id uuid.UUID) error {
-	command, err := s.Pool.Exec(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now()) WHERE id=$1`, id)
+	var revoked RevokedSession
+	err := s.Pool.QueryRow(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())
+        WHERE id=$1 RETURNING realm_id,id,user_id`, id).Scan(&revoked.RealmID, &revoked.SessionID, &revoked.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
 		return err
 	}
-	if command.RowsAffected() == 0 {
-		return ErrNotFound
-	}
 	_, _ = s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE session_id=$1`, id)
+	s.notifyRevoked([]RevokedSession{revoked})
 	return nil
 }
 
 func (s *Store) RevokeAllUserSessions(ctx context.Context, userID uuid.UUID, except *uuid.UUID) error {
-	_, err := s.Pool.Exec(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())
-        WHERE user_id=$1 AND ($2::uuid IS NULL OR id<>$2)`, userID, except)
+	rows, err := s.Pool.Query(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())
+        WHERE user_id=$1 AND ($2::uuid IS NULL OR id<>$2) AND revoked_at IS NULL
+        RETURNING realm_id,id,user_id`, userID, except)
+	if err != nil {
+		return err
+	}
+	revoked := make([]RevokedSession, 0)
+	for rows.Next() {
+		var session RevokedSession
+		if err := rows.Scan(&session.RealmID, &session.SessionID, &session.UserID); err != nil {
+			rows.Close()
+			return err
+		}
+		revoked = append(revoked, session)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	_, _ = s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
         WHERE user_id=$1 AND ($2::uuid IS NULL OR session_id<>$2)`, userID, except)
-	return err
+	s.notifyRevoked(revoked)
+	return nil
+}
+
+// BackchannelLogoutTargets lists the enabled clients of a Realm that registered
+// a back-channel logout URI and actually took part in the given session.
+func (s *Store) BackchannelLogoutTargets(ctx context.Context, realmID, sessionID uuid.UUID) ([]domain.Client, error) {
+	rows, err := s.Pool.Query(ctx, "SELECT "+clientColumns+` FROM clients c
+        WHERE c.realm_id=$1 AND c.enabled=true AND c.backchannel_logout_uri <> ''
+        AND (EXISTS(SELECT 1 FROM refresh_tokens t WHERE t.client_id=c.id AND t.session_id=$2)
+            OR EXISTS(SELECT 1 FROM authorization_codes a WHERE a.client_id=c.id AND a.session_id=$2))
+        ORDER BY c.client_id`, realmID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	clients := make([]domain.Client, 0)
+	for rows.Next() {
+		client, err := scanClient(rows)
+		if err != nil {
+			return nil, err
+		}
+		clients = append(clients, client)
+	}
+	return clients, rows.Err()
 }
 
 func (s *Store) ListSessions(ctx context.Context, realmID *uuid.UUID, userID *uuid.UUID, limit int) ([]domain.Session, error) {

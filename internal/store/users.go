@@ -99,7 +99,7 @@ func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateU
 	if input.DisplayName == "" {
 		input.DisplayName = input.Username
 	}
-	hashed, err := password.Hash(input.Password)
+	hashed, err := password.HashContext(ctx, input.Password)
 	if err != nil {
 		return domain.User{}, err
 	}
@@ -255,7 +255,7 @@ func (s *Store) ChangePassword(ctx context.Context, userID uuid.UUID, current, r
 		return err
 	}
 	if !adminReset && user.FederationID == nil {
-		ok, err := password.Verify(current, hash)
+		ok, err := password.VerifyContext(ctx, current, hash)
 		if err != nil || !ok {
 			return errors.New("current password is incorrect")
 		}
@@ -275,7 +275,7 @@ func (s *Store) ChangePassword(ctx context.Context, userID uuid.UUID, current, r
             locked_until=NULL,updated_at=now() WHERE id=$1`, userID)
 		return err
 	}
-	newHash, err := password.Hash(replacement)
+	newHash, err := password.HashContext(ctx, replacement)
 	if err != nil {
 		return err
 	}
@@ -292,69 +292,111 @@ type AuthenticationResult struct {
 	AuthMethod     string
 }
 
+// AuthenticatePassword verifies a local password without holding a database
+// transaction across the Argon2 work. The previous implementation opened a
+// SELECT ... FOR UPDATE and only committed after verification, so every
+// in-flight login pinned a pooled connection for the whole hash duration and a
+// burst of logins starved every other query — token issuance included. The
+// row lock also served to serialize the failure counter; the atomic UPDATE in
+// recordFailedLogin replaces it.
 func (s *Store) AuthenticatePassword(ctx context.Context, realm domain.Realm, username, suppliedPassword string) (AuthenticationResult, error) {
-	tx, err := s.Pool.Begin(ctx)
-	if err != nil {
-		return AuthenticationResult{}, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
 	var user domain.User
 	var passwordHash string
-	var maxAttempts, lockoutSeconds int
-	err = tx.QueryRow(ctx, `SELECT u.id,u.realm_id,u.username,u.email,u.email_verified,u.display_name,u.enabled,u.platform_admin,
-        u.manager_id,u.failed_attempts,u.locked_until,u.password_changed_at,u.created_at,u.updated_at,u.password_hash,
-        r.max_login_attempts,r.lockout_seconds FROM users u JOIN realms r ON r.id=u.realm_id
-        WHERE u.realm_id=$1 AND lower(u.username)=lower($2) FOR UPDATE`, realm.ID, strings.TrimSpace(username)).Scan(
-		&user.ID, &user.RealmID, &user.Username, &user.Email, &user.EmailVerified, &user.DisplayName, &user.Enabled, &user.PlatformAdmin,
-		&user.ManagerID, &user.FailedAttempts, &user.LockedUntil, &user.PasswordChanged, &user.CreatedAt, &user.UpdatedAt,
-		&passwordHash, &maxAttempts, &lockoutSeconds)
+	err := s.Pool.QueryRow(ctx, "SELECT "+userColumns+`,password_hash FROM users
+        WHERE realm_id=$1 AND lower(username)=lower($2)`, realm.ID, strings.TrimSpace(username)).Scan(
+		&user.ID, &user.RealmID, &user.Username, &user.Email, &user.EmailVerified, &user.DisplayName,
+		&user.Enabled, &user.PlatformAdmin, &user.ManagerID, &user.FederationID, &user.ExternalID,
+		&user.ExternalDN, &user.FederationSyncedAt, &user.FailedAttempts, &user.LockedUntil,
+		&user.PasswordChanged, &user.CreatedAt, &user.UpdatedAt, &passwordHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Equalize the dominant Argon2 work factor for unknown users.
-		_, _ = password.Verify(suppliedPassword, s.dummyPasswordHash)
+		_, _ = s.dummyPasswordVerification(ctx, suppliedPassword)
 		return AuthenticationResult{FailureReason: "INVALID_CREDENTIALS"}, nil
 	}
 	if err != nil {
 		return AuthenticationResult{}, err
 	}
-	now := time.Now().UTC()
-	if !realm.Enabled || !user.Enabled {
-		return AuthenticationResult{User: user, FailureReason: "ACCOUNT_DISABLED"}, nil
+	if reason := accountFailureReason(realm, user, time.Now().UTC()); reason != "" {
+		return AuthenticationResult{User: user, FailureReason: reason}, nil
 	}
-	if user.LockedUntil != nil && user.LockedUntil.After(now) {
-		return AuthenticationResult{User: user, FailureReason: "ACCOUNT_LOCKED"}, nil
-	}
-	ok, verifyErr := password.Verify(suppliedPassword, passwordHash)
+	ok, verifyErr := password.VerifyContext(ctx, suppliedPassword, passwordHash)
 	if verifyErr != nil {
 		return AuthenticationResult{}, verifyErr
 	}
 	if !ok {
-		attempts := user.FailedAttempts + 1
-		var lockedUntil *time.Time
-		if attempts >= maxAttempts {
-			locked := now.Add(time.Duration(lockoutSeconds) * time.Second)
-			lockedUntil = &locked
-		}
-		if _, err := tx.Exec(ctx, `UPDATE users SET failed_attempts=$2,locked_until=$3,updated_at=now()
-            WHERE id=$1`, user.ID, attempts, lockedUntil); err != nil {
-			return AuthenticationResult{}, err
-		}
-		if err := tx.Commit(ctx); err != nil {
+		locked, err := s.recordFailedLogin(ctx, user.ID)
+		if err != nil {
 			return AuthenticationResult{}, err
 		}
 		reason := "INVALID_CREDENTIALS"
-		if lockedUntil != nil {
+		if locked {
 			reason = "ACCOUNT_LOCKED"
 		}
 		return AuthenticationResult{User: user, FailureReason: reason}, nil
 	}
-	if _, err := tx.Exec(ctx, `UPDATE users SET failed_attempts=0,locked_until=NULL,updated_at=now() WHERE id=$1`, user.ID); err != nil {
+	accepted, err := s.completeSuccessfulLogin(ctx, user.ID)
+	if err != nil {
 		return AuthenticationResult{}, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return AuthenticationResult{}, err
+	if !accepted {
+		// A concurrent burst locked or disabled the account while this
+		// attempt was hashing. Refuse rather than clearing the lockout.
+		return AuthenticationResult{User: user, FailureReason: "ACCOUNT_LOCKED"}, nil
 	}
 	user.FailedAttempts, user.LockedUntil = 0, nil
 	return AuthenticationResult{User: user, Success: true, SessionSeconds: realm.SessionTTLSeconds}, nil
+}
+
+// recordFailedLogin increments the failure counter and applies the realm
+// lockout policy in one statement, so concurrent attempts cannot lose
+// increments without a row lock. It reports whether the account is now locked.
+func (s *Store) recordFailedLogin(ctx context.Context, userID uuid.UUID) (bool, error) {
+	var locked bool
+	err := s.Pool.QueryRow(ctx, `UPDATE users u SET
+        failed_attempts=u.failed_attempts+1,
+        locked_until=CASE WHEN u.failed_attempts+1 >= r.max_login_attempts
+            THEN now()+make_interval(secs => r.lockout_seconds) ELSE u.locked_until END,
+        updated_at=now()
+        FROM realms r WHERE u.id=$1 AND r.id=u.realm_id
+        RETURNING (u.locked_until IS NOT NULL AND u.locked_until>now())`, userID).Scan(&locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	return locked, err
+}
+
+// completeSuccessfulLogin clears the failure counter only while the account is
+// still usable, closing the window between reading the lockout state and
+// finishing verification.
+func (s *Store) completeSuccessfulLogin(ctx context.Context, userID uuid.UUID) (bool, error) {
+	command, err := s.Pool.Exec(ctx, `UPDATE users SET failed_attempts=0,locked_until=NULL,updated_at=now()
+        WHERE id=$1 AND enabled=true AND (locked_until IS NULL OR locked_until<=now())`, userID)
+	if err != nil {
+		return false, err
+	}
+	return command.RowsAffected() == 1, nil
+}
+
+// UnlockUser clears a lockout without changing the password. Until now the
+// only way an administrator could release a locked account was to reset its
+// password, which forces an unnecessary credential change on a user who was
+// simply locked out by mistyping. It reports whether the account was locked.
+func (s *Store) UnlockUser(ctx context.Context, realmID, userID uuid.UUID) (bool, error) {
+	// The prior state is captured in its own CTE so the reported value cannot
+	// depend on when the RETURNING clause observes the updated row.
+	var wasLocked bool
+	err := s.Pool.QueryRow(ctx, `WITH previous AS (
+            SELECT id,locked_until,failed_attempts FROM users WHERE id=$1 AND realm_id=$2 FOR UPDATE
+        ), cleared AS (
+            UPDATE users SET failed_attempts=0,locked_until=NULL,updated_at=now()
+            WHERE id=(SELECT id FROM previous) RETURNING id
+        )
+        SELECT (previous.locked_until IS NOT NULL AND previous.locked_until>now()) OR previous.failed_attempts>0
+        FROM previous JOIN cleared ON cleared.id=previous.id`, userID, realmID).Scan(&wasLocked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	return wasLocked, err
 }
 
 func (s *Store) RealmRolesForUser(ctx context.Context, userID uuid.UUID) ([]string, error) {

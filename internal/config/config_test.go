@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
 	"strings"
 	"testing"
@@ -139,5 +140,34 @@ func TestLoadMaintenanceIgnoresProxyConfiguration(t *testing.T) {
 	t.Setenv(EnvTrustedProxyCIDRs, "not-a-cidr")
 	if _, err := LoadMaintenance(); err != nil {
 		t.Fatalf("maintenance config rejected irrelevant proxy setting: %v", err)
+	}
+}
+
+func TestLoadAcceptsAListenAddressAndRejectsAMalformedOne(t *testing.T) {
+	t.Setenv(EnvPostgresDSN, "postgres://resso@localhost/resso")
+	t.Setenv(EnvBootstrapAdmin, "admin")
+	t.Setenv(EnvBootstrapAdminPass, "bootstrap-password-123")
+	t.Setenv(EnvEncryptionKey, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'k'}, 32)))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ListenAddress != DefaultListenAddress {
+		t.Fatalf("default listen address = %q", cfg.ListenAddress)
+	}
+
+	t.Setenv(EnvListenAddress, "127.0.0.1:19080")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ListenAddress != "127.0.0.1:19080" {
+		t.Fatalf("listen address = %q", cfg.ListenAddress)
+	}
+
+	t.Setenv(EnvListenAddress, "not-a-socket-address")
+	if _, err := Load(); err == nil {
+		t.Fatal("a malformed listen address was accepted")
 	}
 }

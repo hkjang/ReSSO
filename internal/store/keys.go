@@ -18,6 +18,71 @@ import (
 	"github.com/hkjang/ReSSO/internal/domain"
 )
 
+// signingKeyTTL bounds how long an instance keeps serving a cached key set
+// after another instance rotates. A rotated key stays PASSIVE — and therefore
+// published and accepted — for two hours, so signing with it for a few more
+// seconds cannot produce a token that fails verification.
+const signingKeyTTL = 30 * time.Second
+
+type signingKeyEntry struct {
+	privateKey *rsa.PrivateKey
+	active     domain.SigningKey
+	published  []domain.SigningKey
+	loadedAt   time.Time
+}
+
+// signingKeys caches the per-Realm key material used on the hot path. Loading
+// it per request meant a query, an AES-GCM open and a PKCS#8 parse for every
+// token issued, and a query plus a JWK unmarshal for every token verified.
+// The zero value is usable, so a Store built literally in tests still works.
+func (s *Store) cachedSigningKeys(ctx context.Context, realmID uuid.UUID) (signingKeyEntry, error) {
+	if cached, found := s.signingKeys.Load(realmID); found {
+		if entry, ok := cached.(signingKeyEntry); ok && time.Since(entry.loadedAt) < signingKeyTTL {
+			return entry, nil
+		}
+	}
+	entry, err := s.loadSigningKeys(ctx, realmID)
+	if err != nil {
+		return signingKeyEntry{}, err
+	}
+	s.signingKeys.Store(realmID, entry)
+	return entry, nil
+}
+
+// InvalidateSigningKeys drops the cached key material for a Realm. Rotation
+// calls it so the new key is used immediately on this instance.
+func (s *Store) InvalidateSigningKeys(realmID uuid.UUID) {
+	s.signingKeys.Delete(realmID)
+}
+
+// InvalidateAllSigningKeys drops every cached Realm key set. Rewrapping the
+// stored ciphertexts does not change the key material, but clearing the cache
+// keeps the in-memory state provably consistent with the database.
+func (s *Store) InvalidateAllSigningKeys() {
+	s.signingKeys.Range(func(key, _ any) bool {
+		s.signingKeys.Delete(key)
+		return true
+	})
+}
+
+func (s *Store) loadSigningKeys(ctx context.Context, realmID uuid.UUID) (signingKeyEntry, error) {
+	published, err := s.ListSigningKeys(ctx, realmID)
+	if err != nil {
+		return signingKeyEntry{}, err
+	}
+	entry := signingKeyEntry{published: published, loadedAt: time.Now()}
+	privateKey, active, err := s.loadActivePrivateKey(ctx, realmID)
+	if err != nil {
+		return signingKeyEntry{}, err
+	}
+	// Precompute once, while the key is still private to this goroutine.
+	// crypto/rsa mutates the key on first use otherwise, which would be a data
+	// race between concurrent signers sharing the cached pointer.
+	privateKey.Precompute()
+	entry.privateKey, entry.active = privateKey, active
+	return entry, nil
+}
+
 func keyAAD(realmID uuid.UUID, kid string) []byte {
 	return []byte("ReSSO/signing-key/" + realmID.String() + "/" + kid)
 }
@@ -69,6 +134,7 @@ func (s *Store) RotateSigningKey(ctx context.Context, realmID uuid.UUID) (domain
         WHERE realm_id=$1 AND status='ACTIVE'`, realmID, retireAt); err != nil {
 		return domain.SigningKey{}, fmt.Errorf("retire prior signing key: %w", err)
 	}
+	defer s.InvalidateSigningKeys(realmID)
 	result := domain.SigningKey{ID: uuid.New(), RealmID: realmID, KID: kid, Algorithm: "RS256", Status: "ACTIVE", PublicJWK: publicJSON, CreatedAt: time.Now().UTC()}
 	if _, err := tx.Exec(ctx, `INSERT INTO signing_keys(id,realm_id,kid,algorithm,status,private_key_cipher,public_jwk,created_at)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, result.ID, realmID, kid, result.Algorithm, result.Status,
@@ -81,7 +147,27 @@ func (s *Store) RotateSigningKey(ctx context.Context, realmID uuid.UUID) (domain
 	return result, nil
 }
 
+// ActivePrivateKey returns the Realm's current signing key, served from the
+// per-Realm cache. Callers must not mutate the returned key.
 func (s *Store) ActivePrivateKey(ctx context.Context, realmID uuid.UUID) (*rsa.PrivateKey, domain.SigningKey, error) {
+	entry, err := s.cachedSigningKeys(ctx, realmID)
+	if err != nil {
+		return nil, domain.SigningKey{}, err
+	}
+	return entry.privateKey, entry.active, nil
+}
+
+// PublishedSigningKeys returns every non-retired key of a Realm for signature
+// verification and for the JWKS document, served from the same cache.
+func (s *Store) PublishedSigningKeys(ctx context.Context, realmID uuid.UUID) ([]domain.SigningKey, error) {
+	entry, err := s.cachedSigningKeys(ctx, realmID)
+	if err != nil {
+		return nil, err
+	}
+	return entry.published, nil
+}
+
+func (s *Store) loadActivePrivateKey(ctx context.Context, realmID uuid.UUID) (*rsa.PrivateKey, domain.SigningKey, error) {
 	var key domain.SigningKey
 	var encrypted []byte
 	err := s.Pool.QueryRow(ctx, `SELECT id,realm_id,kid,algorithm,status,public_jwk,created_at,retire_at,private_key_cipher

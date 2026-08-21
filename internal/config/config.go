@@ -1,3 +1,5 @@
+// Package config loads and validates the environment configuration that
+// ReSSO needs before it can serve or run an offline maintenance command.
 package config
 
 import (
@@ -19,6 +21,7 @@ const (
 	EnvDataEncryptionKeys    = "DATA_ENCRYPTION_KEYS"
 	EnvDigestKeys            = "DIGEST_KEYS"
 	EnvTrustedProxyCIDRs     = "TRUSTED_PROXY_CIDRS"
+	EnvListenAddress         = "LISTEN_ADDRESS"
 	DefaultListenAddress     = ":8080"
 	DefaultBootstrapRealm    = "master"
 	DefaultBootstrapIssuer   = "http://localhost:8080/realms/master"
@@ -123,6 +126,12 @@ func load(requireBootstrap bool) (Config, error) {
 				return Config{}, fmt.Errorf("%s: %w", EnvDigestKeys, err)
 			}
 		}
+	}
+	if raw := strings.TrimSpace(os.Getenv(EnvListenAddress)); raw != "" {
+		if _, _, err := net.SplitHostPort(raw); err != nil {
+			return Config{}, fmt.Errorf("%s must be host:port, for example :8080", EnvListenAddress)
+		}
+		cfg.ListenAddress = raw
 	}
 	if raw := strings.TrimSpace(os.Getenv(EnvTrustedProxyCIDRs)); requireBootstrap && raw != "" {
 		for _, value := range strings.Split(raw, ",") {

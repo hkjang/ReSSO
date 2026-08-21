@@ -178,8 +178,17 @@ func (s *Store) CreateRefreshToken(ctx context.Context, token RefreshToken) (str
 
 var ErrTokenReuse = errors.New("refresh token reuse detected")
 
-// RotateRefreshToken enforces one-time use. Reuse revokes the entire token
-// family so a stolen older token cannot silently maintain persistence.
+// refreshRotationGrace lets a token that was already rotated be presented
+// again for a short window. Browsers and mobile clients routinely fire two
+// refreshes at once (parallel tabs, a retried request whose response was lost
+// on the network), and treating that as theft logs the user out of every
+// client at once. Only presentations outside this window — or of an explicitly
+// revoked token — are treated as reuse.
+const refreshRotationGrace = 30 * time.Second
+
+// RotateRefreshToken enforces one-time use outside refreshRotationGrace. Reuse
+// revokes the entire token family so a stolen older token cannot silently
+// maintain persistence.
 func (s *Store) RotateRefreshToken(ctx context.Context, raw string, reducedScopes []string) (RefreshToken, string, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -198,7 +207,8 @@ func (s *Store) RotateRefreshToken(ctx context.Context, raw string, reducedScope
 	if err != nil {
 		return RefreshToken{}, "", err
 	}
-	if rotatedAt != nil || revokedAt != nil {
+	withinGrace := rotatedAt != nil && revokedAt == nil && time.Since(*rotatedAt) <= refreshRotationGrace
+	if (rotatedAt != nil || revokedAt != nil) && !withinGrace {
 		_, _ = tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE family_id=$1`, old.FamilyID)
 		if err := tx.Commit(ctx); err != nil {
 			return RefreshToken{}, "", err
@@ -215,7 +225,9 @@ func (s *Store) RotateRefreshToken(ctx context.Context, raw string, reducedScope
 			return RefreshToken{}, "", ErrNotFound
 		}
 	}
-	if _, err := tx.Exec(ctx, "UPDATE refresh_tokens SET rotated_at=now() WHERE id=$1", old.ID); err != nil {
+	// COALESCE keeps the first rotation timestamp so the grace window is fixed
+	// from the original rotation and cannot be extended by repeated retries.
+	if _, err := tx.Exec(ctx, "UPDATE refresh_tokens SET rotated_at=COALESCE(rotated_at,now()) WHERE id=$1", old.ID); err != nil {
 		return RefreshToken{}, "", err
 	}
 	rawNew, err := cryptoutil.RandomToken(48)

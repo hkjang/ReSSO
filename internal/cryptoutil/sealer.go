@@ -1,3 +1,6 @@
+// Package cryptoutil provides ReSSO's authenticated encryption and keyed
+// digest primitives, including the split data-encryption and digest keyrings
+// that allow rewrapping stored secrets without invalidating live credentials.
 package cryptoutil
 
 import (

@@ -1,8 +1,12 @@
+// Package oidc issues and verifies ReSSO's OpenID Connect tokens: access,
+// ID, refresh and back-channel logout tokens, with Keycloak-compatible claims.
 package oidc
 
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +46,7 @@ type keycloakClaims struct {
 	EmailVerified     *bool               `json:"email_verified,omitempty"`
 	Name              string              `json:"name,omitempty"`
 	Nonce             string              `json:"nonce,omitempty"`
+	AccessTokenHash   string              `json:"at_hash,omitempty"`
 	RealmAccess       map[string][]string `json:"realm_access,omitempty"`
 	ResourceAccess    map[string]any      `json:"resource_access,omitempty"`
 }
@@ -124,6 +129,10 @@ func (s *Service) IssueUserTokens(ctx context.Context, realm domain.Realm, clien
 		idExtra.Type = "ID"
 		idExtra.Nonce = nonce
 		idExtra.Scope = ""
+		// at_hash lets a relying party bind the ID token to the access token
+		// it was issued with. Strict OpenID Connect clients reject an ID token
+		// without it when an access token is present.
+		idExtra.AccessTokenHash = accessTokenHash(accessToken)
 		response.IDToken, err = signClaims(signer, idStandard, idExtra)
 		if err != nil {
 			return TokenResponse{}, err
@@ -176,6 +185,38 @@ func (s *Service) IssueClientToken(ctx context.Context, realm domain.Realm, clie
 	return TokenResponse{AccessToken: raw, TokenType: "Bearer", ExpiresIn: ttl, Scope: strings.Join(scopes, " ")}, err
 }
 
+// logoutEvent is the event identifier every OpenID Connect Back-Channel
+// Logout token must carry.
+const logoutEvent = "http://schemas.openid.net/event/backchannel-logout"
+
+type logoutClaims struct {
+	Events    map[string]any `json:"events"`
+	SessionID string         `json:"sid,omitempty"`
+}
+
+// IssueLogoutToken builds an OpenID Connect Back-Channel Logout 1.0 token for
+// one relying party. The token deliberately carries no nonce, and both sub and
+// sid so that a relying party can terminate either the specific session or all
+// of the subject's sessions.
+func (s *Service) IssueLogoutToken(ctx context.Context, realm domain.Realm, client domain.Client,
+	sessionID, userID uuid.UUID) (string, error) {
+	privateKey, metadata, err := s.Store.ActivePrivateKey(ctx, realm.ID)
+	if err != nil {
+		return "", err
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: privateKey},
+		(&jose.SignerOptions{}).WithType("logout+jwt").WithHeader("kid", metadata.KID))
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().UTC()
+	standard := jwt.Claims{Issuer: realm.IssuerURL, Subject: userID.String(),
+		Audience: jwt.Audience{client.ClientID}, IssuedAt: jwt.NewNumericDate(now),
+		Expiry: jwt.NewNumericDate(now.Add(2 * time.Minute)), ID: uuid.NewString()}
+	extra := logoutClaims{Events: map[string]any{logoutEvent: map[string]any{}}, SessionID: sessionID.String()}
+	return jwt.Signed(signer).Claims(standard).Claims(extra).Serialize()
+}
+
 func (s *Service) Verify(ctx context.Context, realm domain.Realm, raw string, expectedAudience string) (VerifiedToken, error) {
 	parsed, err := jwt.ParseSigned(raw, []jose.SignatureAlgorithm{jose.RS256})
 	if err != nil {
@@ -188,7 +229,7 @@ func (s *Service) Verify(ctx context.Context, realm domain.Realm, raw string, ex
 	if kid == "" {
 		return VerifiedToken{}, errors.New("token has no kid header")
 	}
-	keys, err := s.Store.ListSigningKeys(ctx, realm.ID)
+	keys, err := s.Store.PublishedSigningKeys(ctx, realm.ID)
 	if err != nil {
 		return VerifiedToken{}, err
 	}
@@ -230,6 +271,14 @@ func (s *Service) Verify(ctx context.Context, realm domain.Realm, raw string, ex
 		}
 	}
 	return VerifiedToken{Claims: standard, Extra: extra, Raw: raw}, nil
+}
+
+// accessTokenHash is the base64url encoding of the left-most half of the
+// SHA-256 digest of the access token, as required for RS256 by OpenID Connect
+// Core 1.0 section 3.1.3.6.
+func accessTokenHash(accessToken string) string {
+	digest := sha256.Sum256([]byte(accessToken))
+	return base64.RawURLEncoding.EncodeToString(digest[:len(digest)/2])
 }
 
 func containsScope(scopes []string, expected string) bool {

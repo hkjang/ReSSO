@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -149,11 +151,33 @@ func TestIntegrationRefreshTokenReuseRevokesFamily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Presenting the rotated token again inside refreshRotationGrace is a
+	// retry, not theft: it yields a fresh token and keeps the family alive.
+	_, graceRaw, err := data.RotateRefreshToken(context.Background(), raw, nil)
+	if err != nil {
+		t.Fatalf("rotation inside the grace window was rejected: %v", err)
+	}
+	if graceRaw == rotatedRaw {
+		t.Fatal("grace rotation returned the same token value")
+	}
+	if _, active, err := data.InspectRefreshToken(context.Background(), rotatedRaw); err != nil || !active {
+		t.Fatalf("grace rotation revoked the earlier sibling: active=%v err=%v", active, err)
+	}
+
+	// Aging the recorded rotation past the grace window turns the same replay
+	// into reuse, which revokes every token in the family.
+	if _, err := data.Pool.Exec(context.Background(), `UPDATE refresh_tokens
+		SET rotated_at=now()-make_interval(secs => $1) WHERE token_hash=ANY($2::bytea[])`,
+		int(refreshRotationGrace.Seconds())+60, data.Sealer.Digests(raw)); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := data.RotateRefreshToken(context.Background(), raw, nil); !errors.Is(err, ErrTokenReuse) {
 		t.Fatalf("reuse error = %v, want ErrTokenReuse", err)
 	}
-	if _, active, err := data.InspectRefreshToken(context.Background(), rotatedRaw); err != nil || active {
-		t.Fatalf("rotated family member remained active: active=%v err=%v", active, err)
+	for name, token := range map[string]string{"first child": rotatedRaw, "grace child": graceRaw} {
+		if _, active, err := data.InspectRefreshToken(context.Background(), token); err != nil || active {
+			t.Fatalf("%s remained active after reuse: active=%v err=%v", name, active, err)
+		}
 	}
 }
 
@@ -299,8 +323,23 @@ func TestIntegrationDiagnoseReportsIncompleteSchema(t *testing.T) {
 	if diagnosis.DatabaseReady {
 		t.Fatalf("incomplete schema reported ready: %+v", diagnosis)
 	}
-	if len(diagnosis.AppliedMigrations) != 2 {
-		t.Fatalf("applied migrations = %v", diagnosis.AppliedMigrations)
+	// Count the embedded migrations rather than a literal, so adding one does
+	// not require editing this assertion.
+	entries, err := fs.ReadDir(migrationFiles, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	embedded := 0
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			embedded++
+		}
+	}
+	if len(diagnosis.AppliedMigrations) != embedded-1 {
+		t.Fatalf("applied migrations = %v, want %d entries", diagnosis.AppliedMigrations, embedded-1)
+	}
+	if slices.Contains(diagnosis.AppliedMigrations, "003_hardening.sql") {
+		t.Fatalf("removed migration still reported as applied: %v", diagnosis.AppliedMigrations)
 	}
 }
 
@@ -505,4 +544,403 @@ func createIntegrationClient(t *testing.T, data *Store, realmID uuid.UUID) uuid.
 		t.Fatal(err)
 	}
 	return created.Client.ID
+}
+
+func TestIntegrationClientSecretUsesKeyedDigestAndUpgradesLegacyHashes(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+
+	created, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "secret-client", Name: "Secret Client", Type: "confidential",
+		RedirectURIs: []string{"https://app.example.com/callback"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	if err := data.Pool.QueryRow(ctx, "SELECT secret_hash FROM clients WHERE id=$1", created.Client.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(stored, clientSecretDigestPrefix) {
+		t.Fatalf("new client secret was not stored as a keyed digest: %q", stored)
+	}
+	if ok, err := data.VerifyClientSecret(ctx, created.Client.ID, created.ClientSecret); err != nil || !ok {
+		t.Fatalf("keyed digest verification failed: ok=%v err=%v", ok, err)
+	}
+	if ok, err := data.VerifyClientSecret(ctx, created.Client.ID, created.ClientSecret+"x"); err != nil || ok {
+		t.Fatalf("a wrong secret was accepted: ok=%v err=%v", ok, err)
+	}
+
+	// A v0.2 Argon2 hash must keep working and be upgraded in place.
+	legacySecret := "legacy-client-secret-value"
+	legacyHash, err := password.Hash(legacySecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, "UPDATE clients SET secret_hash=$2 WHERE id=$1", created.Client.ID, legacyHash); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := data.VerifyClientSecret(ctx, created.Client.ID, legacySecret); err != nil || !ok {
+		t.Fatalf("legacy Argon2 client secret was rejected: ok=%v err=%v", ok, err)
+	}
+	if err := data.Pool.QueryRow(ctx, "SELECT secret_hash FROM clients WHERE id=$1", created.Client.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(stored, clientSecretDigestPrefix) {
+		t.Fatalf("legacy hash was not upgraded after a successful verification: %q", stored)
+	}
+	if ok, err := data.VerifyClientSecret(ctx, created.Client.ID, legacySecret); err != nil || !ok {
+		t.Fatalf("upgraded digest rejected the same secret: ok=%v err=%v", ok, err)
+	}
+
+	rotated, err := data.RotateClientSecret(ctx, created.Client.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := data.VerifyClientSecret(ctx, created.Client.ID, legacySecret); ok {
+		t.Fatal("rotation did not invalidate the previous secret")
+	}
+	if ok, err := data.VerifyClientSecret(ctx, created.Client.ID, rotated); err != nil || !ok {
+		t.Fatalf("rotated secret was rejected: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestIntegrationConcurrentFailedLoginsCountAtomicallyAndLock(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `UPDATE realms SET max_login_attempts=5,lockout_seconds=900 WHERE id=$1`, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err = data.RealmByID(ctx, realm.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, CreateUserInput{
+		Username: "lock-race", Password: "correct-horse-battery", Enabled: true, DisplayName: "Lock Race",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const attempts = 4
+	var wait sync.WaitGroup
+	results := make([]AuthenticationResult, attempts)
+	errs := make([]error, attempts)
+	for index := range attempts {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			results[index], errs[index] = data.Authenticate(ctx, realm, "lock-race", "wrong-password")
+		}()
+	}
+	wait.Wait()
+	for index, err := range errs {
+		if err != nil {
+			t.Fatalf("attempt %d returned an error: %v", index, err)
+		}
+		if results[index].Success {
+			t.Fatalf("attempt %d succeeded with a wrong password", index)
+		}
+	}
+	var failed int
+	if err := data.Pool.QueryRow(ctx, "SELECT failed_attempts FROM users WHERE id=$1", user.ID).Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed != attempts {
+		t.Fatalf("concurrent failures lost increments: got %d, want %d", failed, attempts)
+	}
+
+	// The fifth failure reaches max_login_attempts and must lock the account,
+	// after which even the correct password is refused.
+	result, err := data.Authenticate(ctx, realm, "lock-race", "wrong-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FailureReason != "ACCOUNT_LOCKED" {
+		t.Fatalf("expected ACCOUNT_LOCKED, got %q", result.FailureReason)
+	}
+	result, err = data.Authenticate(ctx, realm, "lock-race", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success || result.FailureReason != "ACCOUNT_LOCKED" {
+		t.Fatalf("a locked account accepted the correct password: %+v", result)
+	}
+
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET locked_until=NULL WHERE id=$1`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	result, err = data.Authenticate(ctx, realm, "lock-race", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("unlocked account rejected the correct password: %+v", result)
+	}
+	if err := data.Pool.QueryRow(ctx, "SELECT failed_attempts FROM users WHERE id=$1", user.ID).Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed != 0 {
+		t.Fatalf("successful login did not reset the failure counter: %d", failed)
+	}
+}
+
+func TestIntegrationBackchannelLogoutTargetsAndRevocationHook(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+
+	notified, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "rp-with-logout", Name: "RP With Logout", Type: "confidential",
+		RedirectURIs:         []string{"https://rp.example.com/callback"},
+		BackchannelLogoutURI: "https://rp.example.com/backchannel-logout",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	silent, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "rp-without-logout", Name: "RP Without Logout", Type: "confidential",
+		RedirectURIs: []string{"https://other.example.com/callback"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "rp-bad-logout", Name: "RP Bad Logout", Type: "confidential",
+		RedirectURIs:         []string{"https://bad.example.com/callback"},
+		BackchannelLogoutURI: "http://bad.example.com/backchannel-logout",
+	}); err == nil {
+		t.Fatal("a plaintext back-channel logout URI was accepted")
+	}
+
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		time.Hour, "127.0.0.1", "integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, sessionID := bootstrap.AdminUserID, session.Session.ID
+	for _, clientID := range []uuid.UUID{notified.Client.ID, silent.Client.ID} {
+		if _, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+			UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+			ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	targets, err := data.BackchannelLogoutTargets(ctx, bootstrap.RealmID, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].ClientID != "rp-with-logout" {
+		t.Fatalf("unexpected back-channel logout targets: %+v", targets)
+	}
+
+	// A session the client never took part in must not be notified.
+	otherSession, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		time.Hour, "127.0.0.1", "integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err = data.BackchannelLogoutTargets(ctx, bootstrap.RealmID, otherSession.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 0 {
+		t.Fatalf("an uninvolved session produced targets: %+v", targets)
+	}
+
+	var mutex sync.Mutex
+	var revoked []RevokedSession
+	data.OnSessionRevoked = func(session RevokedSession) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		revoked = append(revoked, session)
+	}
+	if err := data.RevokeSession(ctx, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	mutex.Lock()
+	got := append([]RevokedSession(nil), revoked...)
+	mutex.Unlock()
+	if len(got) != 1 || got[0].SessionID != sessionID || got[0].UserID != userID || got[0].RealmID != bootstrap.RealmID {
+		t.Fatalf("revocation hook received %+v", got)
+	}
+
+	revoked = nil
+	if err := data.RevokeAllUserSessions(ctx, userID, nil); err != nil {
+		t.Fatal(err)
+	}
+	mutex.Lock()
+	got = append([]RevokedSession(nil), revoked...)
+	mutex.Unlock()
+	// Only the still-active session is reported; the one revoked above is not
+	// announced twice.
+	if len(got) != 1 || got[0].SessionID != otherSession.Session.ID {
+		t.Fatalf("bulk revocation hook received %+v", got)
+	}
+}
+
+func TestIntegrationEnsureSearchIndexesIsIdempotentAndOptional(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	var extensionSchema *string
+	if err := data.Pool.QueryRow(ctx, `SELECT n.nspname FROM pg_extension e
+		JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'`).Scan(&extensionSchema); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatal(err)
+	}
+
+	indexed, err := data.EnsureSearchIndexes(ctx)
+	if err != nil {
+		t.Fatalf("EnsureSearchIndexes failed: %v", err)
+	}
+	if indexed != (extensionSchema != nil) {
+		t.Fatalf("indexed=%v but pg_trgm schema=%v", indexed, extensionSchema)
+	}
+	// Running twice must be a no-op rather than an error.
+	if again, err := data.EnsureSearchIndexes(ctx); err != nil || again != indexed {
+		t.Fatalf("second run: indexed=%v err=%v", again, err)
+	}
+	if !indexed {
+		t.Skip("pg_trgm is not installed in this database")
+	}
+	var created int
+	if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes
+		WHERE indexname IN ('idx_users_username_trgm','idx_users_email_trgm','idx_users_display_name_trgm')
+		AND schemaname=current_schema()`).Scan(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created != 3 {
+		t.Fatalf("created %d trigram indexes, want 3", created)
+	}
+	// The search itself must still return the right rows with the index in place.
+	realm, err := data.CreateRealm(ctx, CreateRealmInput{Name: "search-realm", DisplayName: "Search",
+		IssuerURL: "https://sso.example.com/realms/search-realm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"alice.smith", "bob.jones", "carol.smithers"} {
+		if _, err := data.CreateUser(ctx, realm.ID, CreateUserInput{
+			Username: name, Password: "search-password-1234", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	users, err := data.ListUsers(ctx, realm.ID, "smith", 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 2 {
+		t.Fatalf("search for %q returned %d users", "smith", len(users))
+	}
+	total, err := data.CountUsers(ctx, realm.ID, "smith")
+	if err != nil || total != 2 {
+		t.Fatalf("CountUsers = %d, err=%v", total, err)
+	}
+}
+
+func TestIntegrationUnlockUserClearsLockoutWithoutChangingThePassword(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The policy must now be readable rather than living only in the database.
+	if realm.PasswordMinLength < 8 || realm.MaxLoginAttempts < 3 || realm.LockoutSeconds < 30 {
+		t.Fatalf("realm policy was not loaded: %+v", realm)
+	}
+
+	user, err := data.CreateUser(ctx, realm.ID, CreateUserInput{
+		Username: "lockout-user", Password: "correct-horse-battery", Enabled: true, DisplayName: "Lockout User",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range realm.MaxLoginAttempts {
+		if _, err := data.Authenticate(ctx, realm, "lockout-user", "wrong-password"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := data.Authenticate(ctx, realm, "lockout-user", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FailureReason != "ACCOUNT_LOCKED" {
+		t.Fatalf("account was not locked: %+v", result)
+	}
+
+	wasLocked, err := data.UnlockUser(ctx, realm.ID, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wasLocked {
+		t.Fatal("UnlockUser did not report the account as locked")
+	}
+	// The original password must still work: unlocking is not a credential reset.
+	result, err = data.Authenticate(ctx, realm, "lockout-user", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("unlocked account rejected its unchanged password: %+v", result)
+	}
+	// Unlocking an account that was never locked is a no-op, not an error.
+	if wasLocked, err := data.UnlockUser(ctx, realm.ID, user.ID); err != nil || wasLocked {
+		t.Fatalf("second unlock: wasLocked=%v err=%v", wasLocked, err)
+	}
+	// A user from another Realm must not be reachable.
+	other, err := data.CreateRealm(ctx, CreateRealmInput{Name: "other-realm", DisplayName: "Other",
+		IssuerURL: "https://sso.example.com/realms/other-realm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.UnlockUser(ctx, other.ID, user.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-realm unlock error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestIntegrationUpdateRealmPersistsAndValidatesThePolicy(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := UpdateRealmInput{
+		DisplayName: realm.DisplayName, IssuerURL: realm.IssuerURL, Enabled: true,
+		AccessTokenTTLSeconds: realm.AccessTokenTTLSeconds, RefreshTokenTTLSeconds: realm.RefreshTokenTTLSeconds,
+		SessionTTLSeconds: realm.SessionTTLSeconds, PasswordMinLength: 16,
+		MaxLoginAttempts: 10, LockoutSeconds: 600,
+	}
+	updated, err := data.UpdateRealm(ctx, realm.ID, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.PasswordMinLength != 16 || updated.MaxLoginAttempts != 10 || updated.LockoutSeconds != 600 {
+		t.Fatalf("policy was not persisted: %+v", updated)
+	}
+	// The new minimum must actually be enforced on user creation.
+	if _, err := data.CreateUser(ctx, realm.ID, CreateUserInput{
+		Username: "short-password", Password: "0123456789", Enabled: true}); err == nil {
+		t.Fatal("a password shorter than the Realm minimum was accepted")
+	}
+
+	// Out-of-range values are reported as readable input errors, not as
+	// database constraint violations.
+	for _, invalid := range []UpdateRealmInput{
+		func() UpdateRealmInput { out := base; out.PasswordMinLength = 4; return out }(),
+		func() UpdateRealmInput { out := base; out.MaxLoginAttempts = 1; return out }(),
+		func() UpdateRealmInput { out := base; out.LockoutSeconds = 10; return out }(),
+	} {
+		if _, err := data.UpdateRealm(ctx, realm.ID, invalid); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("policy validation error = %v, want ErrInvalidInput", err)
+		}
+	}
 }

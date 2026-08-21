@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 
 	"github.com/hkjang/ReSSO/internal/domain"
 	ressooidc "github.com/hkjang/ReSSO/internal/oidc"
+	"github.com/hkjang/ReSSO/internal/ratelimit"
 	"github.com/hkjang/ReSSO/internal/store"
 )
 
@@ -47,8 +49,15 @@ func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 		"introspection_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post"},
 		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_basic", "client_secret_post", "none"},
 		"code_challenge_methods_supported":              []string{"S256"},
+		"backchannel_logout_supported":                  true,
+		"backchannel_logout_session_supported":          true,
+		"frontchannel_logout_supported":                 false,
+		"request_parameter_supported":                   false,
+		"request_uri_parameter_supported":               false,
+		"require_request_uri_registration":              false,
+		"tls_client_certificate_bound_access_tokens":    false,
 		"scopes_supported":                              []string{"openid", "profile", "email", "roles"},
-		"claims_supported":                              []string{"iss", "sub", "aud", "exp", "iat", "auth_time", "jti", "sid", "azp", "scope", "preferred_username", "email", "email_verified", "name", "realm_access", "resource_access"},
+		"claims_supported":                              []string{"iss", "sub", "aud", "exp", "iat", "auth_time", "jti", "sid", "azp", "scope", "preferred_username", "email", "email_verified", "name", "realm_access", "resource_access", "at_hash"},
 	})
 }
 
@@ -58,7 +67,7 @@ func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, "realm_not_found", "Realm을 찾을 수 없습니다.")
 		return
 	}
-	keys, err := s.store.ListSigningKeys(r.Context(), realm.ID)
+	keys, err := s.store.PublishedSigningKeys(r.Context(), realm.ID)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
@@ -80,13 +89,13 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	client, err := s.store.ClientByIdentifier(r.Context(), realm.ID, query.Get("client_id"))
 	if err != nil || !client.Enabled {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "unknown client_id")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "unknown client_id")
 		return
 	}
 	redirectURI := query.Get("redirect_uri")
 	if !store.RedirectURIAllowed(client, redirectURI) {
 		// Never redirect an error to an untrusted URI.
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri is not registered")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri is not registered")
 		return
 	}
 	if query.Get("response_type") != "code" {
@@ -144,23 +153,22 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Pragma", "no-cache")
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := r.ParseForm(); err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "invalid form body")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid form body")
 		return
 	}
 	realm, err := s.realmFromPath(r)
 	if err != nil || !realm.Enabled {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "realm is unavailable")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "realm is unavailable")
 		return
 	}
 	client, authenticated, err := s.authenticateOIDCClient(r, realm)
 	if err != nil || !authenticated || !client.Enabled {
-		w.Header().Set("WWW-Authenticate", `Basic realm="ReSSO token endpoint"`)
-		writeOAuthError(w, r, http.StatusUnauthorized, "invalid_client", "client authentication failed")
+		s.writeClientAuthError(w, r, err)
 		return
 	}
 	grant := r.Form.Get("grant_type")
 	if !slices.Contains(client.GrantTypes, grant) {
-		writeOAuthError(w, r, http.StatusBadRequest, "unsupported_grant_type", "grant is not enabled for this client")
+		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "grant is not enabled for this client")
 		return
 	}
 	switch grant {
@@ -171,7 +179,7 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	case "client_credentials":
 		s.handleClientCredentialsGrant(w, r, realm, client)
 	default:
-		writeOAuthError(w, r, http.StatusBadRequest, "unsupported_grant_type", "grant is not supported")
+		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "grant is not supported")
 	}
 }
 
@@ -186,25 +194,26 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		return nil
 	})
 	if err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "authorization code is invalid or expired")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code is invalid or expired")
 		return
 	}
 	user, err := s.store.UserByID(r.Context(), code.UserID)
 	if err != nil || !user.Enabled {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "user is unavailable")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "user is unavailable")
 		return
 	}
 	includeRefresh := slices.Contains(client.GrantTypes, "refresh_token")
 	response, err := s.oidc.IssueUserTokens(r.Context(), realm, client, user, code.SessionID, code.Scope, code.Nonce, includeRefresh)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "authorization session is no longer active")
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization session is no longer active")
 			return
 		}
 		s.logger.Error("token issue failed", "trace_id", traceIDFrom(r.Context()), "error", err)
-		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "token could not be issued")
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}
+	s.metrics.Add(metricTokens, 1, "authorization_code")
 	s.audit(r, &realm.ID, &user.ID, user.Username, "TOKEN_ISSUED", "SUCCESS", "client", client.ClientID, map[string]any{"grant_type": "authorization_code"})
 	writeJSON(w, http.StatusOK, response)
 }
@@ -213,72 +222,110 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 	raw := r.Form.Get("refresh_token")
 	inspected, _, err := s.store.InspectRefreshToken(r.Context(), raw)
 	if err != nil || inspected.RealmID != realm.ID || inspected.ClientID != client.ID || inspected.UserID == nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refresh token is invalid or expired")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token is invalid or expired")
 		return
 	}
-	requestedScopes, err := validatedScopes(r.Form.Get("scope"), inspected.Scope, false)
-	if err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_scope", err.Error())
-		return
-	}
-	if r.Form.Get("scope") != "" {
-		inspected.Scope = requestedScopes
-	}
+	// A refresh may narrow its scopes but never widen them, so the token's
+	// own scope list is the allowed set. An empty request keeps them as they
+	// are, which is signalled to the store by a nil reduction.
 	var reducedScopes []string
-	if r.Form.Get("scope") != "" {
-		reducedScopes = inspected.Scope
+	if requested := r.Form.Get("scope"); requested != "" {
+		reducedScopes, err = validatedScopes(requested, inspected.Scope, false)
+		if err != nil {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_scope", err.Error())
+			return
+		}
+		inspected.Scope = reducedScopes
 	}
 	rotated, rawNew, err := s.store.RotateRefreshToken(r.Context(), raw, reducedScopes)
 	if err != nil {
 		if errors.Is(err, store.ErrTokenReuse) {
 			s.audit(r, &realm.ID, inspected.UserID, "", "REFRESH_TOKEN_REUSE", "FAILURE", "client", client.ClientID, nil)
 		}
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refresh token is invalid or was already used")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token is invalid or was already used")
 		return
 	}
 	rotated.Scope = inspected.Scope
 	user, err := s.store.UserByID(r.Context(), *rotated.UserID)
 	if err != nil || !user.Enabled {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "user is unavailable")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "user is unavailable")
 		return
 	}
 	response, err := s.oidc.IssueRefreshedUserTokens(r.Context(), realm, client, user, rotated, rawNew)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "authorization session is no longer active")
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization session is no longer active")
 			return
 		}
-		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "token could not be issued")
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}
+	s.metrics.Add(metricTokens, 1, "refresh_token")
 	s.audit(r, &realm.ID, &user.ID, user.Username, "TOKEN_REFRESH", "SUCCESS", "client", client.ClientID, nil)
 	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request, realm domain.Realm, client domain.Client) {
 	if client.Type != "confidential" {
-		writeOAuthError(w, r, http.StatusUnauthorized, "unauthorized_client", "client_credentials requires a confidential client")
+		writeOAuthError(w, http.StatusUnauthorized, "unauthorized_client", "client_credentials requires a confidential client")
 		return
 	}
 	scopes, err := validatedScopes(r.Form.Get("scope"), client.DefaultScopes, false)
 	if err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_scope", err.Error())
+		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", err.Error())
 		return
 	}
 	response, err := s.oidc.IssueClientToken(r.Context(), realm, client, scopes)
 	if err != nil {
-		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "token could not be issued")
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}
+	s.metrics.Add(metricTokens, 1, "client_credentials")
 	s.audit(r, &realm.ID, nil, client.ClientID, "TOKEN_ISSUED", "SUCCESS", "client", client.ClientID, map[string]any{"grant_type": "client_credentials"})
 	writeJSON(w, http.StatusOK, response)
 }
 
+// rateLimitedError reports that a caller exhausted its credential attempts.
+type rateLimitedError struct{ retryAfter time.Duration }
+
+func (e *rateLimitedError) Error() string { return "client authentication is rate limited" }
+
+// authenticateOIDCClient resolves and verifies the calling client. Failed
+// attempts are counted per source address and per client identifier so that
+// guessing a client secret is bounded, and so an unauthenticated caller cannot
+// keep the credential verification path busy.
 func (s *Server) authenticateOIDCClient(r *http.Request, realm domain.Realm) (domain.Client, bool, error) {
 	clientID, secret, basic := r.BasicAuth()
 	if !basic {
 		clientID, secret = r.Form.Get("client_id"), r.Form.Get("client_secret")
 	}
+	buckets := []struct {
+		limiter *ratelimit.FailureLimiter
+		key     string
+	}{
+		{s.clientAuthLimiter, realm.ID.String() + "|" + clientID},
+		{s.addressAuthLimiter, s.clientIP(r)},
+	}
+	for _, bucket := range buckets {
+		if allowed, retryAfter := bucket.limiter.Allowed(bucket.key); !allowed {
+			return domain.Client{}, false, &rateLimitedError{retryAfter: retryAfter}
+		}
+	}
+	client, authenticated, err := s.verifyOIDCClient(r, realm, clientID, secret)
+	if err != nil || !authenticated {
+		for _, bucket := range buckets {
+			bucket.limiter.Fail(bucket.key)
+		}
+		s.metrics.Add(metricClientAuth, 1, realm.Name)
+		return client, false, err
+	}
+	// Only the client's own bucket is cleared. A successful authentication
+	// says nothing about the other clients sharing this address.
+	s.clientAuthLimiter.Reset(buckets[0].key)
+	return client, true, nil
+}
+
+func (s *Server) verifyOIDCClient(r *http.Request, realm domain.Realm, clientID, secret string) (domain.Client, bool, error) {
 	client, err := s.store.ClientByIdentifier(r.Context(), realm.ID, clientID)
 	if err != nil {
 		return domain.Client{}, false, err
@@ -290,33 +337,50 @@ func (s *Server) authenticateOIDCClient(r *http.Request, realm domain.Realm) (do
 	return client, ok, err
 }
 
+// writeClientAuthError emits the shared invalid_client response, upgrading it
+// to 429 with a Retry-After when the caller is being throttled.
+func (s *Server) writeClientAuthError(w http.ResponseWriter, r *http.Request, err error) {
+	var limited *rateLimitedError
+	if errors.As(err, &limited) {
+		retryAfter := int(limited.retryAfter.Seconds())
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		writeOAuthError(w, http.StatusTooManyRequests, "invalid_client", "too many failed client authentication attempts")
+		return
+	}
+	w.Header().Set("WWW-Authenticate", `Basic realm="ReSSO token endpoint"`)
+	writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "client authentication failed")
+}
+
 func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 	realm, err := s.realmFromPath(r)
 	if err != nil {
-		writeBearerError(w, r, "invalid_token")
+		writeBearerError(w, "invalid_token")
 		return
 	}
 	raw := bearerToken(r)
 	verified, err := s.oidc.Verify(r.Context(), realm, raw, "")
 	if err != nil || verified.Extra.Type != "Bearer" {
-		writeBearerError(w, r, "invalid_token")
+		writeBearerError(w, "invalid_token")
 		return
 	}
 	userID, err := uuid.Parse(verified.Claims.Subject)
 	if err != nil {
-		writeBearerError(w, r, "invalid_token")
+		writeBearerError(w, "invalid_token")
 		return
 	}
 	user, err := s.store.UserByID(r.Context(), userID)
 	if err != nil || !user.Enabled {
-		writeBearerError(w, r, "invalid_token")
+		writeBearerError(w, "invalid_token")
 		return
 	}
 	if sid, parseErr := uuid.Parse(verified.Extra.SessionID); parseErr != nil {
-		writeBearerError(w, r, "invalid_token")
+		writeBearerError(w, "invalid_token")
 		return
 	} else if _, sessionErr := s.store.SessionAuthTime(r.Context(), sid); sessionErr != nil {
-		writeBearerError(w, r, "invalid_token")
+		writeBearerError(w, "invalid_token")
 		return
 	}
 	scopes := strings.Fields(verified.Extra.Scope)
@@ -345,7 +409,7 @@ func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := r.ParseForm(); err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "invalid form body")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid form body")
 		return
 	}
 	realm, err := s.realmFromPath(r)
@@ -355,11 +419,15 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 	}
 	client, ok, err := s.authenticateOIDCClient(r, realm)
 	if err != nil || !ok || client.Type != "confidential" {
-		writeOAuthError(w, r, http.StatusUnauthorized, "invalid_client", "client authentication failed")
+		s.writeClientAuthError(w, r, err)
 		return
 	}
 	raw := r.Form.Get("token")
-	if verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, client.ClientID); verifyErr == nil && verified.Extra.AuthorizedParty == client.ClientID {
+	// Any confidential client of the Realm may introspect an access token of
+	// that Realm. Restricting this to the issuing client made the resource
+	// server pattern impossible: an API validating tokens minted for a
+	// different client always saw active=false.
+	if verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, ""); verifyErr == nil {
 		if verified.Extra.SessionID != "" {
 			sid, parseErr := uuid.Parse(verified.Extra.SessionID)
 			if parseErr != nil {
@@ -371,12 +439,20 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"active": true, "scope": verified.Extra.Scope,
-			"client_id": verified.Extra.AuthorizedParty, "username": verified.Extra.PreferredUsername,
-			"token_type": "Bearer", "exp": verified.Claims.Expiry.Time().Unix(), "iat": verified.Claims.IssuedAt.Time().Unix(),
-			"sub": verified.Claims.Subject, "aud": verified.Claims.Audience, "iss": verified.Claims.Issuer, "jti": verified.Claims.ID})
+		response := map[string]any{"active": true, "scope": verified.Extra.Scope,
+			"client_id": verified.Extra.AuthorizedParty, "azp": verified.Extra.AuthorizedParty,
+			"username": verified.Extra.PreferredUsername, "token_type": "Bearer", "typ": verified.Extra.Type,
+			"exp": verified.Claims.Expiry.Time().Unix(), "iat": verified.Claims.IssuedAt.Time().Unix(),
+			"sub": verified.Claims.Subject, "aud": verified.Claims.Audience, "iss": verified.Claims.Issuer,
+			"jti": verified.Claims.ID}
+		if verified.Extra.SessionID != "" {
+			response["sid"] = verified.Extra.SessionID
+		}
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
+	// A refresh token stays private to the client that holds it: its metadata
+	// is disclosed only to that client, not to every resource server.
 	if refresh, active, inspectErr := s.store.InspectRefreshToken(r.Context(), raw); inspectErr == nil && refresh.RealmID == realm.ID && refresh.ClientID == client.ID {
 		writeJSON(w, http.StatusOK, map[string]any{"active": active, "client_id": client.ClientID,
 			"scope": strings.Join(refresh.Scope, " "), "exp": refresh.ExpiresAt.Unix()})
@@ -388,7 +464,7 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := r.ParseForm(); err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "invalid form body")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid form body")
 		return
 	}
 	realm, err := s.realmFromPath(r)
@@ -398,7 +474,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	}
 	client, ok, err := s.authenticateOIDCClient(r, realm)
 	if err != nil || !ok {
-		writeOAuthError(w, r, http.StatusUnauthorized, "invalid_client", "client authentication failed")
+		s.writeClientAuthError(w, r, err)
 		return
 	}
 	raw := r.Form.Get("token")
@@ -433,6 +509,13 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 			if found, findErr := s.store.ClientByIdentifier(r.Context(), realm.ID, verified.Extra.AuthorizedParty); findErr == nil {
 				client = &found
 			}
+		}
+	} else if identifier := values.Get("client_id"); identifier != "" {
+		// RP-Initiated Logout 1.0 allows client_id in place of an
+		// id_token_hint. The redirect target is still checked against the
+		// client's registered list, so this cannot become an open redirect.
+		if found, findErr := s.store.ClientByIdentifier(r.Context(), realm.ID, identifier); findErr == nil && found.Enabled {
+			client = &found
 		}
 	}
 	redirectTo := ""
@@ -491,7 +574,7 @@ func validatedScopes(requested string, allowed []string, requireOpenID bool) ([]
 	return result, nil
 }
 
-func writeOAuthError(w http.ResponseWriter, r *http.Request, status int, code, description string) {
+func writeOAuthError(w http.ResponseWriter, status int, code, description string) {
 	writeJSON(w, status, map[string]any{"error": code, "error_description": description})
 }
 
@@ -508,9 +591,7 @@ func redirectOAuthError(w http.ResponseWriter, r *http.Request, target, state, i
 	http.Redirect(w, r, parsed.String(), http.StatusFound)
 }
 
-func writeBearerError(w http.ResponseWriter, r *http.Request, code string) {
+func writeBearerError(w http.ResponseWriter, code string) {
 	w.Header().Set("WWW-Authenticate", `Bearer error="`+code+`"`)
-	writeOAuthError(w, r, http.StatusUnauthorized, code, "access token is invalid or expired")
+	writeOAuthError(w, http.StatusUnauthorized, code, "access token is invalid or expired")
 }
-
-var _ = time.Second

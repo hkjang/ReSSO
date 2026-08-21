@@ -62,6 +62,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		if ipDecision.Attempts == 101 {
 			s.audit(r, nil, nil, strings.TrimSpace(input.Username), "LOGIN_RATE_LIMITED", "FAILURE", "user", "", map[string]any{"bucket": "ip"})
 		}
+		s.metrics.Add(metricLogins, 1, "rate_limited")
 		writeLoginRateLimited(w, r, ipDecision.RetryAfterSeconds)
 		return
 	}
@@ -110,6 +111,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
 			return
 		}
+		s.metrics.Add(metricLogins, 1, "failure")
 		s.audit(r, &realm.ID, nil, strings.TrimSpace(input.Username), "LOGIN_FAILURE", "FAILURE", "user", "", map[string]any{
 			"reason": result.FailureReason, "rate_limited": !failureDecision.Allowed,
 		})
@@ -158,6 +160,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		}
 		response["redirect_to"] = authorizationRedirect(consumed.RedirectURI, code, consumed.State, realm.IssuerURL, newSession.Session.ID)
 	}
+	s.metrics.Add(metricLogins, 1, "success")
 	s.audit(r, &realm.ID, &result.User.ID, result.User.Username, "LOGIN_SUCCESS", "SUCCESS", "session", newSession.Session.ID.String(), nil)
 	writeJSON(w, http.StatusOK, response)
 }

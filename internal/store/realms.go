@@ -22,13 +22,15 @@ var ErrFederationPasswordExternal = errors.New("password is managed by the sourc
 var ErrFederationOperation = errors.New("LDAP federation operation failed")
 
 const realmColumns = `id,name,display_name,issuer_url,enabled,approval_enabled,
-    access_token_ttl_seconds,refresh_token_ttl_seconds,session_ttl_seconds,created_at,updated_at`
+    access_token_ttl_seconds,refresh_token_ttl_seconds,session_ttl_seconds,
+    password_min_length,max_login_attempts,lockout_seconds,created_at,updated_at`
 
 func scanRealm(row pgx.Row) (domain.Realm, error) {
 	var realm domain.Realm
 	err := row.Scan(&realm.ID, &realm.Name, &realm.DisplayName, &realm.IssuerURL, &realm.Enabled,
 		&realm.ApprovalEnabled, &realm.AccessTokenTTLSeconds, &realm.RefreshTokenTTLSeconds,
-		&realm.SessionTTLSeconds, &realm.CreatedAt, &realm.UpdatedAt)
+		&realm.SessionTTLSeconds, &realm.PasswordMinLength, &realm.MaxLoginAttempts,
+		&realm.LockoutSeconds, &realm.CreatedAt, &realm.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Realm{}, ErrNotFound
 	}
@@ -111,6 +113,36 @@ type UpdateRealmInput struct {
 	AccessTokenTTLSeconds  int    `json:"access_token_ttl_seconds"`
 	RefreshTokenTTLSeconds int    `json:"refresh_token_ttl_seconds"`
 	SessionTTLSeconds      int    `json:"session_ttl_seconds"`
+	// The password and lockout policy lived only in the database until now:
+	// it was enforced on every login and password change but could not be
+	// read or set by an administrator, and the console guessed at its value.
+	PasswordMinLength int `json:"password_min_length"`
+	MaxLoginAttempts  int `json:"max_login_attempts"`
+	LockoutSeconds    int `json:"lockout_seconds"`
+}
+
+// realmPolicyBounds mirrors the CHECK constraints in 001_initial.sql so that
+// an out-of-range value is reported as a readable message instead of a
+// constraint violation.
+func validateRealmPolicy(input UpdateRealmInput) error {
+	for _, bound := range []struct {
+		label     string
+		value     int
+		low, high int
+	}{
+		{"password_min_length", input.PasswordMinLength, 8, 128},
+		{"max_login_attempts", input.MaxLoginAttempts, 3, 50},
+		{"lockout_seconds", input.LockoutSeconds, 30, 86400},
+		{"access_token_ttl_seconds", input.AccessTokenTTLSeconds, 60, 3600},
+		{"refresh_token_ttl_seconds", input.RefreshTokenTTLSeconds, 300, 2592000},
+		{"session_ttl_seconds", input.SessionTTLSeconds, 300, 2592000},
+	} {
+		if bound.value < bound.low || bound.value > bound.high {
+			return fmt.Errorf("%w: %s must be between %d and %d", ErrInvalidInput,
+				bound.label, bound.low, bound.high)
+		}
+	}
+	return nil
 }
 
 func (s *Store) UpdateRealm(ctx context.Context, id uuid.UUID, input UpdateRealmInput) (domain.Realm, error) {
@@ -118,11 +150,16 @@ func (s *Store) UpdateRealm(ctx context.Context, id uuid.UUID, input UpdateRealm
 	if err := validateIssuerURL(issuerURL); err != nil {
 		return domain.Realm{}, err
 	}
+	if err := validateRealmPolicy(input); err != nil {
+		return domain.Realm{}, err
+	}
 	_, err := s.Pool.Exec(ctx, `UPDATE realms SET display_name=$2,issuer_url=$3,enabled=$4,
         approval_enabled=$5,access_token_ttl_seconds=$6,refresh_token_ttl_seconds=$7,
-        session_ttl_seconds=$8,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.DisplayName),
+        session_ttl_seconds=$8,password_min_length=$9,max_login_attempts=$10,
+        lockout_seconds=$11,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.DisplayName),
 		issuerURL, input.Enabled, input.ApprovalEnabled,
-		input.AccessTokenTTLSeconds, input.RefreshTokenTTLSeconds, input.SessionTTLSeconds)
+		input.AccessTokenTTLSeconds, input.RefreshTokenTTLSeconds, input.SessionTTLSeconds,
+		input.PasswordMinLength, input.MaxLoginAttempts, input.LockoutSeconds)
 	if err != nil {
 		return domain.Realm{}, fmt.Errorf("update realm: %w", err)
 	}

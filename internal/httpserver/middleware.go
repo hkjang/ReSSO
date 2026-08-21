@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/hkjang/ReSSO/internal/domain"
+	"github.com/hkjang/ReSSO/internal/store"
 )
 
 type statusRecorder struct {
@@ -68,9 +69,13 @@ func (s *Server) commonMiddleware(next http.Handler) http.Handler {
 			} else if recorder.status >= 400 {
 				level = slog.LevelWarn
 			}
+			elapsed := time.Since(start)
+			route := routePattern(r)
+			s.metrics.Add(metricRequests, 1, route, r.Method, statusLabel(recorder.status))
+			s.metrics.Observe(metricRequestTime, elapsed.Seconds(), route)
 			s.logger.Log(ctx, level, "http request", "trace_id", traceID, "method", r.Method,
 				"path", r.URL.Path, "status", recorder.status, "bytes", recorder.bytes,
-				"duration_ms", time.Since(start).Milliseconds(), "remote_ip", s.clientIP(r))
+				"duration_ms", elapsed.Milliseconds(), "remote_ip", s.clientIP(r))
 		}()
 		next.ServeHTTP(recorder, r.WithContext(ctx))
 	})
@@ -94,6 +99,30 @@ func (s *Server) oidcCORS(next http.Handler) http.Handler {
 	})
 }
 
+// isSafeMethod reports whether a request only reads, and therefore needs no
+// CSRF token and may be authorized by a read-scoped API key.
+func isSafeMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
+}
+
+// sessionContext validates the browser session cookie, enforces CSRF on
+// state-changing methods, and returns a request carrying the session and the
+// derived principal. It reports false after writing the response itself.
+func (s *Server) sessionContext(w http.ResponseWriter, r *http.Request,
+	authenticated store.AuthenticatedSession) (*http.Request, bool) {
+	if !isSafeMethod(r.Method) && !s.store.ValidateCSRF(authenticated, r.Header.Get("X-CSRF-Token")) {
+		writeError(w, r, http.StatusForbidden, "invalid_csrf", "요청 검증 토큰이 올바르지 않습니다.")
+		return nil, false
+	}
+	sid := authenticated.Session.ID
+	principal := domain.Principal{UserID: authenticated.User.ID, RealmID: authenticated.User.RealmID,
+		Username: authenticated.User.Username, PlatformAdmin: authenticated.User.PlatformAdmin,
+		RealmAdmin: authenticated.RealmAdmin, SessionID: &sid}
+	ctx := context.WithValue(r.Context(), sessionKey, authenticated)
+	ctx = context.WithValue(ctx, principalKey, principal)
+	return r.WithContext(ctx), true
+}
+
 func (s *Server) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authenticated, err := s.store.SessionByToken(r.Context(), sessionCookie(r))
@@ -101,41 +130,27 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 			writeError(w, r, http.StatusUnauthorized, "authentication_required", "로그인이 필요합니다.")
 			return
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-			if !s.store.ValidateCSRF(authenticated, r.Header.Get("X-CSRF-Token")) {
-				writeError(w, r, http.StatusForbidden, "invalid_csrf", "요청 검증 토큰이 올바르지 않습니다.")
-				return
-			}
+		request, ok := s.sessionContext(w, r, authenticated)
+		if !ok {
+			return
 		}
-		sid := authenticated.Session.ID
-		principal := domain.Principal{UserID: authenticated.User.ID, RealmID: authenticated.User.RealmID,
-			Username: authenticated.User.Username, PlatformAdmin: authenticated.User.PlatformAdmin,
-			RealmAdmin: authenticated.RealmAdmin, SessionID: &sid}
-		ctx := context.WithValue(r.Context(), sessionKey, authenticated)
-		ctx = context.WithValue(ctx, principalKey, principal)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, request)
 	})
 }
 
 func (s *Server) requireSessionOrAPIKey(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if authenticated, err := s.store.SessionByToken(r.Context(), sessionCookie(r)); err == nil {
-			if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-				if !s.store.ValidateCSRF(authenticated, r.Header.Get("X-CSRF-Token")) {
-					writeError(w, r, http.StatusForbidden, "invalid_csrf", "요청 검증 토큰이 올바르지 않습니다.")
-					return
-				}
+			request, ok := s.sessionContext(w, r, authenticated)
+			if !ok {
+				return
 			}
-			sid := authenticated.Session.ID
-			principal := domain.Principal{UserID: authenticated.User.ID, RealmID: authenticated.User.RealmID,
-				Username: authenticated.User.Username, PlatformAdmin: authenticated.User.PlatformAdmin,
-				RealmAdmin: authenticated.RealmAdmin, SessionID: &sid}
-			ctx := context.WithValue(r.Context(), sessionKey, authenticated)
-			ctx = context.WithValue(ctx, principalKey, principal)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			next.ServeHTTP(w, request)
 			return
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+		// An API key is read-only authorization; changing state always
+		// requires a browser session so that CSRF protection applies.
+		if !isSafeMethod(r.Method) {
 			writeError(w, r, http.StatusUnauthorized, "browser_session_required", "변경 요청에는 브라우저 로그인이 필요합니다.")
 			return
 		}
@@ -145,8 +160,7 @@ func (s *Server) requireSessionOrAPIKey(next http.Handler) http.Handler {
 			writeError(w, r, http.StatusUnauthorized, "authentication_required", "로그인 또는 api:read 범위의 API 키가 필요합니다.")
 			return
 		}
-		ctx := context.WithValue(r.Context(), principalKey, principal)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey, principal)))
 	})
 }
 

@@ -1,6 +1,8 @@
 module github.com/hkjang/ReSSO
 
-go 1.26.7
+go 1.26
+
+toolchain go1.26.7
 
 require (
 	github.com/go-chi/chi/v5 v5.3.1

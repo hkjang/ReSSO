@@ -1,3 +1,5 @@
+// Package federation connects Realms to external LDAP and Active Directory
+// directories for authentication, attribute synchronization and group mapping.
 package federation
 
 import (
@@ -112,7 +114,7 @@ func TestConnection(ctx context.Context, config RuntimeConfig) error {
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 	request := ldap.NewSearchRequest(config.Provider.UsersDN, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
 		1, 5, false, "(objectClass=*)", []string{"1.1"}, nil)
 	if _, err := connection.Search(request); err != nil {
@@ -130,7 +132,7 @@ func Authenticate(ctx context.Context, config RuntimeConfig, username, password 
 		return User{}, false, err
 	}
 	result, err := search(connection, config.Provider, username, 2)
-	connection.Close()
+	_ = connection.Close()
 	if err != nil {
 		return User{}, false, fmt.Errorf("search LDAP user: %w", err)
 	}
@@ -145,7 +147,7 @@ func Authenticate(ctx context.Context, config RuntimeConfig, username, password 
 	if err != nil {
 		return User{}, false, err
 	}
-	defer userConnection.Close()
+	defer func() { _ = userConnection.Close() }()
 	if err := userConnection.Bind(user.DN, password); err != nil {
 		if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
 			return User{}, false, nil
@@ -160,7 +162,7 @@ func FetchUsers(ctx context.Context, config RuntimeConfig) ([]User, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 	result, err := search(connection, config.Provider, "", 0)
 	if err != nil {
 		return nil, fmt.Errorf("search LDAP users: %w", err)
@@ -181,7 +183,7 @@ func UpdateUser(ctx context.Context, config RuntimeConfig, dn, email, displayNam
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 	request := userModifyRequest(config.Provider, dn, email, displayName)
 	if err := connection.Modify(request); err != nil {
 		return fmt.Errorf("update LDAP user: %w", err)
@@ -215,7 +217,7 @@ func ChangePassword(ctx context.Context, config RuntimeConfig, dn, current, repl
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 	if _, err := connection.PasswordModify(ldap.NewPasswordModifyRequest(dn, current, replacement)); err != nil {
 		return fmt.Errorf("change LDAP password: %w", err)
 	}
@@ -229,7 +231,7 @@ func connect(ctx context.Context, config RuntimeConfig) (*ldap.Conn, error) {
 	}
 	if config.Provider.BindDN != "" {
 		if err := connection.Bind(config.Provider.BindDN, config.BindCredential); err != nil {
-			connection.Close()
+			_ = connection.Close()
 			return nil, fmt.Errorf("bind service account: %w", err)
 		}
 	}
@@ -252,7 +254,7 @@ func dial(ctx context.Context, provider domain.LDAPFederation) (*ldap.Conn, erro
 	connection.SetTimeout(operationTimeout)
 	if provider.StartTLS {
 		if err := connection.StartTLS(tlsConfig); err != nil {
-			connection.Close()
+			_ = connection.Close()
 			return nil, fmt.Errorf("start LDAP TLS: %w", err)
 		}
 	}
@@ -367,13 +369,13 @@ func MappedRoles(provider domain.LDAPFederation, memberOf []string) []string {
 func changeADPassword(ctx context.Context, config RuntimeConfig, dn, current, replacement string) error {
 	parsed, _ := url.Parse(config.Provider.ConnectionURL)
 	if parsed.Scheme != "ldaps" && !config.Provider.StartTLS {
-		return errors.New("Active Directory password changes require LDAPS or StartTLS")
+		return errors.New("changing an Active Directory password requires LDAPS or StartTLS")
 	}
 	connection, err := connect(ctx, config)
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 	request := ldap.NewModifyRequest(dn, nil)
 	newValue := quotedUTF16LE(replacement)
 	if current == "" {

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/url"
@@ -90,6 +91,21 @@ type UpdateClientInput struct {
 	BackchannelLogoutURI   string   `json:"backchannel_logout_uri"`
 }
 
+// validateBackchannelLogoutURI applies the same transport rules as redirect
+// URIs. ReSSO now actually posts signed logout tokens to this address, so an
+// unvalidated value would let an administrator direct signed tokens at an
+// arbitrary plaintext endpoint.
+func validateBackchannelLogoutURI(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", nil
+	}
+	if err := validateURIs([]string{trimmed}, false); err != nil {
+		return "", fmt.Errorf("backchannel_logout_uri: %w", err)
+	}
+	return trimmed, nil
+}
+
 func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClientInput) (domain.Client, error) {
 	if strings.TrimSpace(input.Name) == "" {
 		return domain.Client{}, errors.New("client name is required")
@@ -109,13 +125,17 @@ func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClie
 	input.PostLogoutRedirectURIs = nonNilStrings(input.PostLogoutRedirectURIs)
 	input.GrantTypes = nonNilStrings(input.GrantTypes)
 	input.DefaultScopes = nonNilStrings(input.DefaultScopes)
+	backchannelURI, err := validateBackchannelLogoutURI(input.BackchannelLogoutURI)
+	if err != nil {
+		return domain.Client{}, err
+	}
 	command, err := s.Pool.Exec(ctx, `UPDATE clients SET name=$2,redirect_uris=$3,
         post_logout_redirect_uris=$4,web_origins=$5,grant_types=$6,default_scopes=$7,
         require_pkce=$8,enabled=$9,access_token_ttl_seconds=$10,refresh_token_ttl_seconds=$11,
         backchannel_logout_uri=$12,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.Name),
 		input.RedirectURIs, input.PostLogoutRedirectURIs, input.WebOrigins, input.GrantTypes,
 		input.DefaultScopes, input.RequirePKCE, input.Enabled, input.AccessTokenTTLSeconds,
-		input.RefreshTokenTTLSeconds, strings.TrimSpace(input.BackchannelLogoutURI))
+		input.RefreshTokenTTLSeconds, backchannelURI)
 	if err != nil {
 		return domain.Client{}, fmt.Errorf("update client: %w", err)
 	}
@@ -149,11 +169,15 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 	input.WebOrigins = normalizedOrigins
 	input.RedirectURIs = nonNilStrings(input.RedirectURIs)
 	input.PostLogoutRedirectURIs = nonNilStrings(input.PostLogoutRedirectURIs)
+	backchannelURI, err := validateBackchannelLogoutURI(input.BackchannelLogoutURI)
+	if err != nil {
+		return CreatedClient{}, err
+	}
 	client := domain.Client{ID: uuid.New(), RealmID: realmID, ClientID: input.ClientID, Name: input.Name,
 		Type: input.Type, RedirectURIs: input.RedirectURIs, PostLogoutRedirectURIs: input.PostLogoutRedirectURIs,
 		WebOrigins: input.WebOrigins, GrantTypes: input.GrantTypes, DefaultScopes: input.DefaultScopes,
 		RequirePKCE: input.RequirePKCE || input.Type == "public", Enabled: true, AccessTokenTTLSeconds: 300,
-		RefreshTokenTTLSeconds: 1800, BackchannelLogoutURI: strings.TrimSpace(input.BackchannelLogoutURI),
+		RefreshTokenTTLSeconds: 1800, BackchannelLogoutURI: backchannelURI,
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	var secret, secretHash string
 	if client.Type == "confidential" {
@@ -161,10 +185,7 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 		if err != nil {
 			return CreatedClient{}, err
 		}
-		secretHash, err = password.Hash(secret)
-		if err != nil {
-			return CreatedClient{}, err
-		}
+		secretHash = s.clientSecretDigest(secret)
 	}
 	_, err = s.Pool.Exec(ctx, `INSERT INTO clients(id,realm_id,client_id,name,type,secret_hash,redirect_uris,
         post_logout_redirect_uris,web_origins,grant_types,default_scopes,require_pkce,enabled,
@@ -226,14 +247,25 @@ func isLoopbackHostname(host string) bool {
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
-func (s *Store) WebOriginAllowed(ctx context.Context, realmID uuid.UUID, origin string) (bool, error) {
+// normalizedWebOrigin canonicalizes a single Origin header value. A malformed
+// value is reported as not well formed rather than as an error: it can never
+// match a registered origin, so the caller's answer is simply "not allowed".
+func normalizedWebOrigin(origin string) (string, bool) {
 	normalized, err := normalizeWebOrigins([]string{origin})
 	if err != nil || len(normalized) != 1 {
+		return "", false
+	}
+	return normalized[0], true
+}
+
+func (s *Store) WebOriginAllowed(ctx context.Context, realmID uuid.UUID, origin string) (bool, error) {
+	normalized, wellFormed := normalizedWebOrigin(origin)
+	if !wellFormed {
 		return false, nil
 	}
 	var allowed bool
-	err = s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM clients
-		WHERE realm_id=$1 AND enabled=true AND $2=ANY(web_origins))`, realmID, normalized[0]).Scan(&allowed)
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM clients
+		WHERE realm_id=$1 AND enabled=true AND $2=ANY(web_origins))`, realmID, normalized).Scan(&allowed)
 	return allowed, err
 }
 
@@ -245,15 +277,47 @@ func PostLogoutURIAllowed(client domain.Client, requested string) bool {
 	return slices.Contains(client.PostLogoutRedirectURIs, requested)
 }
 
+// clientSecretDigestPrefix marks a keyed-HMAC client secret hash. Client
+// secrets are 256-bit values generated by ReSSO, so they carry no guessable
+// structure for a password-stretching function to defend. Verifying them with
+// Argon2 instead let any unauthenticated caller of the token, introspection or
+// revocation endpoint spend 64 MiB and a CPU core per attempt, so new secrets
+// use the same keyed digest as personal API keys.
+const clientSecretDigestPrefix = "hmac-sha256$"
+
+func (s *Store) clientSecretDigest(secret string) string {
+	return clientSecretDigestPrefix + base64.RawStdEncoding.EncodeToString(s.Sealer.Digest(secret))
+}
+
+// VerifyClientSecret accepts both the keyed digest and the v0.2 Argon2 hash.
+// A surviving Argon2 hash is upgraded in place on the first successful
+// verification so the expensive path disappears as clients authenticate.
 func (s *Store) VerifyClientSecret(ctx context.Context, clientID uuid.UUID, secret string) (bool, error) {
 	var hash *string
 	if err := s.Pool.QueryRow(ctx, "SELECT secret_hash FROM clients WHERE id=$1", clientID).Scan(&hash); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, ErrNotFound
+		}
 		return false, err
 	}
 	if hash == nil || secret == "" {
 		return false, nil
 	}
-	return password.Verify(secret, *hash)
+	if encoded, ok := strings.CutPrefix(*hash, clientSecretDigestPrefix); ok {
+		expected, err := base64.RawStdEncoding.DecodeString(encoded)
+		if err != nil {
+			return false, errors.New("stored client secret digest is malformed")
+		}
+		return s.Sealer.MatchDigest(secret, expected), nil
+	}
+	matched, err := password.VerifyContext(ctx, secret, *hash)
+	if err != nil || !matched {
+		return false, err
+	}
+	// Best effort: a failed upgrade only leaves the legacy hash in place.
+	_, _ = s.Pool.Exec(ctx, `UPDATE clients SET secret_hash=$2 WHERE id=$1 AND secret_hash=$3`,
+		clientID, s.clientSecretDigest(secret), *hash)
+	return true, nil
 }
 
 func (s *Store) RotateClientSecret(ctx context.Context, clientID uuid.UUID) (string, error) {
@@ -261,12 +325,8 @@ func (s *Store) RotateClientSecret(ctx context.Context, clientID uuid.UUID) (str
 	if err != nil {
 		return "", err
 	}
-	hash, err := password.Hash(secret)
-	if err != nil {
-		return "", err
-	}
 	command, err := s.Pool.Exec(ctx, `UPDATE clients SET secret_hash=$2,updated_at=now()
-        WHERE id=$1 AND type='confidential'`, clientID, hash)
+        WHERE id=$1 AND type='confidential'`, clientID, s.clientSecretDigest(secret))
 	if err != nil {
 		return "", err
 	}

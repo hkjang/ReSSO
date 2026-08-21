@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type SystemLog struct {
@@ -26,6 +28,43 @@ func (s *Store) WriteSystemLog(ctx context.Context, level, component, message, t
 	}
 	_, err = s.Pool.Exec(ctx, `INSERT INTO system_logs(level,component,message,trace_id,attributes)
         VALUES($1,$2,$3,$4,$5)`, level, component, message, traceID, encoded)
+	return err
+}
+
+// SystemLogEntry is one buffered log record awaiting persistence.
+type SystemLogEntry struct {
+	OccurredAt time.Time
+	Level      string
+	Component  string
+	Message    string
+	TraceID    string
+	Attributes map[string]any
+}
+
+// WriteSystemLogs persists a batch in a single round trip. Every HTTP request
+// emits a log line, so writing them one statement at a time made the log
+// mirror the busiest writer in the database.
+func (s *Store) WriteSystemLogs(ctx context.Context, entries []SystemLogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	rows := make([][]any, 0, len(entries))
+	for _, entry := range entries {
+		attributes := entry.Attributes
+		if attributes == nil {
+			attributes = map[string]any{}
+		}
+		encoded, err := json.Marshal(attributes)
+		if err != nil {
+			// One unencodable record must not discard the whole batch.
+			encoded = []byte(`{"attributes_error":"could not be encoded"}`)
+		}
+		rows = append(rows, []any{entry.OccurredAt, entry.Level, entry.Component,
+			entry.Message, entry.TraceID, encoded})
+	}
+	_, err := s.Pool.CopyFrom(ctx, pgx.Identifier{"system_logs"},
+		[]string{"occurred_at", "level", "component", "message", "trace_id", "attributes"},
+		pgx.CopyFromRows(rows))
 	return err
 }
 
@@ -64,6 +103,9 @@ func (s *Store) PruneOperationalData(ctx context.Context) error {
 		"DELETE FROM authorization_codes WHERE expires_at < now() - interval '1 day'",
 		"DELETE FROM revoked_access_tokens WHERE expires_at < now()",
 		"DELETE FROM login_rate_limits WHERE updated_at < now() - interval '1 day'",
+		// Refresh tokens were only collected through the session cascade, so a
+		// long-lived session accumulated every rotation it ever performed.
+		"DELETE FROM refresh_tokens WHERE expires_at < now() - interval '7 days'",
 		"DELETE FROM sso_sessions WHERE expires_at < now() - interval '30 days'",
 	}
 	for _, statement := range statements {

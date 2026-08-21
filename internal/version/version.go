@@ -1,3 +1,4 @@
+// Package version carries the build identity stamped in at link time.
 package version
 
 import "runtime"

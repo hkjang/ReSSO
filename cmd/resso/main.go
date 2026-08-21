@@ -4,24 +4,33 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/hkjang/ReSSO/internal/backchannel"
 	"github.com/hkjang/ReSSO/internal/config"
 	"github.com/hkjang/ReSSO/internal/cryptoutil"
 	"github.com/hkjang/ReSSO/internal/httpserver"
 	"github.com/hkjang/ReSSO/internal/observability"
+	"github.com/hkjang/ReSSO/internal/oidc"
 	"github.com/hkjang/ReSSO/internal/store"
 	"github.com/hkjang/ReSSO/internal/version"
 )
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
-		client := &http.Client{Timeout: 3 * time.Second}
-		response, err := client.Get("http://127.0.0.1:8080/health/ready")
+		probeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, healthCheckURL(), nil)
+		if err != nil {
+			os.Exit(1)
+		}
+		response, err := http.DefaultClient.Do(request)
 		if err != nil || response.StatusCode != http.StatusOK {
 			os.Exit(1)
 		}
@@ -59,6 +68,11 @@ func main() {
 		bootstrapLogger.Error("database migration failed", "error", err)
 		os.Exit(1)
 	}
+	if indexed, indexErr := data.EnsureSearchIndexes(startupCtx); indexErr != nil {
+		bootstrapLogger.Warn("optional user search indexes could not be created", "error", indexErr)
+	} else if !indexed {
+		bootstrapLogger.Info("pg_trgm is not installed; user search uses a sequential scan")
+	}
 	bootstrap, err := data.Bootstrap(startupCtx, cfg.BootstrapAdmin, cfg.BootstrapAdminPassword)
 	if err != nil {
 		bootstrapLogger.Error("service bootstrap failed", "error", err)
@@ -81,7 +95,16 @@ func main() {
 	logger.Info("ReSSO starting", "version", version.Version, "commit", version.Commit,
 		"listen", cfg.ListenAddress, "bootstrap_admin_created", bootstrap.Created)
 
+	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	app := httpserver.New(data, logger, cfg.TrustedProxyCIDRs)
+
+	// Relying parties that registered a back-channel logout URI are notified
+	// whenever a session ends, including administrative revocations.
+	logoutNotifier := backchannel.New(runCtx, data, &oidc.Service{Store: data}, logger, app.Metrics())
+	data.OnSessionRevoked = logoutNotifier.SessionRevoked
+
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddress,
 		Handler:           app.Handler(),
@@ -93,10 +116,8 @@ func main() {
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
-	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	go maintenance(runCtx, data, logger)
-	go federationMaintenance(runCtx, data, logger)
+	go federationMaintenance(runCtx, data, logger, app.Metrics())
 	go func() {
 		<-runCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -104,6 +125,7 @@ func main() {
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
+		logoutNotifier.Wait(10 * time.Second)
 	}()
 
 	err = httpServer.ListenAndServe()
@@ -112,6 +134,23 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("ReSSO stopped")
+}
+
+// healthCheckURL follows LISTEN_ADDRESS so the container health check probes
+// the port the server actually bound.
+func healthCheckURL() string {
+	address := strings.TrimSpace(os.Getenv(config.EnvListenAddress))
+	if address == "" {
+		address = config.DefaultListenAddress
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "http://127.0.0.1:8080/health/ready"
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/health/ready"
 }
 
 func newSealer(cfg config.Config) (*cryptoutil.Sealer, error) {
@@ -129,7 +168,7 @@ func newSealer(cfg config.Config) (*cryptoutil.Sealer, error) {
 	return cryptoutil.NewKeyring(dataKeys, digestKeys)
 }
 
-func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.Logger) {
+func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.Logger, metrics *observability.Registry) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
@@ -149,10 +188,12 @@ func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.
 				summary, syncErr := data.SyncLDAPFederation(syncCtx, id)
 				syncCancel()
 				if syncErr != nil {
+					metrics.Add(httpserver.MetricFederationSync, 1, "failure")
 					logger.Error("scheduled LDAP federation sync failed", "federation_id", id,
 						"read", summary.Read, "failed", summary.Failed, "error", syncErr)
 					continue
 				}
+				metrics.Add(httpserver.MetricFederationSync, 1, "success")
 				logger.Info("scheduled LDAP federation sync completed", "federation_id", id,
 					"read", summary.Read, "added", summary.Added, "updated", summary.Updated, "disabled", summary.Disabled)
 			}
@@ -161,6 +202,24 @@ func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.
 }
 
 func maintenance(ctx context.Context, data *store.Store, logger *slog.Logger) {
+	prune := func() {
+		cleanupCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		if err := data.PruneOperationalData(cleanupCtx); err != nil {
+			logger.Warn("operational data retention cleanup failed", "error", err)
+		}
+	}
+	// Run once shortly after startup. Waiting a full day for the first pass
+	// meant a service that restarts daily never collected expired
+	// authorization codes, revoked token records or rate-limit buckets at all.
+	startup := time.NewTimer(time.Minute)
+	defer startup.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-startup.C:
+		prune()
+	}
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 	for {
@@ -168,12 +227,7 @@ func maintenance(ctx context.Context, data *store.Store, logger *slog.Logger) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			cleanupCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-			err := data.PruneOperationalData(cleanupCtx)
-			cancel()
-			if err != nil {
-				logger.Warn("operational data retention cleanup failed", "error", err)
-			}
+			prune()
 		}
 	}
 }

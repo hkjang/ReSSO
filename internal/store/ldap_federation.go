@@ -633,7 +633,7 @@ func (s *Store) Authenticate(ctx context.Context, realm domain.Realm, username, 
 	if federationErr != nil {
 		return AuthenticationResult{}, federationErr
 	}
-	_, _ = s.dummyPasswordVerification(suppliedPassword)
+	_, _ = s.dummyPasswordVerification(ctx, suppliedPassword)
 	return AuthenticationResult{FailureReason: "INVALID_CREDENTIALS"}, nil
 }
 
@@ -671,30 +671,23 @@ func (s *Store) authenticateLinkedLDAPUser(ctx context.Context, realm domain.Rea
 }
 
 func (s *Store) finishFederatedAuthentication(ctx context.Context, realm domain.Realm, user domain.User, verified bool, providerName string) (AuthenticationResult, error) {
-	now := time.Now().UTC()
 	if !verified {
-		var maxAttempts, lockoutSeconds int
-		if err := s.Pool.QueryRow(ctx, `SELECT max_login_attempts,lockout_seconds FROM realms WHERE id=$1`, realm.ID).Scan(&maxAttempts, &lockoutSeconds); err != nil {
-			return AuthenticationResult{}, err
-		}
-		attempts := user.FailedAttempts + 1
-		var lockedUntil *time.Time
-		if attempts >= maxAttempts {
-			locked := now.Add(time.Duration(lockoutSeconds) * time.Second)
-			lockedUntil = &locked
-		}
-		_, err := s.Pool.Exec(ctx, `UPDATE users SET failed_attempts=$2,locked_until=$3,updated_at=now() WHERE id=$1`, user.ID, attempts, lockedUntil)
+		locked, err := s.recordFailedLogin(ctx, user.ID)
 		if err != nil {
 			return AuthenticationResult{}, err
 		}
 		reason := "INVALID_CREDENTIALS"
-		if lockedUntil != nil {
+		if locked {
 			reason = "ACCOUNT_LOCKED"
 		}
 		return AuthenticationResult{User: user, FailureReason: reason}, nil
 	}
-	if _, err := s.Pool.Exec(ctx, `UPDATE users SET failed_attempts=0,locked_until=NULL,updated_at=now() WHERE id=$1`, user.ID); err != nil {
+	accepted, err := s.completeSuccessfulLogin(ctx, user.ID)
+	if err != nil {
 		return AuthenticationResult{}, err
+	}
+	if !accepted {
+		return AuthenticationResult{User: user, FailureReason: "ACCOUNT_LOCKED"}, nil
 	}
 	user.FailedAttempts, user.LockedUntil = 0, nil
 	return AuthenticationResult{User: user, Success: true, SessionSeconds: realm.SessionTTLSeconds,
@@ -715,8 +708,8 @@ func accountFailureReason(realm domain.Realm, user domain.User, now time.Time) s
 	return ""
 }
 
-func (s *Store) dummyPasswordVerification(value string) (bool, error) {
-	return password.Verify(value, s.dummyPasswordHash)
+func (s *Store) dummyPasswordVerification(ctx context.Context, value string) (bool, error) {
+	return password.VerifyContext(ctx, value, s.dummyPasswordHash)
 }
 
 func (s *Store) updateFederatedAttributes(ctx context.Context, user domain.User, email, displayName string) error {
