@@ -11,7 +11,7 @@ import { api } from '../lib/api'
 import { PageHeader, ContentCard } from '../components/Page'
 import { ErrorAlert, PageLoading } from '../components/Feedback'
 
-interface DashboardData { realms: number; users: number; clients: number; active_sessions: number; pending_approvals: number; readiness: { issuer_https: boolean; signing_keys_ready: boolean; federation_failures: number; locked_users: number; expiring_api_keys: number } }
+interface DashboardData { realms: number; users: number; clients: number; active_sessions: number; pending_approvals: number; readiness: { issuer_https: boolean; signing_keys_ready: boolean; federation_failures: number; locked_users: number; expiring_api_keys: number; aging_signing_keys: number; signing_key_advisory_days: number } }
 
 export function DashboardPage() {
   const query = useQuery({ queryKey: ['dashboard'], queryFn: () => api<DashboardData>('/api/admin/v1/dashboard'), refetchInterval: 30_000 })
@@ -32,6 +32,7 @@ export function DashboardPage() {
     { label: 'LDAP 최근 동기화', ready: (query.data?.readiness.federation_failures ?? 0) === 0, detail: `${query.data?.readiness.federation_failures ?? 0}개 실패`, to: '/admin/user-federation', action: 'User Federation 열기' },
     { label: '잠긴 사용자', ready: (query.data?.readiness.locked_users ?? 0) === 0, detail: `${query.data?.readiness.locked_users ?? 0}명`, to: '/admin/users', action: '잠긴 사용자 보기' },
     { label: '7일 내 API 키 만료', ready: (query.data?.readiness.expiring_api_keys ?? 0) === 0, detail: `${query.data?.readiness.expiring_api_keys ?? 0}개`, to: '/admin/audit', action: '감사 이벤트 확인' },
+    { label: `${query.data?.readiness.signing_key_advisory_days ?? 180}일 초과 서명 키`, ready: (query.data?.readiness.aging_signing_keys ?? 0) === 0, detail: `${query.data?.readiness.aging_signing_keys ?? 0}개`, to: '/admin/keys', action: '서명 키 회전' },
   ]
   return (
     <>

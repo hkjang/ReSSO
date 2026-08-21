@@ -76,6 +76,10 @@ func queryInt(r *http.Request, name string, fallback int) int {
 	return value
 }
 
+// signingKeyAdvisoryDays is when the console starts suggesting a rotation. It
+// is advice, not a failure: a key past it still signs and verifies normally.
+const signingKeyAdvisoryDays = 180
+
 func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFrom(r.Context())
 	var realmID *uuid.UUID
@@ -101,6 +105,10 @@ func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
 	var readiness struct {
 		IssuerHTTPS, SigningKeysReady                    bool
 		FederationFailures, LockedUsers, ExpiringAPIKeys int
+		// Signing keys are never rotated automatically, and nothing told the
+		// operator when one had aged: a Realm could run for years on the key
+		// created at bootstrap while the console reported it as healthy.
+		AgingSigningKeys int
 	}
 	err = s.store.Pool.QueryRow(r.Context(), `SELECT
 		NOT EXISTS(SELECT 1 FROM realms WHERE enabled=true AND ($1::uuid IS NULL OR id=$1)
@@ -112,8 +120,12 @@ func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
 		(SELECT count(*) FROM users WHERE locked_until>now() AND ($1::uuid IS NULL OR realm_id=$1)),
 		(SELECT count(*) FROM personal_api_keys k JOIN users u ON u.id=k.user_id
 		    WHERE k.revoked_at IS NULL AND k.expires_at BETWEEN now() AND now()+interval '7 days'
-		    AND ($1::uuid IS NULL OR u.realm_id=$1))`, realmID).Scan(&readiness.IssuerHTTPS,
-		&readiness.SigningKeysReady, &readiness.FederationFailures, &readiness.LockedUsers, &readiness.ExpiringAPIKeys)
+		    AND ($1::uuid IS NULL OR u.realm_id=$1)),
+		(SELECT count(*) FROM signing_keys k JOIN realms r ON r.id=k.realm_id
+		    WHERE k.status='ACTIVE' AND r.enabled=true AND k.created_at < now()-make_interval(days => $2)
+		    AND ($1::uuid IS NULL OR k.realm_id=$1))`, realmID, signingKeyAdvisoryDays).Scan(&readiness.IssuerHTTPS,
+		&readiness.SigningKeysReady, &readiness.FederationFailures, &readiness.LockedUsers,
+		&readiness.ExpiringAPIKeys, &readiness.AgingSigningKeys)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
@@ -122,7 +134,8 @@ func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
 		"clients": counts.Clients, "active_sessions": counts.ActiveSessions, "pending_approvals": counts.PendingApprovals,
 		"readiness": map[string]any{"issuer_https": readiness.IssuerHTTPS, "signing_keys_ready": readiness.SigningKeysReady,
 			"federation_failures": readiness.FederationFailures, "locked_users": readiness.LockedUsers,
-			"expiring_api_keys": readiness.ExpiringAPIKeys}})
+			"expiring_api_keys": readiness.ExpiringAPIKeys, "aging_signing_keys": readiness.AgingSigningKeys,
+			"signing_key_advisory_days": signingKeyAdvisoryDays}})
 }
 
 func (s *Server) adminListRealms(w http.ResponseWriter, r *http.Request) {
