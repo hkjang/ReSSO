@@ -124,7 +124,7 @@ export function UsersPage() {
     return true
   })
   if (realms.isLoading) return <PageLoading />
-  if (realms.error) return <ErrorAlert error={realms.error} />
+  if (realms.error) return <ErrorAlert error={realms.error} onRetry={() => void realms.refetch()} />
   return (
     <>
       <PageHeader title="사용자" description="Realm별 계정 수명주기, 잠금과 팀장 관계를 관리합니다." action={{ label: '사용자 추가', onClick: () => setCreateOpen(true) }} />
@@ -138,7 +138,7 @@ export function UsersPage() {
         </ToggleButtonGroup>
       </Stack>
       <ContentCard noPadding>
-        {users.isLoading ? <PageLoading /> : users.error ? <Box sx={{ p: 2 }}><ErrorAlert error={users.error} /></Box> : !users.data?.items.length ? <EmptyState title="사용자가 없습니다" description="검색 조건을 바꾸거나 새 사용자를 추가하세요." /> : !visibleUsers.length ? <EmptyState title="이 페이지에 해당하는 사용자가 없습니다" description="상태 필터는 현재 페이지에만 적용됩니다. 필터를 해제하거나 다른 페이지를 확인하세요." /> : <>
+        {users.isLoading ? <PageLoading /> : users.error ? <Box sx={{ p: 2 }}><ErrorAlert error={users.error} onRetry={() => void users.refetch()} /></Box> : !users.data?.items.length ? <EmptyState title="사용자가 없습니다" description="검색 조건을 바꾸거나 새 사용자를 추가하세요." /> : !visibleUsers.length ? <EmptyState title="이 페이지에 해당하는 사용자가 없습니다" description="상태 필터는 현재 페이지에만 적용됩니다. 필터를 해제하거나 다른 페이지를 확인하세요." /> : <>
           <TableContainer sx={{ maxHeight: 'calc(100vh - 315px)' }}><Table stickyHeader aria-label="사용자 목록"><TableHead><TableRow><TableCell>사용자</TableCell><TableCell>이메일</TableCell><TableCell>소스</TableCell><TableCell>상태</TableCell><TableCell>마지막 비밀번호 변경</TableCell><TableCell align="right">작업</TableCell></TableRow></TableHead><TableBody>
             {visibleUsers.map((user) => <TableRow hover key={user.id} onClick={() => setSelected(user)} sx={{ cursor: 'pointer' }} tabIndex={0} onKeyDown={(e) => { if (e.key === 'Enter') setSelected(user) }}><TableCell><Typography fontWeight={680}>{user.display_name}</Typography><Typography variant="caption" color="text.secondary" className="mono">{user.username}</Typography></TableCell><TableCell>{user.email ? <Stack direction="row" spacing={.7} alignItems="center"><span>{user.email}</span>{user.email_verified && <Chip label="확인됨" size="small" color="success" variant="outlined" />}</Stack> : '—'}</TableCell><TableCell>{user.federation_id ? <Chip label="LDAP" size="small" color="secondary" variant="outlined" /> : <Chip label="Local" size="small" variant="outlined" />}</TableCell><TableCell><StatusChip active={user.enabled && !isLocked(user)} activeLabel="정상" inactiveLabel={isLocked(user) ? '잠김' : '비활성'} />{isLocked(user) && <Typography variant="caption" color="text.secondary" display="block">{formatDate(user.locked_until)}까지</Typography>}</TableCell><TableCell>{formatDate(user.password_changed_at)}</TableCell><TableCell align="right" onClick={(event) => event.stopPropagation()}>{isLocked(user) ? <Tooltip title="비밀번호를 바꾸지 않고 잠금만 해제합니다"><span><Button size="small" startIcon={<LockOpenRoundedIcon />} disabled={unlock.isPending} onClick={() => unlock.mutate(user)}>잠금 해제</Button></span></Tooltip> : null}</TableCell></TableRow>)}
           </TableBody></Table></TableContainer>

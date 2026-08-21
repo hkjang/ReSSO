@@ -178,7 +178,7 @@ export function UserFederationPage() {
       <Alert severity="info" sx={{ flex: 1, py: 0 }}>낮은 우선순위 숫자의 공급자부터 로그인 사용자를 검색합니다. 운영 전 연결 및 인증 테스트를 실행하세요.</Alert>
     </Stack>
     <ContentCard noPadding>
-      {providers.isLoading ? <PageLoading /> : providers.error ? <Box sx={{ p: 2 }}><ErrorAlert error={providers.error} /></Box>
+      {providers.isLoading ? <PageLoading /> : providers.error ? <Box sx={{ p: 2 }}><ErrorAlert error={providers.error} onRetry={() => void providers.refetch()} /></Box>
         : !providers.data?.items.length ? <EmptyState title="LDAP 공급자가 없습니다" description="Active Directory 또는 표준 LDAP 연결을 추가하세요." />
           : <TableContainer sx={{ maxHeight: 'calc(100vh - 265px)' }}><Table stickyHeader aria-label="LDAP User Federation 목록"><TableHead><TableRow>
             <TableCell>공급자</TableCell><TableCell>연결</TableCell><TableCell>편집 모드</TableCell><TableCell>마지막 동기화</TableCell><TableCell>상태</TableCell>

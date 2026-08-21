@@ -16,7 +16,7 @@ interface DashboardData { realms: number; users: number; clients: number; active
 export function DashboardPage() {
   const query = useQuery({ queryKey: ['dashboard'], queryFn: () => api<DashboardData>('/api/admin/v1/dashboard'), refetchInterval: 30_000 })
   if (query.isLoading) return <PageLoading />
-  if (query.error) return <ErrorAlert error={query.error} />
+  if (query.error) return <ErrorAlert error={query.error} onRetry={() => void query.refetch()} />
   const cards = [
     { label: 'Realm', value: query.data?.realms ?? 0, icon: DnsRoundedIcon, color: '#2f6fed', to: '/admin/realms' },
     { label: '사용자', value: query.data?.users ?? 0, icon: GroupsRoundedIcon, color: '#12a594', to: '/admin/users' },

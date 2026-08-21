@@ -43,7 +43,15 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     const csrf = cookie('resso_csrf')
     if (csrf) headers.set('X-CSRF-Token', csrf)
   }
-  const response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  let response: Response
+  try {
+    response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  } catch {
+    // fetch rejects with a bare "Failed to fetch" when the service is not
+    // reachable, which is the most common failure in an offline deployment
+    // during a restart. Surfacing it verbatim told the operator nothing.
+    throw new APIError(0, 'network_unreachable', '서버에 연결하지 못했습니다. 네트워크와 ReSSO 서비스 상태를 확인한 뒤 다시 시도하세요.')
+  }
   if (response.status === 401 && !unauthenticatedIsExpected.includes(path.split('?')[0])) {
     reportUnauthenticated()
   }
