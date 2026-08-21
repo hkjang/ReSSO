@@ -1495,3 +1495,135 @@ func TestIntegrationUpgradeFromAnEarlierSchemaKeepsData(t *testing.T) {
 		t.Fatalf("re-running migrations failed: %v", err)
 	}
 }
+
+// TestIntegrationConcurrentRefreshRotationIsSafe exercises the case the grace
+// window exists for: two tabs refreshing the same token at the same moment.
+// The earlier coverage presented the token twice in sequence, which does not
+// contend for the row lock the rotation relies on.
+func TestIntegrationConcurrentRefreshRotationIsSafe(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		time.Hour, "127.0.0.1", "integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, sessionID := bootstrap.AdminUserID, session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const attempts = 6
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	issued := make([]string, attempts)
+	errs := make([]error, attempts)
+	for index := range attempts {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			_, token, err := data.RotateRefreshToken(ctx, raw, nil)
+			issued[index], errs[index] = token, err
+		}()
+	}
+	close(start)
+	wait.Wait()
+
+	var succeeded int
+	unique := map[string]bool{}
+	for index, err := range errs {
+		if err != nil {
+			// Inside the grace window nothing should be treated as reuse.
+			if errors.Is(err, ErrTokenReuse) {
+				t.Fatalf("attempt %d was treated as theft inside the grace window", index)
+			}
+			t.Fatalf("attempt %d failed: %v", index, err)
+		}
+		succeeded++
+		if issued[index] == "" || unique[issued[index]] {
+			t.Fatalf("attempt %d returned a duplicate or empty token", index)
+		}
+		unique[issued[index]] = true
+	}
+	if succeeded != attempts {
+		t.Fatalf("%d of %d concurrent refreshes succeeded", succeeded, attempts)
+	}
+
+	// Every token belongs to one family, and every one still works, so no tab
+	// is logged out by another tab's refresh.
+	var families int
+	if err := data.Pool.QueryRow(ctx, `SELECT count(DISTINCT family_id) FROM refresh_tokens`).Scan(&families); err != nil {
+		t.Fatal(err)
+	}
+	if families != 1 {
+		t.Fatalf("concurrent rotation produced %d families", families)
+	}
+	for index, token := range issued {
+		if _, active, err := data.InspectRefreshToken(ctx, token); err != nil || !active {
+			t.Fatalf("token %d is not usable: active=%v err=%v", index, active, err)
+		}
+	}
+
+	// Aging the recorded rotation past the window restores theft detection.
+	if _, err := data.Pool.Exec(ctx, `UPDATE refresh_tokens SET rotated_at=now()-make_interval(secs => $1)
+		WHERE rotated_at IS NOT NULL`, int(refreshRotationGrace.Seconds())+60); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := data.RotateRefreshToken(ctx, raw, nil); !errors.Is(err, ErrTokenReuse) {
+		t.Fatalf("reuse after the grace window: %v", err)
+	}
+}
+
+// TestIntegrationConcurrentLDAPSyncClaimAdmitsOne races the claim the way two
+// administrators or an overlapping scheduled sweep would.
+func TestIntegrationConcurrentLDAPSyncClaimAdmitsOne(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	created, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldaps://ldap.invalid:636",
+		UsersDN: "ou=people,dc=example,dc=com", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const racers = 8
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	claimed := make([]bool, racers)
+	errs := make([]error, racers)
+	for index := range racers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			claimed[index], errs[index] = data.ClaimLDAPSyncForTest(ctx, created.ID)
+		}()
+	}
+	close(start)
+	wait.Wait()
+
+	winners := 0
+	for index, err := range errs {
+		if err != nil {
+			t.Fatalf("racer %d failed: %v", index, err)
+		}
+		if claimed[index] {
+			winners++
+		}
+	}
+	// Two full walks of a directory would interleave writes to the same users.
+	if winners != 1 {
+		t.Fatalf("%d racers claimed the synchronization, want exactly 1", winners)
+	}
+}
