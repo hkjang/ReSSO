@@ -449,6 +449,18 @@ func TestIntegrationOptionalEmailLifecycleAndAdminRecovery(t *testing.T) {
 
 func openIntegrationStore(t *testing.T, sealer *cryptoutil.Sealer) *Store {
 	t.Helper()
+	return openIntegrationStoreOptions(t, sealer, true)
+}
+
+// openIntegrationStoreWithoutMigrating leaves the schema empty so a test can
+// apply an older set of migrations itself.
+func openIntegrationStoreWithoutMigrating(t *testing.T, sealer *cryptoutil.Sealer) *Store {
+	t.Helper()
+	return openIntegrationStoreOptions(t, sealer, false)
+}
+
+func openIntegrationStoreOptions(t *testing.T, sealer *cryptoutil.Sealer, migrate bool) *Store {
+	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv(integrationDSNEnvironment))
 	if dsn == "" {
 		t.Skipf("set %s to run PostgreSQL integration tests", integrationDSNEnvironment)
@@ -492,10 +504,12 @@ func openIntegrationStore(t *testing.T, sealer *cryptoutil.Sealer) *Store {
 		t.Fatal(err)
 	}
 	data := &Store{Pool: pool, Sealer: sealer, dummyPasswordHash: dummyHash}
-	if err := Migrate(ctx, pool); err != nil {
-		pool.Close()
-		admin.Close()
-		t.Fatal(err)
+	if migrate {
+		if err := Migrate(ctx, pool); err != nil {
+			pool.Close()
+			admin.Close()
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(func() {
 		pool.Close()
@@ -1381,5 +1395,103 @@ func TestIntegrationIdleTimeoutEndsUnusedSessionsEverywhere(t *testing.T) {
 		if _, err := data.UpdateRealm(ctx, realm.ID, out); !errors.Is(err, ErrInvalidInput) {
 			t.Fatalf("idle timeout %d was accepted: %v", invalid, err)
 		}
+	}
+}
+
+// TestIntegrationUpgradeFromAnEarlierSchemaKeepsData applies the migrations an
+// older release shipped, writes records directly into that schema, then applies
+// the rest. Every migration has only ever been exercised against an empty
+// database, which is the case that cannot fail; upgrading a populated one is
+// the case that can. The seed data is written with plain SQL because the
+// current store selects columns the older schema does not have — the server
+// never reads a database it has not migrated, since Migrate runs before it
+// starts serving.
+func TestIntegrationUpgradeFromAnEarlierSchemaKeepsData(t *testing.T) {
+	data := openIntegrationStoreWithoutMigrating(t, integrationSealer(t))
+	ctx := context.Background()
+
+	entries, err := fs.ReadDir(migrationFiles, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			names = append(names, entry.Name())
+		}
+	}
+	slices.Sort(names)
+	if len(names) < 3 {
+		t.Skip("need at least three migrations to model an upgrade")
+	}
+	older := names[:len(names)-2]
+
+	if _, err := data.Pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range older {
+		body, err := migrationFiles.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := data.Pool.Exec(ctx, string(body)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
+		if _, err := data.Pool.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES($1)`, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	realmID, userID := uuid.New(), uuid.New()
+	hash, err := password.Hash("legacy-password-12345")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO realms(id,name,display_name,issuer_url)
+		VALUES($1,'legacy','Legacy','https://sso.example.com/realms/legacy')`, realmID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO users(id,realm_id,username,display_name,password_hash,enabled)
+		VALUES($1,$2,'legacy-user','Legacy User',$3,true)`, userID, realmID, hash); err != nil {
+		t.Fatal(err)
+	}
+	token, err := cryptoutil.RandomToken(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO sso_sessions(id,realm_id,user_id,token_hash,csrf_hash,expires_at)
+		VALUES($1,$2,$3,$4,$5,now()+interval '1 hour')`,
+		uuid.New(), realmID, userID, data.Sealer.Digest(token), data.Sealer.Digest("csrf")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Migrate(ctx, data.Pool); err != nil {
+		t.Fatalf("upgrade migration failed on a populated database: %v", err)
+	}
+
+	// Records written before the upgrade still work through the current code.
+	if _, err := data.SessionByToken(ctx, token); err != nil {
+		t.Fatalf("a session created before the upgrade stopped working: %v", err)
+	}
+	upgraded, err := data.RealmByID(ctx, realmID)
+	if err != nil {
+		t.Fatalf("a Realm created before the upgrade cannot be read: %v", err)
+	}
+	// Columns the newer releases added must carry defaults that preserve the
+	// previous behaviour rather than switching something on during an upgrade.
+	if upgraded.IdleTimeoutSeconds != 0 {
+		t.Fatalf("idle timeout defaulted to %d; an upgrade must not start expiring sessions", upgraded.IdleTimeoutSeconds)
+	}
+	if upgraded.PasswordMinLength < 8 || upgraded.MaxLoginAttempts < 3 || upgraded.LockoutSeconds < 30 {
+		t.Fatalf("policy defaults are outside their documented range: %+v", upgraded)
+	}
+	result, err := data.Authenticate(ctx, upgraded, "legacy-user", "legacy-password-12345")
+	if err != nil || !result.Success {
+		t.Fatalf("an account created before the upgrade cannot sign in: %+v err=%v", result, err)
+	}
+	// Applying again must be a no-op rather than an error.
+	if err := Migrate(ctx, data.Pool); err != nil {
+		t.Fatalf("re-running migrations failed: %v", err)
 	}
 }
