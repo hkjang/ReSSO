@@ -28,8 +28,11 @@ export function UsersPage() {
   const { notify } = useToast()
   const realms = useRealms()
   const selection = useRealmSelection(realms.data?.items)
-  const [searchInput, setSearchInput] = useState('')
-  const [search, setSearch] = useState('')
+  // The command palette hands over the term it matched, so the page opens on
+  // the user that was selected rather than on an unfiltered list.
+  const [handedOverTerm] = useState(() => new URLSearchParams(window.location.search).get('q') ?? '')
+  const [searchInput, setSearchInput] = useState(handedOverTerm)
+  const [search, setSearch] = useState(handedOverTerm)
   const [page, setPage] = useState(0)
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [sort, setSort] = useState<SortState<UserSortColumn>>({ column: 'username', descending: false })

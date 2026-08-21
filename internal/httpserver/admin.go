@@ -834,20 +834,34 @@ func (s *Server) adminQuickSearch(w http.ResponseWriter, r *http.Request) {
 	if !principal.PlatformAdmin {
 		realmID = &principal.RealmID
 	}
+	// The paths below must be routes the console actually has. They used to
+	// point at /admin/realms/{id}/users and /admin/realms/{id}/clients, which
+	// do not exist: selecting a user or a client fell through to the catch-all
+	// route and threw the administrator out to their personal profile. The
+	// Realm now travels as the query parameter the admin screens read, and the
+	// term is carried along so the destination opens on the match.
 	rows, err := s.store.Pool.Query(r.Context(), `
-		SELECT kind,id,label,description,path FROM (
-		  SELECT 'realm' kind,id::text,name label,display_name description,'/admin/realms/'||id::text path
+		SELECT kind,id,label,description,path,sort FROM (
+		  SELECT 'realm' kind,id::text,name label,display_name description,
+		    '/admin/realms/'||id::text path,1 sort
 		  FROM realms WHERE ($2::uuid IS NULL OR id=$2) AND (name ILIKE '%'||$1||'%' OR display_name ILIKE '%'||$1||'%')
 		  UNION ALL
-		  SELECT 'user',u.id::text,u.username,u.email,'/admin/realms/'||u.realm_id::text||'/users'
-		  FROM users u WHERE ($2::uuid IS NULL OR u.realm_id=$2) AND (u.username ILIKE '%'||$1||'%' OR u.email ILIKE '%'||$1||'%')
+		  SELECT 'user',u.id::text,u.username,u.email,
+		    '/admin/users?realm='||r.name||'&q='||u.username,2
+		  FROM users u JOIN realms r ON r.id=u.realm_id
+		  WHERE ($2::uuid IS NULL OR u.realm_id=$2)
+		    AND (u.username ILIKE '%'||$1||'%' OR u.email ILIKE '%'||$1||'%' OR u.display_name ILIKE '%'||$1||'%')
 		  UNION ALL
-		  SELECT 'client',c.id::text,c.client_id,c.name,'/admin/realms/'||c.realm_id::text||'/clients'
-		  FROM clients c WHERE ($2::uuid IS NULL OR c.realm_id=$2) AND (c.client_id ILIKE '%'||$1||'%' OR c.name ILIKE '%'||$1||'%')
+		  SELECT 'client',c.id::text,c.client_id,c.name,
+		    '/admin/clients?realm='||r.name||'&q='||c.client_id,3
+		  FROM clients c JOIN realms r ON r.id=c.realm_id
+		  WHERE ($2::uuid IS NULL OR c.realm_id=$2) AND (c.client_id ILIKE '%'||$1||'%' OR c.name ILIKE '%'||$1||'%')
 		  UNION ALL
-		  SELECT 'federation',f.id::text,f.name,f.connection_url,'/admin/user-federation'
-		  FROM user_federations f WHERE ($2::uuid IS NULL OR f.realm_id=$2) AND (f.name ILIKE '%'||$1||'%' OR f.connection_url ILIKE '%'||$1||'%')
-		) results LIMIT 20`, query, realmID)
+		  SELECT 'federation',f.id::text,f.name,f.connection_url,
+		    '/admin/user-federation?realm='||r.name,4
+		  FROM user_federations f JOIN realms r ON r.id=f.realm_id
+		  WHERE ($2::uuid IS NULL OR f.realm_id=$2) AND (f.name ILIKE '%'||$1||'%' OR f.connection_url ILIKE '%'||$1||'%')
+		) results ORDER BY sort,label LIMIT 20`, query, realmID)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
@@ -857,7 +871,8 @@ func (s *Server) adminQuickSearch(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		item := map[string]string{}
 		var kind, id, label, description, path string
-		if err := rows.Scan(&kind, &id, &label, &description, &path); err != nil {
+		var sortKey int
+		if err := rows.Scan(&kind, &id, &label, &description, &path, &sortKey); err != nil {
 			writeStoreError(w, r, err)
 			return
 		}

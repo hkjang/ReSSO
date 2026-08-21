@@ -498,3 +498,70 @@ func TestIntegrationClientSecretBruteForceIsLimitedWithoutBlockingNeighbours(t *
 		t.Fatalf("the limited client was not still blocked: status %d", status)
 	}
 }
+
+func TestIntegrationQuickSearchPointsAtRoutesTheConsoleHas(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	bootstrap, err := data.Bootstrap(context.Background(), "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "searchable", DisplayName: "Searchable One", Password: "searchable-password-1", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+		ClientID: "searchable-client", Name: "Searchable Client", Type: "public",
+		RedirectURIs: []string{"https://rp.example.com/cb"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Jar = jar
+	login := postIntegrationLogin(t, client, server.URL, "admin", "bootstrap-password-123")
+	_ = login.Body.Close()
+
+	response, err := client.Get(server.URL + "/api/admin/v1/quick-search?q=searchable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	var payload struct {
+		Items []struct{ Kind, Label, Path string } `json:"items"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) < 2 {
+		t.Fatalf("quick search returned %d items", len(payload.Items))
+	}
+	// Every destination must be a route the console actually registers.
+	// The user and client entries used to point at /admin/realms/{id}/users
+	// and /admin/realms/{id}/clients, which do not exist: selecting one fell
+	// through to the catch-all and landed on the personal profile instead.
+	known := map[string]bool{"/admin/users": true, "/admin/clients": true, "/admin/user-federation": true, "/admin/realms": true}
+	for _, item := range payload.Items {
+		target, query, _ := strings.Cut(item.Path, "?")
+		if strings.HasPrefix(target, "/admin/realms/") {
+			continue // the Realm detail route takes an identifier
+		}
+		if !known[target] {
+			t.Fatalf("%s %q points at %q, which the console does not route", item.Kind, item.Label, item.Path)
+		}
+		if !strings.Contains(query, "realm=master") {
+			t.Fatalf("%s %q does not carry its Realm: %q", item.Kind, item.Label, item.Path)
+		}
+		if item.Kind == "user" || item.Kind == "client" {
+			if !strings.Contains(query, "q=") {
+				t.Fatalf("%s %q does not carry the search term: %q", item.Kind, item.Label, item.Path)
+			}
+		}
+	}
+}

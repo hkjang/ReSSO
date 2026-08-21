@@ -26,7 +26,8 @@ export function ClientsPage() {
   const [createForm, setCreateForm] = useState(blankClient)
   const [selected, setSelected] = useState<Client | null>(null)
   const [edit, setEdit] = useState<(Client & { redirectText: string; logoutText: string; originsText: string; scopesText: string }) | null>(null)
-  const [search, setSearch] = useState('')
+  // Seeded by the command palette so the selected client is already filtered.
+  const [search, setSearch] = useState(() => new URLSearchParams(window.location.search).get('q') ?? '')
   const [sort, setSort] = useState<SortState<'name' | 'client_id' | 'type'>>({ column: 'name', descending: false })
   const [oneTimeSecret, setOneTimeSecret] = useState('')
   // Rotating a secret takes effect immediately and breaks every deployment
