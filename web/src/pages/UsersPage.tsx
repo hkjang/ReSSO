@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
+import LockOpenRoundedIcon from '@mui/icons-material/LockOpenRounded'
 import SearchRoundedIcon from '@mui/icons-material/SearchRounded'
-import { Alert, Box, Button, Checkbox, Chip, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, InputAdornment, MenuItem, Stack, Switch, Table, TableBody, TableCell, TableContainer, TableHead, TablePagination, TableRow, TextField, Typography } from '@mui/material'
+import { Alert, Box, Button, Checkbox, Chip, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, InputAdornment, MenuItem, Stack, Switch, Table, TableBody, TableCell, TableContainer, TableHead, TablePagination, TableRow, TextField, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, jsonBody } from '../lib/api'
 import { useRealms, useRealmSelection } from '../lib/realms'
@@ -11,16 +12,22 @@ import { RealmPicker } from '../components/RealmPicker'
 import { PageHeader, ContentCard, StatusChip } from '../components/Page'
 import { DetailDrawer } from '../components/DetailDrawer'
 import { EmptyState, ErrorAlert, PageLoading } from '../components/Feedback'
+import { CopyButton } from '../components/CopyField'
+import { useToast } from '../components/toast-context'
 
 const blankUser = { username: '', email: '', email_verified: false, display_name: '', password: '', enabled: true, manager_id: '' }
 
+type StatusFilter = 'all' | 'locked' | 'disabled'
+
 export function UsersPage() {
   const queryClient = useQueryClient()
+  const { notify } = useToast()
   const realms = useRealms()
   const selection = useRealmSelection(realms.data?.items)
   const [searchInput, setSearchInput] = useState('')
   const [search, setSearch] = useState('')
   const [page, setPage] = useState(0)
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [rowsPerPage, setRowsPerPage] = useState(50)
   const [createOpen, setCreateOpen] = useState(false)
   const [createForm, setCreateForm] = useState(blankUser)
@@ -48,11 +55,29 @@ export function UsersPage() {
     const timer = window.setTimeout(() => { setSearch(searchInput.trim()); setPage(0) }, 300)
     return () => window.clearTimeout(timer)
   }, [searchInput])
-  useEffect(() => setEditForm(selected ? { ...selected } : null), [selected])
-  useEffect(() => {
+  // These three derive editor state from data that arrives asynchronously.
+  // Adjusting during render instead of in an effect is React's documented
+  // pattern for it: the extra render happens before the browser paints, so it
+  // cannot cause the visible flash of stale values an effect would.
+  const [pagedRealm, setPagedRealm] = useState(selection.realmID)
+  if (pagedRealm !== selection.realmID) {
+    setPagedRealm(selection.realmID)
+    setPage(0)
+  }
+  // The version is part of the identity so that saving, which returns a
+  // normalized record, refreshes the form the same way selecting a row does.
+  const editVersion = selected ? `${selected.id}:${selected.updated_at}` : ''
+  const [loadedEdit, setLoadedEdit] = useState(editVersion)
+  if (loadedEdit !== editVersion) {
+    setLoadedEdit(editVersion)
+    setEditForm(selected ? { ...selected } : null)
+  }
+  const [loadedMappings, setLoadedMappings] = useState<UserRoleMappings | undefined>(undefined)
+  if (loadedMappings !== roleMappings.data) {
+    setLoadedMappings(roleMappings.data)
     setRealmRoleIDs(roleMappings.data?.realm_role_ids ?? [])
     setClientRoleIDs(roleMappings.data?.client_role_ids ?? [])
-  }, [roleMappings.data])
+  }
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['users', selection.realmID] })
   const create = useMutation({
     mutationFn: () => api<User>(`/api/admin/v1/realms/${selection.realmID}/users`, { method: 'POST', ...jsonBody({ ...createForm, manager_id: createForm.manager_id || undefined }) }),
@@ -65,6 +90,15 @@ export function UsersPage() {
   const reset = useMutation({
     mutationFn: () => api<void>(`/api/admin/v1/realms/${selection.realmID}/users/${selected!.id}/password`, { method: 'PUT', ...jsonBody({ new_password: resetPassword }) }),
     onSuccess: () => setResetPassword(''),
+  })
+  const unlock = useMutation({
+    mutationFn: (user: User) => api<User>(`/api/admin/v1/realms/${selection.realmID}/users/${user.id}/unlock`, { method: 'POST' }),
+    onSuccess: async (saved) => {
+      notify(`${saved.display_name} 계정의 잠금을 해제했습니다.`)
+      if (selected?.id === saved.id) setSelected(saved)
+      await invalidate()
+    },
+    onError: () => notify('잠금을 해제하지 못했습니다.', 'error'),
   })
   const saveRoles = useMutation({
     mutationFn: () => api<UserRoleMappings>(`/api/admin/v1/realms/${selection.realmID}/users/${selected!.id}/role-mappings`, {
@@ -81,6 +115,14 @@ export function UsersPage() {
   })
   const toggle = (values: string[], value: string, setter: (next: string[]) => void) => setter(values.includes(value) ? values.filter((item) => item !== value) : [...values, value])
   const emailMatchesSelected = normalizeEmail(editForm?.email) === normalizeEmail(selected?.email)
+  const isLocked = (user: User) => Boolean(user.locked_until && new Date(user.locked_until) > new Date())
+  // The filter narrows the page that is already loaded; the server-side query
+  // stays a plain paged search so the count in the pager remains truthful.
+  const visibleUsers = (users.data?.items ?? []).filter((user) => {
+    if (statusFilter === 'locked') return isLocked(user)
+    if (statusFilter === 'disabled') return !user.enabled
+    return true
+  })
   if (realms.isLoading) return <PageLoading />
   if (realms.error) return <ErrorAlert error={realms.error} />
   return (
@@ -89,11 +131,16 @@ export function UsersPage() {
       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} sx={{ mb: 2 }}>
         <RealmPicker realms={realms.data?.items ?? []} value={selection.realmID} onChange={selection.setRealmID} />
         <TextField value={searchInput} onChange={(e) => setSearchInput(e.target.value)} placeholder="아이디, 이메일, 이름 검색" aria-label="사용자 검색" sx={{ maxWidth: 400 }} InputProps={{ startAdornment: <InputAdornment position="start"><SearchRoundedIcon /></InputAdornment> }} />
+        <ToggleButtonGroup exclusive size="small" value={statusFilter} onChange={(_, value: StatusFilter | null) => value && setStatusFilter(value)} aria-label="상태 필터" sx={{ alignSelf: { sm: 'center' } }}>
+          <ToggleButton value="all">전체</ToggleButton>
+          <ToggleButton value="locked">잠김</ToggleButton>
+          <ToggleButton value="disabled">비활성</ToggleButton>
+        </ToggleButtonGroup>
       </Stack>
       <ContentCard noPadding>
-        {users.isLoading ? <PageLoading /> : users.error ? <Box sx={{ p: 2 }}><ErrorAlert error={users.error} /></Box> : !users.data?.items.length ? <EmptyState title="사용자가 없습니다" description="검색 조건을 바꾸거나 새 사용자를 추가하세요." /> : <>
-          <TableContainer sx={{ maxHeight: 'calc(100vh - 315px)' }}><Table stickyHeader aria-label="사용자 목록"><TableHead><TableRow><TableCell>사용자</TableCell><TableCell>이메일</TableCell><TableCell>소스</TableCell><TableCell>상태</TableCell><TableCell>마지막 비밀번호 변경</TableCell></TableRow></TableHead><TableBody>
-            {users.data.items.map((user) => <TableRow hover key={user.id} onClick={() => setSelected(user)} sx={{ cursor: 'pointer' }} tabIndex={0} onKeyDown={(e) => { if (e.key === 'Enter') setSelected(user) }}><TableCell><Typography fontWeight={680}>{user.display_name}</Typography><Typography variant="caption" color="text.secondary" className="mono">{user.username}</Typography></TableCell><TableCell>{user.email ? <Stack direction="row" spacing={.7} alignItems="center"><span>{user.email}</span>{user.email_verified && <Chip label="확인됨" size="small" color="success" variant="outlined" />}</Stack> : '—'}</TableCell><TableCell>{user.federation_id ? <Chip label="LDAP" size="small" color="secondary" variant="outlined" /> : <Chip label="Local" size="small" variant="outlined" />}</TableCell><TableCell><StatusChip active={user.enabled && !user.locked_until} activeLabel="정상" inactiveLabel={user.locked_until ? '잠김' : '비활성'} /></TableCell><TableCell>{formatDate(user.password_changed_at)}</TableCell></TableRow>)}
+        {users.isLoading ? <PageLoading /> : users.error ? <Box sx={{ p: 2 }}><ErrorAlert error={users.error} /></Box> : !users.data?.items.length ? <EmptyState title="사용자가 없습니다" description="검색 조건을 바꾸거나 새 사용자를 추가하세요." /> : !visibleUsers.length ? <EmptyState title="이 페이지에 해당하는 사용자가 없습니다" description="상태 필터는 현재 페이지에만 적용됩니다. 필터를 해제하거나 다른 페이지를 확인하세요." /> : <>
+          <TableContainer sx={{ maxHeight: 'calc(100vh - 315px)' }}><Table stickyHeader aria-label="사용자 목록"><TableHead><TableRow><TableCell>사용자</TableCell><TableCell>이메일</TableCell><TableCell>소스</TableCell><TableCell>상태</TableCell><TableCell>마지막 비밀번호 변경</TableCell><TableCell align="right">작업</TableCell></TableRow></TableHead><TableBody>
+            {visibleUsers.map((user) => <TableRow hover key={user.id} onClick={() => setSelected(user)} sx={{ cursor: 'pointer' }} tabIndex={0} onKeyDown={(e) => { if (e.key === 'Enter') setSelected(user) }}><TableCell><Typography fontWeight={680}>{user.display_name}</Typography><Typography variant="caption" color="text.secondary" className="mono">{user.username}</Typography></TableCell><TableCell>{user.email ? <Stack direction="row" spacing={.7} alignItems="center"><span>{user.email}</span>{user.email_verified && <Chip label="확인됨" size="small" color="success" variant="outlined" />}</Stack> : '—'}</TableCell><TableCell>{user.federation_id ? <Chip label="LDAP" size="small" color="secondary" variant="outlined" /> : <Chip label="Local" size="small" variant="outlined" />}</TableCell><TableCell><StatusChip active={user.enabled && !isLocked(user)} activeLabel="정상" inactiveLabel={isLocked(user) ? '잠김' : '비활성'} />{isLocked(user) && <Typography variant="caption" color="text.secondary" display="block">{formatDate(user.locked_until)}까지</Typography>}</TableCell><TableCell>{formatDate(user.password_changed_at)}</TableCell><TableCell align="right" onClick={(event) => event.stopPropagation()}>{isLocked(user) ? <Tooltip title="비밀번호를 바꾸지 않고 잠금만 해제합니다"><span><Button size="small" startIcon={<LockOpenRoundedIcon />} disabled={unlock.isPending} onClick={() => unlock.mutate(user)}>잠금 해제</Button></span></Tooltip> : null}</TableCell></TableRow>)}
           </TableBody></Table></TableContainer>
           <TablePagination component="div" count={users.data.total ?? users.data.items.length} page={page} rowsPerPage={rowsPerPage} rowsPerPageOptions={[25, 50, 100]} onPageChange={(_, next) => setPage(next)} onRowsPerPageChange={(event) => { setRowsPerPage(Number(event.target.value)); setPage(0) }} labelRowsPerPage="페이지당" />
         </>}
@@ -113,6 +160,8 @@ export function UsersPage() {
           <Stack component="form" spacing={2} onSubmit={(e) => { e.preventDefault(); update.mutate() }}>
             {update.error && <ErrorAlert error={update.error} />}{update.isSuccess && <Alert severity="success">사용자 정보를 저장했습니다.</Alert>}
             <TextField label="아이디" value={editForm.username} disabled helperText="아이디는 변경할 수 없습니다." />
+            <Stack direction="row" alignItems="center" spacing={.5}><Typography variant="caption" color="text.secondary" className="mono" sx={{ overflowWrap: 'anywhere' }}>User ID {editForm.id}</Typography><CopyButton value={editForm.id} label="User ID 복사" /></Stack>
+            {isLocked(editForm) && <Alert severity="warning" action={<Button size="small" color="inherit" startIcon={<LockOpenRoundedIcon />} disabled={unlock.isPending} onClick={() => unlock.mutate(editForm)}>잠금 해제</Button>}>{formatDate(editForm.locked_until)}까지 잠긴 계정입니다. 비밀번호를 재설정하지 않고 잠금만 해제할 수 있습니다.</Alert>}
             <TextField label="표시 이름" required value={editForm.display_name} onChange={(e) => setEditForm({ ...editForm, display_name: e.target.value })} />
             <TextField label="이메일 (선택)" type="email" value={editForm.email} inputProps={{ maxLength: EMAIL_MAX_LENGTH }} onChange={(e) => { const email = e.target.value; setEditForm({ ...editForm, email, email_verified: normalizeEmail(email) === normalizeEmail(selected?.email) ? Boolean(selected?.email_verified) : false }) }} helperText={emailMatchesSelected ? '이메일을 변경하거나 비우면 확인 상태가 자동으로 해제됩니다.' : '새 이메일을 먼저 저장한 뒤 관리자가 확인 상태로 변경할 수 있습니다.'} />
             <FormControlLabel control={<Switch checked={editForm.email_verified} disabled={!editForm.email.trim() || !emailMatchesSelected} onChange={(e) => setEditForm({ ...editForm, email_verified: e.target.checked })} />} label="관리자가 이메일을 확인함" />

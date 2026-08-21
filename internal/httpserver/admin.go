@@ -25,6 +25,7 @@ func (s *Server) adminRoutes(r chi.Router) {
 		r.Post("/users", s.adminCreateUser)
 		r.Put("/users/{userID}", s.adminUpdateUser)
 		r.Put("/users/{userID}/password", s.adminResetPassword)
+		r.Post("/users/{userID}/unlock", s.adminUnlockUser)
 		r.Get("/users/{userID}/role-mappings", s.adminGetUserRoleMappings)
 		r.Put("/users/{userID}/role-mappings", s.adminReplaceUserRoleMappings)
 		r.Get("/user-federations", s.adminListLDAPFederations)
@@ -552,6 +553,32 @@ func (s *Server) adminDeleteClientRole(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFrom(r.Context())
 	s.audit(r, &realmID, &principal.UserID, principal.Username, "CLIENT_ROLE_DELETE", "SUCCESS", "client_role", roleID.String(), nil)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// adminUnlockUser releases a lockout without forcing a password change.
+func (s *Server) adminUnlockUser(w http.ResponseWriter, r *http.Request) {
+	realmID, ok := parseUUIDParam(w, r, "realmID")
+	if !ok {
+		return
+	}
+	userID, ok := parseUUIDParam(w, r, "userID")
+	if !ok {
+		return
+	}
+	wasLocked, err := s.store.UnlockUser(r.Context(), realmID, userID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	user, err := s.store.UserByID(r.Context(), userID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	principal, _ := principalFrom(r.Context())
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "USER_UNLOCK", "SUCCESS", "user",
+		userID.String(), map[string]any{"was_locked": wasLocked})
+	writeJSON(w, http.StatusOK, user)
 }
 
 func (s *Server) adminGetUserRoleMappings(w http.ResponseWriter, r *http.Request) {

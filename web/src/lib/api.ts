@@ -2,14 +2,24 @@ export class APIError extends Error {
   status: number
   code: string
   traceId?: string
+  /** Seconds the caller must wait, taken from the Retry-After response header. */
+  retryAfterSeconds?: number
 
-  constructor(status: number, code: string, message: string, traceId?: string) {
+  constructor(status: number, code: string, message: string, traceId?: string, retryAfterSeconds?: number) {
     super(message)
     this.name = 'APIError'
     this.status = status
     this.code = code
     this.traceId = traceId
+    this.retryAfterSeconds = retryAfterSeconds
   }
+}
+
+function retryAfter(response: Response): number | undefined {
+  const header = response.headers.get('Retry-After')
+  if (!header) return undefined
+  const seconds = Number(header)
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : undefined
 }
 
 function cookie(name: string): string {
@@ -31,7 +41,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!response.ok) {
     let body: { error?: string; message?: string; error_description?: string; trace_id?: string } = {}
     try { body = await response.json() } catch { /* non-JSON proxy error */ }
-    throw new APIError(response.status, body.error ?? 'request_failed', body.message ?? body.error_description ?? `요청이 실패했습니다 (${response.status})`, body.trace_id)
+    throw new APIError(response.status, body.error ?? 'request_failed', body.message ?? body.error_description ?? `요청이 실패했습니다 (${response.status})`, body.trace_id, retryAfter(response))
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>

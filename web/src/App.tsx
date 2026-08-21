@@ -1,6 +1,6 @@
 import { lazy, Suspense, type ReactNode } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
-import { useAuth } from './lib/auth'
+import { useAuth } from './lib/auth-context'
 import { PageLoading } from './components/Feedback'
 import { AppShell } from './components/AppShell'
 import { LoginPage } from './pages/LoginPage'

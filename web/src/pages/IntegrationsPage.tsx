@@ -1,7 +1,7 @@
 import ContentCopyRoundedIcon from '@mui/icons-material/ContentCopyRounded'
 import OpenInNewRoundedIcon from '@mui/icons-material/OpenInNewRounded'
 import { Alert, Box, Button, Chip, Grid, IconButton, Stack, Tooltip, Typography } from '@mui/material'
-import { useAuth } from '../lib/auth'
+import { useAuth } from '../lib/auth-context'
 import { ContentCard, PageHeader } from '../components/Page'
 
 const mcpExample = `{

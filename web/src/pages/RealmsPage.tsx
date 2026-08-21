@@ -1,12 +1,13 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useState, type FormEvent } from 'react'
 import { useParams } from 'react-router-dom'
-import { Alert, Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, Stack, Switch, TextField, Typography } from '@mui/material'
+import { Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, Stack, Switch, TextField, Typography } from '@mui/material'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, jsonBody } from '../lib/api'
-import { useAuth } from '../lib/auth'
+import { useAuth } from '../lib/auth-context'
 import { useRealms } from '../lib/realms'
 import type { Realm } from '../types'
 import { PageHeader, ContentCard, StatusChip } from '../components/Page'
+import { useToast } from '../components/toast-context'
 import { DetailDrawer } from '../components/DetailDrawer'
 import { EmptyState, ErrorAlert, PageLoading } from '../components/Feedback'
 
@@ -14,6 +15,7 @@ const newRealm = { name: '', display_name: '', issuer_url: '' }
 
 export function RealmsPage() {
 	const { me } = useAuth()
+  const { notify } = useToast()
   const params = useParams()
   const queryClient = useQueryClient()
   const realms = useRealms()
@@ -21,11 +23,21 @@ export function RealmsPage() {
   const [createForm, setCreateForm] = useState(newRealm)
   const [selected, setSelected] = useState<Realm | null>(null)
   const [form, setForm] = useState<Realm | null>(null)
-  useEffect(() => {
-    const fromRoute = realms.data?.items.find((realm) => realm.id === params.realmId)
-    if (fromRoute) setSelected(fromRoute)
-  }, [params.realmId, realms.data])
-  useEffect(() => setForm(selected ? { ...selected } : null), [selected])
+  // Opening /admin/realms/:realmId selects that Realm once its list has
+  // loaded. Both of these adjust state during render instead of in an effect,
+  // which is React's documented pattern for deriving from asynchronous data.
+  const routeTarget = realms.data?.items.find((realm) => realm.id === params.realmId)
+  const [loadedRoute, setLoadedRoute] = useState<string | undefined>(routeTarget?.id)
+  if (routeTarget && loadedRoute !== routeTarget.id) {
+    setLoadedRoute(routeTarget.id)
+    setSelected(routeTarget)
+  }
+  const formVersion = selected ? `${selected.id}:${selected.updated_at}` : ''
+  const [loadedForm, setLoadedForm] = useState(formVersion)
+  if (loadedForm !== formVersion) {
+    setLoadedForm(formVersion)
+    setForm(selected ? { ...selected } : null)
+  }
   const create = useMutation({
     mutationFn: () => api<Realm>('/api/admin/v1/realms', { method: 'POST', ...jsonBody(createForm) }),
     onSuccess: async () => { setCreateOpen(false); setCreateForm(newRealm); await queryClient.invalidateQueries({ queryKey: ['realms'] }) },
@@ -35,8 +47,10 @@ export function RealmsPage() {
       display_name: form!.display_name, issuer_url: form!.issuer_url, enabled: form!.enabled,
       approval_enabled: form!.approval_enabled, access_token_ttl_seconds: Number(form!.access_token_ttl_seconds),
       refresh_token_ttl_seconds: Number(form!.refresh_token_ttl_seconds), session_ttl_seconds: Number(form!.session_ttl_seconds),
+      password_min_length: Number(form!.password_min_length), max_login_attempts: Number(form!.max_login_attempts),
+      lockout_seconds: Number(form!.lockout_seconds),
     }) }),
-    onSuccess: async (saved) => { setSelected(saved); await queryClient.invalidateQueries({ queryKey: ['realms'] }) },
+    onSuccess: async (saved) => { setSelected(saved); notify('Realm 설정을 저장했습니다.'); await queryClient.invalidateQueries({ queryKey: ['realms'] }) },
   })
   if (realms.isLoading) return <PageLoading />
   if (realms.error) return <ErrorAlert error={realms.error} />
@@ -68,7 +82,6 @@ export function RealmsPage() {
       <DetailDrawer open={Boolean(selected)} onClose={() => setSelected(null)} title={selected?.display_name ?? ''} subtitle={selected?.name}>
         {form && <Stack component="form" spacing={2.2} onSubmit={(e) => { e.preventDefault(); update.mutate() }}>
           {update.error && <ErrorAlert error={update.error} />}
-          {update.isSuccess && <Alert severity="success">설정을 저장했습니다.</Alert>}
           <TextField label="표시 이름" required value={form.display_name} onChange={(e) => setForm({ ...form, display_name: e.target.value })} />
           <TextField label="Issuer URL" type="url" required value={form.issuer_url} onChange={(e) => setForm({ ...form, issuer_url: e.target.value })} />
           <FormControlLabel control={<Switch checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} />} label="Realm 활성" />
@@ -80,6 +93,11 @@ export function RealmsPage() {
           <TextField label="Access Token (초)" type="number" value={form.access_token_ttl_seconds} onChange={(e) => setForm({ ...form, access_token_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 60, max: 3600 }} />
           <TextField label="Refresh Token (초)" type="number" value={form.refresh_token_ttl_seconds} onChange={(e) => setForm({ ...form, refresh_token_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 300, max: 2592000 }} />
           <TextField label="SSO Session (초)" type="number" value={form.session_ttl_seconds} onChange={(e) => setForm({ ...form, session_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 300, max: 2592000 }} />
+          <Typography variant="h3">비밀번호 · 잠금 정책</Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mt: -1 }}>이 Realm의 모든 사용자에게 적용되며, 개인 설정의 비밀번호 변경 화면에도 그대로 안내됩니다.</Typography>
+          <TextField label="비밀번호 최소 길이" type="number" value={form.password_min_length} onChange={(e) => setForm({ ...form, password_min_length: Number(e.target.value) })} inputProps={{ min: 8, max: 128 }} helperText="8자에서 128자 사이" />
+          <TextField label="잠금까지 허용할 연속 실패 횟수" type="number" value={form.max_login_attempts} onChange={(e) => setForm({ ...form, max_login_attempts: Number(e.target.value) })} inputProps={{ min: 3, max: 50 }} helperText="3회에서 50회 사이" />
+          <TextField label="잠금 유지 시간 (초)" type="number" value={form.lockout_seconds} onChange={(e) => setForm({ ...form, lockout_seconds: Number(e.target.value) })} inputProps={{ min: 30, max: 86400 }} helperText={`30초에서 24시간 사이 · 현재 약 ${Math.round((form.lockout_seconds || 0) / 60)}분`} />
           <Button type="submit" variant="contained" disabled={update.isPending}>설정 저장</Button>
         </Stack>}
       </DetailDrawer>

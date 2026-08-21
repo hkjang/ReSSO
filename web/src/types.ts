@@ -16,6 +16,9 @@ export interface Realm {
   access_token_ttl_seconds: number
   refresh_token_ttl_seconds: number
   session_ttl_seconds: number
+  password_min_length: number
+  max_login_attempts: number
+  lockout_seconds: number
   created_at: string
   updated_at: string
 }
@@ -178,9 +181,16 @@ export interface ApprovalRequest {
   decided_at?: string
 }
 
+export interface PasswordPolicy {
+  min_length: number
+  max_login_attempts: number
+  lockout_seconds: number
+}
+
 export interface Me {
   user: User
   roles: string[]
   csrf_token: string
   permissions: { platform_admin: boolean; realm_admin: boolean; admin: boolean }
+  password_policy?: PasswordPolicy
 }

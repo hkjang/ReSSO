@@ -20,13 +20,24 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	roles, _ := s.store.RealmRolesForUser(r.Context(), user.ID)
-	writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"user":       user,
 		"roles":      roles,
 		"csrf_token": cookieValue(r, csrfCookieName),
 		"permissions": map[string]bool{"platform_admin": principal.PlatformAdmin,
 			"realm_admin": principal.RealmAdmin, "admin": principal.PlatformAdmin || principal.RealmAdmin},
-	})
+	}
+	// The console needs the Realm's own policy to validate a new password
+	// before submitting it, instead of guessing a minimum length and letting
+	// the server reject the request.
+	if realm, realmErr := s.store.RealmByID(r.Context(), user.RealmID); realmErr == nil {
+		response["password_policy"] = map[string]any{
+			"min_length":         realm.PasswordMinLength,
+			"max_login_attempts": realm.MaxLoginAttempts,
+			"lockout_seconds":    realm.LockoutSeconds,
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func cookieValue(r *http.Request, name string) string {

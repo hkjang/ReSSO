@@ -7,7 +7,15 @@ import VisibilityRoundedIcon from '@mui/icons-material/VisibilityRounded'
 import { Alert, Box, Button, CircularProgress, IconButton, InputAdornment, Link, Paper, Stack, TextField, Typography } from '@mui/material'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { api, APIError, jsonBody } from '../lib/api'
-import { useAuth } from '../lib/auth'
+import { useAuth } from '../lib/auth-context'
+
+function formatWait(seconds: number): string {
+  if (seconds >= 60) {
+    const minutes = Math.ceil(seconds / 60)
+    return `약 ${minutes}분`
+  }
+  return `${seconds}초`
+}
 
 interface Challenge {
   realm: { name: string; display_name: string }
@@ -21,25 +29,31 @@ export function LoginPage() {
   const { meta, refresh } = useAuth()
   const requestToken = useMemo(() => new URLSearchParams(location.search).get('request') ?? '', [location.search])
   const loggedOut = new URLSearchParams(location.search).get('logged_out') === '1'
-  const [realm, setRealm] = useState('master')
+  const [realmInput, setRealmInput] = useState('master')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
+  // Repeated failures are counted in the browser so the page can explain the
+  // lockout policy without the server having to disclose whether an account
+  // exists or is currently locked.
+  const [failures, setFailures] = useState(0)
+  const [waitSeconds, setWaitSeconds] = useState(0)
   const challenge = useQuery({
     queryKey: ['auth-challenge', requestToken],
     queryFn: () => api<Challenge>(`/api/v1/auth/challenge/${encodeURIComponent(requestToken)}`),
     enabled: Boolean(requestToken),
     retry: false,
   })
-  useEffect(() => {
-    if (challenge.data) setRealm(challenge.data.realm.name)
-  }, [challenge.data])
+  // An authorization request fixes the Realm, so it is derived from the
+  // challenge rather than copied into state by an effect.
+  const realm = challenge.data?.realm.name ?? realmInput
   const login = useMutation({
     mutationFn: () => api<{ authenticated: boolean; redirect_to: string }>('/api/v1/auth/login', {
       method: 'POST',
       ...jsonBody({ realm, username, password, request: requestToken }),
     }),
     onSuccess: async (result) => {
+      setFailures(0)
       if (requestToken) {
         window.location.assign(result.redirect_to)
         return
@@ -47,12 +61,28 @@ export function LoginPage() {
       await refresh()
       navigate('/', { replace: true })
     },
+    onError: (error) => {
+      setFailures((count) => count + 1)
+      if (error instanceof APIError && error.status === 429) {
+        setWaitSeconds(error.retryAfterSeconds ?? 60)
+      }
+    },
   })
+  // Count the wait down so the user can see when to try again rather than
+  // guessing, and keep the form disabled until it elapses. One timeout per
+  // tick keeps the dependency a plain value.
+  useEffect(() => {
+    if (waitSeconds <= 0) return
+    const timer = window.setTimeout(() => setWaitSeconds(waitSeconds - 1), 1000)
+    return () => window.clearTimeout(timer)
+  }, [waitSeconds])
   const submit = (event: FormEvent) => {
     event.preventDefault()
-    if (username.trim() && password) login.mutate()
+    if (username.trim() && password && waitSeconds === 0) login.mutate()
   }
+  const rateLimited = waitSeconds > 0
   const errorMessage = login.error instanceof APIError ? login.error.message : login.error ? '로그인하지 못했습니다.' : ''
+  const blocked = login.isPending || challenge.isError || rateLimited || !username.trim() || !password
 
   return (
     <Box sx={{ minHeight: '100vh', display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'minmax(360px, 520px) 1fr' }, bgcolor: '#0b1220' }}>
@@ -69,18 +99,29 @@ export function LoginPage() {
           </Typography>
           {loggedOut && <Alert severity="success" sx={{ mb: 2 }}>안전하게 로그아웃되었습니다.</Alert>}
           {challenge.isError && <Alert severity="error" sx={{ mb: 2 }}>로그인 요청이 만료되었습니다. 연결한 서비스에서 다시 시작하세요.</Alert>}
-          {errorMessage && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
+          {errorMessage && !rateLimited && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
+          {rateLimited && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              로그인 시도가 제한되었습니다. <strong>{formatWait(waitSeconds)}</strong> 후에 다시 시도할 수 있습니다.
+            </Alert>
+          )}
+          {failures >= 3 && !rateLimited && (
+            <Alert severity="info" sx={{ mb: 2 }}>
+              여러 번 실패했습니다. 반복 실패하면 계정이 일정 시간 잠기며, 잠긴 동안에는 올바른 비밀번호로도 로그인할 수 없습니다.
+              비밀번호가 확실하지 않으면 잠기기 전에 서비스 관리자에게 문의하세요.
+            </Alert>
+          )}
           <Box component="form" onSubmit={submit} noValidate>
             <Stack spacing={2}>
-              {!requestToken && <TextField label="Realm" name="realm" value={realm} onChange={(e) => setRealm(e.target.value)} required autoComplete="organization" helperText="기본 관리 Realm은 master입니다." />}
+              {!requestToken && <TextField label="Realm" name="realm" value={realmInput} onChange={(e) => setRealmInput(e.target.value)} required autoComplete="organization" helperText="기본 관리 Realm은 master입니다." />}
               <TextField label="아이디" name="username" value={username} onChange={(e) => setUsername(e.target.value)} required autoFocus autoComplete="username" inputProps={{ maxLength: 128 }} />
               <TextField
                 label="비밀번호" name="password" type={showPassword ? 'text' : 'password'} value={password}
                 onChange={(e) => setPassword(e.target.value)} required autoComplete="current-password"
                 InputProps={{ endAdornment: <InputAdornment position="end"><IconButton onClick={() => setShowPassword((value) => !value)} edge="end" aria-label={showPassword ? '비밀번호 숨기기' : '비밀번호 표시'}>{showPassword ? <VisibilityOffRoundedIcon /> : <VisibilityRoundedIcon />}</IconButton></InputAdornment> }}
               />
-              <Button type="submit" variant="contained" size="large" endIcon={login.isPending ? <CircularProgress color="inherit" size={18} /> : <ArrowForwardRoundedIcon />} disabled={login.isPending || challenge.isError || !username.trim() || !password}>
-                {login.isPending ? '확인 중…' : '로그인'}
+              <Button type="submit" variant="contained" size="large" endIcon={login.isPending ? <CircularProgress color="inherit" size={18} /> : <ArrowForwardRoundedIcon />} disabled={blocked}>
+                {login.isPending ? '확인 중…' : rateLimited ? `${formatWait(waitSeconds)} 후 재시도` : '로그인'}
               </Button>
             </Stack>
           </Box>

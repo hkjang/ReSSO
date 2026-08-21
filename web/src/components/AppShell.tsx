@@ -22,7 +22,7 @@ import { Avatar, Box, Button, Chip, Dialog, DialogContent, Divider, Drawer, Icon
 import { useQuery } from '@tanstack/react-query'
 import { useTheme } from '@mui/material/styles'
 import { api } from '../lib/api'
-import { useAuth } from '../lib/auth'
+import { useAuth } from '../lib/auth-context'
 import type { Realm } from '../types'
 
 const drawerWidth = 264
@@ -75,13 +75,18 @@ export function AppShell() {
     enabled: Boolean(me),
     staleTime: 30_000,
   })
+  // Read the permissions through plain booleans so the memo depends on scalars
+  // rather than on an optional-chained object path, which the React Compiler
+  // cannot match against the manual dependency list.
+  const isPlatformAdmin = Boolean(me?.permissions.platform_admin)
+  const canRequestRoles = Boolean(capability.data?.enabled)
   const navItems = useMemo(() => {
     if (isAdmin) return adminItems.filter((item) => {
-      if (item.path === '/admin/logs' && !me?.permissions.platform_admin) return false
+      if (item.path === '/admin/logs' && !isPlatformAdmin) return false
       return item.path !== '/admin/approvals' || approvalEnabled
     })
-    return personalItems.filter((item) => item.path !== '/personal/requests' || capability.data?.enabled)
-  }, [isAdmin, approvalEnabled, capability.data?.enabled, me?.permissions.platform_admin])
+    return personalItems.filter((item) => item.path !== '/personal/requests' || canRequestRoles)
+  }, [isAdmin, approvalEnabled, canRequestRoles, isPlatformAdmin])
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
@@ -160,7 +165,13 @@ export function AppShell() {
 function CommandPalette({ open, onClose, items, admin }: { open: boolean; onClose: () => void; items: NavItem[]; admin: boolean }) {
   const [query, setQuery] = useState('')
   const navigate = useNavigate()
-  useEffect(() => { if (!open) setQuery('') }, [open])
+  // Clear the query as the palette closes, adjusting during render so the next
+  // open never shows the previous search for a frame.
+  const [wasOpen, setWasOpen] = useState(open)
+  if (wasOpen !== open) {
+    setWasOpen(open)
+    if (!open) setQuery('')
+  }
   const remote = useQuery({
     queryKey: ['quick-search', query],
     queryFn: () => api<{ items: Array<{ kind: string; id: string; label: string; description: string; path: string }> }>(`/api/admin/v1/quick-search?q=${encodeURIComponent(query)}`),

@@ -54,6 +54,10 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 				"parameters": []any{openAPIPathParameter("realmID"), openAPIPathParameter("userID")},
 				"put":        resetPassword,
 			},
+			"/api/admin/v1/realms/{realmID}/users/{userID}/unlock": map[string]any{
+				"parameters": []any{openAPIPathParameter("realmID"), openAPIPathParameter("userID")},
+				"post":       openAPIOperation("Administration", "잠긴 사용자 잠금 해제", true),
+			},
 			"/api/admin/v1/realms/{realmID}/clients": map[string]any{
 				"parameters": []any{openAPIPathParameter("realmID")},
 				"get":        openAPIReadOperation("Administration", "OIDC Client 목록"),
