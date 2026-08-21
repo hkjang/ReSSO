@@ -64,6 +64,9 @@ type AuditFilter struct {
 	Result    string
 	Actor     string
 	TraceID   string
+	// Ascending reconstructs an incident from its start; the default newest
+	// first answers "what just happened".
+	Ascending bool
 	Limit     int
 	Offset    int
 }
@@ -73,6 +76,14 @@ type AuditFilter struct {
 type AuditPage struct {
 	Items []AuditRow `json:"items"`
 	Total int        `json:"total"`
+}
+
+// order is a fixed keyword chosen by a boolean, never request text.
+func (f AuditFilter) order() string {
+	if f.Ascending {
+		return "ASC"
+	}
+	return "DESC"
 }
 
 func (f AuditFilter) normalized() AuditFilter {
@@ -104,7 +115,7 @@ func (s *Store) ListAudit(ctx context.Context, filter AuditFilter) (AuditPage, e
 	}
 	rows, err := s.Pool.Query(ctx, `SELECT id,occurred_at,realm_id,actor_name,event_type,result,target_type,
         target_id,ip_address,trace_id,detail FROM audit_events `+auditWhere+`
-        ORDER BY occurred_at DESC LIMIT $6 OFFSET $7`,
+        ORDER BY occurred_at `+filter.order()+`, id `+filter.order()+` LIMIT $6 OFFSET $7`,
 		filter.RealmID, filter.EventType, filter.Result, filter.Actor, filter.TraceID, filter.Limit, filter.Offset)
 	if err != nil {
 		return AuditPage{}, err

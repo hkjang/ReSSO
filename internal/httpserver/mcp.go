@@ -12,6 +12,7 @@ import (
 
 	"github.com/hkjang/ReSSO/internal/config"
 	"github.com/hkjang/ReSSO/internal/domain"
+	"github.com/hkjang/ReSSO/internal/store"
 	"github.com/hkjang/ReSSO/internal/version"
 )
 
@@ -248,7 +249,7 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 		if realmID != principal.RealmID && (!principal.PlatformAdmin || !slices.Contains(principal.Scopes, "admin:read")) {
 			return nil, errors.New("다른 Realm을 조회할 권한이 없습니다")
 		}
-		output, err = s.store.ListUsers(r.Context(), realmID, args.Query, 20, 0)
+		output, err = s.store.ListUsers(r.Context(), realmID, args.Query, store.UserSort{}, 20, 0)
 	default:
 		return nil, errors.New("등록되지 않은 도구입니다")
 	}

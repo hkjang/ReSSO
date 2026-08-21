@@ -830,7 +830,7 @@ func TestIntegrationEnsureSearchIndexesIsIdempotentAndOptional(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	users, err := data.ListUsers(ctx, realm.ID, "smith", 100, 0)
+	users, err := data.ListUsers(ctx, realm.ID, "smith", UserSort{}, 100, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1170,5 +1170,88 @@ func TestIntegrationLDAPSyncClaimIsExclusiveAndReleasesWhenStale(t *testing.T) {
 
 	if _, err := data.LDAPSyncRunning(ctx, uuid.New()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown provider error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestIntegrationUserSortIsWhitelistedAndStable(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm, err := data.CreateRealm(ctx, CreateRealmInput{Name: "sortable", DisplayName: "Sortable",
+		IssuerURL: "https://sso.example.com/realms/sortable"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = bootstrap
+	for _, seed := range []struct{ username, display string }{
+		{"carol", "Anna"}, {"alice", "Zoe"}, {"bob", "Mid"},
+	} {
+		if _, err := data.CreateUser(ctx, realm.ID, CreateUserInput{
+			Username: seed.username, DisplayName: seed.display, Password: "sortable-password-1234", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := func(sort UserSort) []string {
+		users, err := data.ListUsers(ctx, realm.ID, "", sort, 100, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := make([]string, 0, len(users))
+		for _, user := range users {
+			result = append(result, user.Username)
+		}
+		return result
+	}
+
+	if got := names(UserSort{}); !slices.Equal(got, []string{"alice", "bob", "carol"}) {
+		t.Fatalf("default order = %v", got)
+	}
+	if got := names(UserSort{Column: "username", Descending: true}); !slices.Equal(got, []string{"carol", "bob", "alice"}) {
+		t.Fatalf("descending username = %v", got)
+	}
+	if got := names(UserSort{Column: "display_name"}); !slices.Equal(got, []string{"carol", "bob", "alice"}) {
+		t.Fatalf("display name order = %v", got)
+	}
+	// An unknown or hostile column must fall back rather than reach the
+	// statement: the value is interpolated, not bound.
+	for _, column := range []string{"", "unknown", "username; DROP TABLE users", "(SELECT 1)"} {
+		got := names(UserSort{Column: column})
+		if !slices.Equal(got, []string{"alice", "bob", "carol"}) {
+			t.Fatalf("sort by %q = %v, want the default order", column, got)
+		}
+	}
+	var remaining int
+	if err := data.Pool.QueryRow(ctx, "SELECT count(*) FROM users WHERE realm_id=$1", realm.ID).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 3 {
+		t.Fatalf("users table was altered: %d rows", remaining)
+	}
+}
+
+func TestIntegrationAuditOrderDirection(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	for _, name := range []string{"first", "second", "third"} {
+		if err := data.WriteAudit(ctx, AuditEvent{RealmID: &bootstrap.RealmID, ActorName: name,
+			EventType: "ORDER_TEST", Result: "SUCCESS"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newest, err := data.ListAudit(ctx, AuditFilter{RealmID: &bootstrap.RealmID, EventType: "ORDER_TEST"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newest.Items[0].ActorName != "third" {
+		t.Fatalf("default order started with %q", newest.Items[0].ActorName)
+	}
+	// Reconstructing an incident needs the oldest first.
+	oldest, err := data.ListAudit(ctx, AuditFilter{RealmID: &bootstrap.RealmID, EventType: "ORDER_TEST", Ascending: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldest.Items[0].ActorName != "first" {
+		t.Fatalf("ascending order started with %q", oldest.Items[0].ActorName)
 	}
 }

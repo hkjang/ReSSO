@@ -6,9 +6,10 @@ import SearchRoundedIcon from '@mui/icons-material/SearchRounded'
 import { Alert, Box, Button, Chip, InputAdornment, MenuItem, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TablePagination, TableRow, TextField, Typography } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../lib/api'
-import { formatDate, shortId } from '../lib/format'
+import { formatTimestamp, shortId } from '../lib/format'
 import { ContentCard, PageHeader } from '../components/Page'
 import { CopyButton } from '../components/CopyField'
+import { SortableCell } from '../components/SortableTable'
 import { DetailDrawer } from '../components/DetailDrawer'
 import { EmptyState, ErrorAlert, PageLoading } from '../components/Feedback'
 
@@ -24,6 +25,7 @@ export function AuditPage() {
   const [actor, setActor] = useState('')
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(100)
+  const [oldestFirst, setOldestFirst] = useState(false)
   // The search box is debounced: without it every keystroke was a request.
   useEffect(() => {
     const timer = window.setTimeout(() => { setActor(actorInput.trim()); setPage(0) }, 300)
@@ -35,9 +37,10 @@ export function AuditPage() {
     staleTime: 60_000,
   })
   const query = useQuery({
-    queryKey: ['audit', eventType, result, actor, page, rowsPerPage],
+    queryKey: ['audit', eventType, result, actor, oldestFirst, page, rowsPerPage],
     queryFn: () => api<{ items: AuditRow[]; total: number }>(`/api/admin/v1/audit?limit=${rowsPerPage}&offset=${page * rowsPerPage}`
-      + `&event_type=${encodeURIComponent(eventType)}&result=${encodeURIComponent(result)}&actor=${encodeURIComponent(actor)}`),
+      + `&event_type=${encodeURIComponent(eventType)}&result=${encodeURIComponent(result)}&actor=${encodeURIComponent(actor)}`
+      + `&order=${oldestFirst ? 'asc' : 'desc'}`),
     refetchInterval: 30_000,
   })
   const filtered = Boolean(eventType || result || actor)
@@ -59,12 +62,12 @@ export function AuditPage() {
       {filtered && <Button onClick={clear} sx={{ alignSelf: { md: 'center' } }}>필터 해제</Button>}
     </Stack>
     <ContentCard noPadding>{query.isLoading ? <PageLoading /> : query.error ? <Box sx={{ p: 2 }}><ErrorAlert error={query.error} onRetry={() => void query.refetch()} /></Box> : !query.data?.items.length ? <EmptyState title={filtered ? '조건에 맞는 감사 이벤트가 없습니다' : '감사 이벤트가 없습니다'} description={filtered ? '필터를 해제하거나 조건을 넓혀보세요.' : undefined} /> : <>
-      <TableContainer sx={{ maxHeight: 'calc(100vh - 320px)' }}><Table stickyHeader><TableHead><TableRow><TableCell>시각</TableCell><TableCell>이벤트</TableCell><TableCell>결과</TableCell><TableCell>행위자</TableCell><TableCell>대상</TableCell><TableCell>IP</TableCell><TableCell>Trace</TableCell></TableRow></TableHead><TableBody>
-        {query.data.items.map((event) => <TableRow hover key={event.id} onClick={() => setSelected(event)} sx={{ cursor: 'pointer' }}><TableCell>{formatDate(event.occurred_at)}</TableCell><TableCell><Typography fontWeight={650}>{event.event_type}</Typography></TableCell><TableCell><Chip size="small" label={event.result} color={event.result === 'SUCCESS' ? 'success' : 'error'} variant="outlined" /></TableCell><TableCell>{event.actor_name || 'system'}</TableCell><TableCell>{event.target_type} {event.target_id && <span className="mono">{shortId(event.target_id)}</span>}</TableCell><TableCell className="mono">{event.ip_address}</TableCell><TableCell onClick={(e) => e.stopPropagation()}><Stack direction="row" alignItems="center" spacing={.3}><Typography variant="body2" className="mono">{shortId(event.trace_id)}</Typography><CopyButton value={event.trace_id} label="Trace ID 복사" /></Stack></TableCell></TableRow>)}
+      <TableContainer sx={{ maxHeight: 'calc(100vh - 320px)' }}><Table stickyHeader><TableHead><TableRow><SortableCell column="occurred_at" sort={{ column: 'occurred_at', descending: !oldestFirst }} onSort={(next) => { setOldestFirst(!next.descending); setPage(0) }}>시각</SortableCell><TableCell>이벤트</TableCell><TableCell>결과</TableCell><TableCell>행위자</TableCell><TableCell>대상</TableCell><TableCell>IP</TableCell><TableCell>Trace</TableCell></TableRow></TableHead><TableBody>
+        {query.data.items.map((event) => <TableRow hover key={event.id} onClick={() => setSelected(event)} sx={{ cursor: 'pointer' }}><TableCell>{formatTimestamp(event.occurred_at)}</TableCell><TableCell><Typography fontWeight={650}>{event.event_type}</Typography></TableCell><TableCell><Chip size="small" label={event.result} color={event.result === 'SUCCESS' ? 'success' : 'error'} variant="outlined" /></TableCell><TableCell>{event.actor_name || 'system'}</TableCell><TableCell>{event.target_type} {event.target_id && <span className="mono">{shortId(event.target_id)}</span>}</TableCell><TableCell className="mono">{event.ip_address}</TableCell><TableCell onClick={(e) => e.stopPropagation()}><Stack direction="row" alignItems="center" spacing={.3}><Typography variant="body2" className="mono">{shortId(event.trace_id)}</Typography><CopyButton value={event.trace_id} label="Trace ID 복사" /></Stack></TableCell></TableRow>)}
       </TableBody></Table></TableContainer>
       <TablePagination component="div" count={query.data.total} page={page} rowsPerPage={rowsPerPage} rowsPerPageOptions={[50, 100, 200]} onPageChange={(_, next) => setPage(next)} onRowsPerPageChange={(event) => { setRowsPerPage(Number(event.target.value)); setPage(0) }} labelRowsPerPage="페이지당" />
     </>}</ContentCard>
-    <DetailDrawer open={Boolean(selected)} onClose={() => setSelected(null)} title={selected?.event_type ?? ''} subtitle={selected ? formatDate(selected.occurred_at) : undefined}>
+    <DetailDrawer open={Boolean(selected)} onClose={() => setSelected(null)} title={selected?.event_type ?? ''} subtitle={selected ? formatTimestamp(selected.occurred_at) : undefined}>
       <KeyValue label="결과" value={selected?.result} />
       <KeyValue label="행위자" value={selected?.actor_name || 'system'} />
       <KeyValue label="대상" value={`${selected?.target_type ?? ''} ${selected?.target_id ?? ''}`} copyValue={selected?.target_id} />
@@ -110,8 +113,8 @@ export function LogsPage() {
       <Button startIcon={<RefreshRoundedIcon />} onClick={() => query.refetch()}>새로고침</Button>
     </Stack>
     {truncated && <Alert severity="info" sx={{ mb: 2 }}>가장 최근 500건만 표시합니다. 조건을 좁히면 더 정확하게 찾을 수 있습니다.</Alert>}
-    <ContentCard noPadding>{query.isLoading ? <PageLoading /> : query.error ? <Box sx={{ p: 2 }}><ErrorAlert error={query.error} onRetry={() => void query.refetch()} /></Box> : !query.data?.items.length ? <EmptyState title="조건에 맞는 로그가 없습니다" description={search ? '검색어를 지우거나 Level 필터를 넓혀보세요.' : undefined} /> : <TableContainer sx={{ maxHeight: 'calc(100vh - 260px)' }}><Table stickyHeader><TableHead><TableRow><TableCell>시각</TableCell><TableCell>Level</TableCell><TableCell>Component</TableCell><TableCell>메시지</TableCell><TableCell>Trace ID</TableCell></TableRow></TableHead><TableBody>{query.data.items.map((log) => <TableRow hover key={log.id} onClick={() => setSelected(log)} sx={{ cursor: 'pointer' }}><TableCell>{formatDate(log.occurred_at)}</TableCell><TableCell><LogLevel level={log.level} /></TableCell><TableCell className="mono">{log.component}</TableCell><TableCell sx={{ maxWidth: 540 }}><Typography noWrap>{log.message}</Typography></TableCell><TableCell onClick={(e) => e.stopPropagation()}><Stack direction="row" alignItems="center" spacing={.3}><Typography variant="body2" className="mono">{shortId(log.trace_id)}</Typography><CopyButton value={log.trace_id} label="Trace ID 복사" /></Stack></TableCell></TableRow>)}</TableBody></Table></TableContainer>}</ContentCard>
-    <DetailDrawer open={Boolean(selected)} onClose={() => setSelected(null)} title={selected?.message ?? ''} subtitle={selected ? formatDate(selected.occurred_at) : undefined}>
+    <ContentCard noPadding>{query.isLoading ? <PageLoading /> : query.error ? <Box sx={{ p: 2 }}><ErrorAlert error={query.error} onRetry={() => void query.refetch()} /></Box> : !query.data?.items.length ? <EmptyState title="조건에 맞는 로그가 없습니다" description={search ? '검색어를 지우거나 Level 필터를 넓혀보세요.' : undefined} /> : <TableContainer sx={{ maxHeight: 'calc(100vh - 260px)' }}><Table stickyHeader><TableHead><TableRow><TableCell>시각</TableCell><TableCell>Level</TableCell><TableCell>Component</TableCell><TableCell>메시지</TableCell><TableCell>Trace ID</TableCell></TableRow></TableHead><TableBody>{query.data.items.map((log) => <TableRow hover key={log.id} onClick={() => setSelected(log)} sx={{ cursor: 'pointer' }}><TableCell>{formatTimestamp(log.occurred_at)}</TableCell><TableCell><LogLevel level={log.level} /></TableCell><TableCell className="mono">{log.component}</TableCell><TableCell sx={{ maxWidth: 540 }}><Typography noWrap>{log.message}</Typography></TableCell><TableCell onClick={(e) => e.stopPropagation()}><Stack direction="row" alignItems="center" spacing={.3}><Typography variant="body2" className="mono">{shortId(log.trace_id)}</Typography><CopyButton value={log.trace_id} label="Trace ID 복사" /></Stack></TableCell></TableRow>)}</TableBody></Table></TableContainer>}</ContentCard>
+    <DetailDrawer open={Boolean(selected)} onClose={() => setSelected(null)} title={selected?.message ?? ''} subtitle={selected ? formatTimestamp(selected.occurred_at) : undefined}>
       <KeyValue label="Level" value={selected?.level} />
       <KeyValue label="Component" value={selected?.component} mono />
       <KeyValue label="Trace ID" value={selected?.trace_id} mono copyValue={selected?.trace_id} />

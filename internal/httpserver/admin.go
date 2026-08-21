@@ -203,7 +203,8 @@ func (s *Server) adminListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	query := r.URL.Query().Get("q")
-	items, err := s.store.ListUsers(r.Context(), realmID, query, queryInt(r, "limit", 100), queryInt(r, "offset", 0))
+	sort := store.UserSort{Column: r.URL.Query().Get("sort"), Descending: r.URL.Query().Get("order") == "desc"}
+	items, err := s.store.ListUsers(r.Context(), realmID, query, sort, queryInt(r, "limit", 100), queryInt(r, "offset", 0))
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
@@ -772,6 +773,7 @@ func (s *Server) adminListAudit(w http.ResponseWriter, r *http.Request) {
 		Result:    strings.ToUpper(r.URL.Query().Get("result")),
 		Actor:     r.URL.Query().Get("actor"),
 		TraceID:   r.URL.Query().Get("trace_id"),
+		Ascending: r.URL.Query().Get("order") == "asc",
 		Limit:     queryInt(r, "limit", 100),
 		Offset:    queryInt(r, "offset", 0),
 	})

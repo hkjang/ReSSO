@@ -36,14 +36,44 @@ func (s *Store) UserByID(ctx context.Context, id uuid.UUID) (domain.User, error)
 	return scanUser(s.Pool.QueryRow(ctx, "SELECT "+userColumns+" FROM users WHERE id=$1", id))
 }
 
-func (s *Store) ListUsers(ctx context.Context, realmID uuid.UUID, query string, limit, offset int) ([]domain.User, error) {
+// userSortColumns whitelists the orderings the console may ask for. The value
+// is interpolated into the statement, so it must never come from the request.
+var userSortColumns = map[string]string{
+	"username":            "lower(username)",
+	"display_name":        "lower(display_name)",
+	"email":               "lower(email)",
+	"created_at":          "created_at",
+	"password_changed_at": "password_changed_at",
+}
+
+// UserSort names an ordering. An unknown column falls back to the username so
+// a stale or hand-written request cannot produce an error page.
+type UserSort struct {
+	Column     string
+	Descending bool
+}
+
+func (s UserSort) orderBy() string {
+	column, ok := userSortColumns[s.Column]
+	if !ok {
+		column = userSortColumns["username"]
+	}
+	direction := "ASC"
+	if s.Descending {
+		direction = "DESC"
+	}
+	// The username tiebreak keeps paging stable when the sorted values repeat.
+	return column + " " + direction + ", lower(username) ASC"
+}
+
+func (s *Store) ListUsers(ctx context.Context, realmID uuid.UUID, query string, sort UserSort, limit, offset int) ([]domain.User, error) {
 	if limit < 1 || limit > 500 {
 		limit = 100
 	}
 	pattern := "%" + strings.ToLower(strings.TrimSpace(query)) + "%"
 	rows, err := s.Pool.Query(ctx, "SELECT "+userColumns+` FROM users WHERE realm_id=$1 AND
         ($2='' OR lower(username) LIKE $3 OR lower(email) LIKE $3 OR lower(display_name) LIKE $3)
-        ORDER BY username LIMIT $4 OFFSET $5`, realmID, strings.TrimSpace(query), pattern, limit, offset)
+        ORDER BY `+sort.orderBy()+` LIMIT $4 OFFSET $5`, realmID, strings.TrimSpace(query), pattern, limit, offset)
 	if err != nil {
 		return nil, err
 	}
