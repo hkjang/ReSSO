@@ -8,13 +8,15 @@ ReSSO는 Go와 React로 만든 오프라인 운영용 Keycloak-compatible OIDC S
 - Authorization Code + PKCE S256, Refresh Token rotation/reuse detection, Client Credentials
 - Keycloak 호환 주요 Claim: `azp`, `sid`, `preferred_username`, `realm_access`, `resource_access`
 - Realm, 사용자, Client, Role, SSO Session, 서명 키와 감사 이벤트 관리
+- Realm별 비밀번호·계정 잠금 정책 설정과 잠긴 계정의 즉시 잠금 해제
 - Realm Role·Client Role 할당/회수와 Realm 범위 관리자 위임
 - 등록된 Web Origin 기반 OIDC CORS 및 Scope 기반 Claim 최소화
 - Realm별 LDAP/Active Directory User Federation, 연결·인증 테스트, 전체/JIT/주기 동기화
 - 서비스 관리자와 개인화 화면 분리
 - 개인 API 키 생성·폐기·회전 및 MCP Streamable HTTP endpoint
 - Realm별 선택적 팀장 검토·승인 프로세스
-- 관리자용 구조화 서버 로그 조회, Trace ID, 민감 필드 마스킹
+- Client별 OIDC Back-Channel Logout 통지
+- 관리자용 구조화 서버 로그 조회, Trace ID, 민감 필드 마스킹, Prometheus `/metrics`
 - React/MUI 정적 자산을 Go 바이너리에 포함한 단일 오프라인 Docker 이미지
 
 ## 환경변수
@@ -30,6 +32,7 @@ PostgreSQL과 최초 관리자 값이 필요하며, 키 보호 설정은 분리�
 | `DIGEST_KEYS` | 권장. Session·Token·API Key HMAC Keyring. 형식은 위와 같고 첫 키가 신규 Digest에 사용됩니다. |
 | `ENCRYPTION_KEY` | v0.2.0 호환 단일 32바이트 키. 분리형 Keyring이 없으면 양쪽 용도로 사용하며, Keyring과 함께 설정하면 Upgrade용 읽기 키로 자동 추가됩니다. |
 | `TRUSTED_PROXY_CIDRS` | 선택. 쉼표로 구분한 Reverse Proxy CIDR. 설정된 Proxy에서 온 `X-Forwarded-For`와 `X-Forwarded-Proto`만 신뢰합니다. |
+| `LISTEN_ADDRESS` | 선택. `host:port` 형식의 Listen 주소. 기본값은 `:8080`이며 Container Health Check도 이 값을 따릅니다. |
 
 `BOOTSTRAP_ADMIN_PASSWORD`는 최초 계정 생성에만 사용됩니다. 컨테이너 재시작이나 값 변경으로 기존 비밀번호가 재설정되지 않습니다.
 
@@ -95,6 +98,10 @@ https://sso.company.com/realms/{realm}/.well-known/openid-configuration
 Public Client는 PKCE S256이 강제됩니다. Redirect URI와 Post Logout Redirect URI는 등록값과 정확히 일치해야 합니다.
 브라우저 SPA는 Client에 등록한 정확한 Web Origin에서만 Token·UserInfo endpoint의 CORS 응답을 받을 수 있습니다. `profile`, `email`, `roles` Claim은 요청 Scope에 포함된 경우에만 제공됩니다.
 
+Access Token을 검증하는 Resource Server는 같은 Realm의 아무 Confidential Client 자격증명으로 Introspection endpoint를 호출할 수 있습니다. Refresh Token Introspection은 해당 Token을 발급받은 Client에게만 허용됩니다.
+
+Client에 Back-Channel Logout URI를 등록하면 Session이 종료될 때(사용자 로그아웃, RP-Initiated Logout, 관리자 강제 폐기 포함) 해당 Session에 참여한 Client에만 서명된 `logout_token`을 POST합니다. URI는 Redirect URI와 동일하게 HTTPS(또는 Loopback HTTP)만 허용하며 Redirect를 따라가지 않습니다. 전달은 Best effort이며 결과는 감사 로그와 `/metrics`에서 확인합니다.
+
 ## MCP와 REST API
 
 - OpenAPI: `/api/openapi.json`
@@ -139,18 +146,47 @@ Archive:       resso-vX.Y.Z.tar.gz
 로컬에서 동일한 아카이브를 만들려면:
 
 ```bash
-./scripts/release-image.sh v0.2.1
+./scripts/release-image.sh v0.3.0
 ```
+
+## 운영 지표
+
+`GET /metrics`가 Prometheus text format을 제공합니다. 운영 정보 노출을 막기 위해 관리 API와 동일한 인증을 요구하므로, Prometheus에는 `admin:read` 범위의 개인 API Key를 Bearer token으로 설정하세요.
+
+```yaml
+scrape_configs:
+  - job_name: resso
+    metrics_path: /metrics
+    authorization:
+      credentials: rk_xxxxx.yyyyy
+    static_configs:
+      - targets: ['sso.company.com']
+```
+
+| 지표 | 내용 |
+|---|---|
+| `resso_http_requests_total` | Route 패턴·Method·Status별 요청 수 |
+| `resso_http_request_duration_seconds` | Route 패턴별 요청 지연 Histogram |
+| `resso_tokens_issued_total` | Grant type별 Token 발급 수 |
+| `resso_login_attempts_total` | 로그인 성공·실패·Rate limit 수 |
+| `resso_client_auth_failures_total` | Realm별 OIDC Client 인증 실패 수 |
+| `resso_backchannel_logout_total` | Back-Channel Logout 전달 결과 |
+| `resso_federation_sync_total` | 주기 LDAP 동기화 성공·실패 수 |
 
 ## 개발 및 검증
 
 ```bash
-go test ./...
-go vet ./...
-cd web
-npm ci
-npm run test
-npm run build
+make lint    # golangci-lint, govulncheck, ESLint
+make test    # go test -race, go vet, 프론트엔드 테스트와 빌드
+```
+
+통합 테스트는 실제 PostgreSQL을 사용합니다. `RESSO_TEST_POSTGRES_DSN`이 없으면 건너뜁니다.
+
+```bash
+docker run -d --name resso-test-pg -e POSTGRES_USER=resso -e POSTGRES_PASSWORD=testpw \
+  -e POSTGRES_DB=resso -p 55432:5432 postgres:16-alpine
+docker exec resso-test-pg psql -U resso -d resso -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+RESSO_TEST_POSTGRES_DSN='postgres://resso:testpw@127.0.0.1:55432/resso?sslmode=disable' go test -race ./...
 ```
 
 실제 PostgreSQL과 실행 중인 ReSSO를 대상으로 OIDC, Refresh, UserInfo, 개인 API Key와 MCP까지 확인:
@@ -169,6 +205,8 @@ Smoke test는 PKCE, Scope 기반 Claim, Refresh Token 재사용 탐지, Web Orig
 - 개인 API Key와 Client Secret은 생성 직후 한 번만 표시됩니다.
 - 관리자 화면의 감사 이벤트와 서버 로그를 정기적으로 검토하세요.
 - Signing Key 회전 후 이전 키는 기존 Token 검증을 위해 일정 시간 JWKS에 유지됩니다.
+- Client Secret은 Digest Keyring으로 보호됩니다. Digest Key를 제거하기 전에 해당 키로 만든 Client Secret을 모두 회전하세요.
+- 대규모 사용자 검색 성능을 위해 데이터베이스 소유자 권한으로 `CREATE EXTENSION pg_trgm;`을 실행하세요. ReSSO는 확장을 직접 설치하지 않고, 존재하면 다음 기동 시 색인을 만듭니다.
 - LDAP Bind Credential도 Data Encryption Keyring으로 암호화되며 API·MCP·감사로그에 평문으로 반환하지 않습니다.
 - 현재 릴리즈는 Kerberos/SPNEGO, MFA/TOTP, SAML, WebAuthn, 외부 Identity Broker를 포함하지 않습니다. 해당 기능이 필요한 조직은 별도 보안 검토와 단계적 확장이 필요합니다.
 

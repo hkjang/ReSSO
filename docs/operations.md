@@ -40,6 +40,54 @@ Docker 이미지에는 `/resso healthcheck`가 포함됩니다.
 
 관리 대시보드는 외부 Issuer HTTPS, Realm ACTIVE 서명 키, LDAP 동기화 실패, 잠긴 사용자와 7일 내 만료 API Key를 실제 DB 상태로 표시합니다.
 
+## 사용자 검색 색인
+
+관리 화면의 사용자 검색은 선행 Wildcard를 사용하므로 B-tree 색인을 사용할 수 없습니다. 사용자 수가 많은 Realm에서는 `pg_trgm` 확장을 설치하면 전체 스캔 대신 색인 스캔을 사용합니다.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+ReSSO는 확장을 직접 설치하지 않습니다. 확장 설치는 데이터베이스 소유자 권한이 필요하고, Migration이 확장을 임의의 스키마에 설치하면 다른 객체에 영향을 주기 때문입니다. 확장이 존재하면 다음 기동 시 색인을 만들고, 없으면 기존 동작을 그대로 유지합니다. 나중에 확장을 설치했다면 재기동만 하면 됩니다. 기동 로그에서 결과를 확인할 수 있습니다.
+
+## 운영 지표
+
+`GET /metrics`가 Prometheus text format을 제공하며 관리 API와 동일한 인증을 요구합니다. Prometheus에는 `admin:read` 범위의 개인 API Key를 Bearer token으로 설정하세요. 지표 목록은 [README](../README.md#운영-지표)에 있습니다.
+
+권장 경보:
+
+- `resso_login_attempts_total{result="failure"}` 급증 — 자격증명 대입 시도
+- `resso_client_auth_failures_total` 급증 — Client Secret 오설정 또는 대입 시도
+- `resso_backchannel_logout_total{result!="delivered"}` — RP가 로그아웃 통지를 받지 못하는 상태
+- `resso_federation_sync_total{result="failure"}` — LDAP 동기화 실패
+- `resso_http_request_duration_seconds` 상위 분위 상승 — 커넥션 풀 포화 또는 LDAP 지연
+
+## Back-Channel Logout
+
+관리 → Client에서 Back-Channel Logout URI를 등록하면 Session 종료 시 해당 Session에 참여한 Client에만 서명된 `logout_token`을 POST합니다.
+
+- 사용자 로그아웃, RP-Initiated Logout, 관리자의 Session 강제 폐기, 계정 복구가 모두 통지를 발생시킵니다.
+- URI는 HTTPS(또는 Loopback HTTP)만 허용하며 Redirect는 따라가지 않습니다.
+- 전달은 Best effort입니다. 재시도하지 않으며 사용자의 로그아웃 응답을 지연시키지 않습니다.
+- RP는 `logout_token`을 Realm JWKS로 검증하고 `iss`, `aud`, `events`, `sid`를 확인해야 합니다.
+- 실패는 서버 로그와 `resso_backchannel_logout_total`에 기록됩니다.
+
+## 계정 잠금 운영
+
+Realm의 잠금 정책은 관리 → Realm 상세에서 설정합니다.
+
+| 항목 | 범위 | 기본값 |
+|---|---|---|
+| 비밀번호 최소 길이 | 8 ~ 128자 | 12자 |
+| 잠금까지 허용할 연속 실패 | 3 ~ 50회 | 5회 |
+| 잠금 유지 시간 | 30초 ~ 24시간 | 900초 |
+
+이 정책은 개인 설정의 비밀번호 변경 화면에 그대로 안내되므로, 값을 바꾸면 사용자가 보는 조건도 함께 바뀝니다.
+
+잠긴 계정은 관리 → 사용자에서 상태 필터를 `잠김`으로 두고 확인하며, `잠금 해제` 버튼으로 비밀번호를 바꾸지 않고 해제합니다. 비밀번호 재설정으로도 잠금이 풀리지만, 사용자가 단순히 오타를 냈을 뿐이라면 불필요한 자격증명 변경을 강요하게 되므로 잠금 해제를 사용하세요. 두 작업 모두 감사 이벤트(`USER_UNLOCK`, `USER_PASSWORD_RESET`)로 기록됩니다.
+
+로그인 화면은 계정 존재 여부를 노출하지 않기 위해 잠금 여부와 무관하게 동일한 메시지를 반환합니다. 사용자가 "비밀번호는 맞는데 로그인이 안 된다"고 문의하면 이 화면에서 잠금 상태를 먼저 확인하세요.
+
 ## 관리자 권한
 
 - `platform_admin`: 모든 Realm, 새 Realm 생성, 서버 로그를 포함한 서비스 전체 관리
@@ -72,7 +120,15 @@ docker compose -f compose.maintenance.yaml --profile maintenance run --rm resso-
 docker compose -f compose.maintenance.yaml --profile maintenance run --rm resso-maintenance crypto rewrap
 ```
 
-`crypto rewrap`은 PostgreSQL의 Signing Private Key와 LDAP Bind Credential을 검증하고 활성 Data Encryption Key로 다시 암호화합니다. Session·Authorization Request/Code·Refresh Token·개인 API Key의 Digest는 원문을 저장하지 않아 재작성하지 않습니다. rewrap 후 `admin diagnose` 결과와 서비스 동작을 확인한 뒤에만 이전 Data Encryption Key를 제거하세요. 이전 Digest Key는 기존 Session과 Token이 만료되고, 그 키로 만든 모든 개인 API Key가 회전 또는 폐기될 때까지 읽기 키로 유지합니다.
+`crypto rewrap`은 PostgreSQL의 Signing Private Key와 LDAP Bind Credential을 검증하고 활성 Data Encryption Key로 다시 암호화합니다. Session·Authorization Request/Code·Refresh Token·개인 API Key·Client Secret의 Digest는 원문을 저장하지 않아 재작성하지 않습니다. rewrap 후 `admin diagnose` 결과와 서비스 동작을 확인한 뒤에만 이전 Data Encryption Key를 제거하세요.
+
+이전 Digest Key는 다음이 모두 끝날 때까지 읽기 키로 유지합니다.
+
+- 기존 Session과 Refresh Token 만료
+- 해당 키로 만든 모든 개인 API Key 회전 또는 폐기
+- **해당 키로 만든 모든 Client Secret 회전**
+
+Client Secret은 만료되지 않으므로 마지막 항목이 사실상 제거 시점을 결정합니다. 관리 → Client에서 각 Confidential Client의 `Client Secret 회전`을 수행한 뒤에 이전 Digest Key를 제거하세요. v0.2.1 이하에서 만든 Argon2 형식 Secret은 Digest Key와 무관하게 계속 동작하며, 최초 인증 성공 시 활성 Digest Key 형식으로 자동 승격됩니다.
 
 v0.2.0의 단일 `ENCRYPTION_KEY`에서 전환할 때는 먼저 기존 설정 그대로 모든 인스턴스를 v0.2.1로 업그레이드합니다. 이 모드에서는 v0.2.0 암호문 형식으로 계속 쓰므로 혼합 배포와 이미지 롤백이 가능합니다. 그 다음 분리형 Keyring을 설정하면서 `ENCRYPTION_KEY`도 유지하면 ReSSO가 기존 키를 `legacy` ID로 양쪽 읽기 Keyring에 자동 추가합니다. 첫 단계에는 `legacy:OLD_KEY,new:NEW_KEY`, 두 번째 단계에는 `new:NEW_KEY,legacy:OLD_KEY` 순서를 사용하세요. 새 Keyring을 활성화하거나 `crypto rewrap`을 실행한 뒤에는 v0.2.0으로 롤백하지 마세요.
 
@@ -122,3 +178,14 @@ GitHub Release에 첨부되는 공식 오프라인 Docker 아카이브는 `linux
 - `DISABLE` 정책은 전체 동기화에서 사라진 계정을 비활성화하고 세션을 종료하므로 LDAP 필터 변경 전에 영향 범위를 확인합니다.
 - 자동 동기화는 5분 이상 주기로 설정하며 다중 Pod에서는 PostgreSQL `SKIP LOCKED` claim으로 중복 실행을 방지합니다.
 - 상세 설정과 장애 대응은 [user-federation.md](user-federation.md)를 참고하세요.
+
+## 관리 화면 링크 공유
+
+관리 화면의 Realm 선택은 주소의 `realm` 파라미터에 반영됩니다. 장애 대응 중 특정 Realm의 화면을 공유하려면 주소를 그대로 전달하면 됩니다.
+
+```text
+https://sso.company.com/admin/users?realm=partners
+https://sso.company.com/admin/clients?realm=master
+```
+
+파라미터가 없으면 마지막으로 선택한 Realm을, 그것도 없으면 첫 번째 Realm을 사용하고 주소를 보정합니다.

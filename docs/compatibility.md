@@ -12,8 +12,10 @@
 | Refresh Token | 회전·재사용 탐지 구현 |
 | Client Credentials | Confidential Client 구현 |
 | UserInfo / JWKS | 구현 |
-| Introspection / Revocation | 구현 |
-| RP-Initiated Logout | 구현 |
+| Introspection / Revocation | 구현. Access Token은 같은 Realm의 모든 Confidential Client가 조회 가능 |
+| RP-Initiated Logout | 구현. `id_token_hint` 또는 `client_id` |
+| Back-Channel Logout | 구현. Session 참여 Client에 서명된 `logout_token` 전송 |
+| ID Token `at_hash` | 구현 |
 | Keycloak `realm_access` / `resource_access` Claim | 구현 |
 | Keycloak URL 구조 | 핵심 OIDC Endpoint 구현 |
 | SSO Browser Session | PostgreSQL 기반 구현 |
@@ -30,7 +32,7 @@
 - SAML, Kerberos/SPNEGO
 - 외부 OIDC/SAML Identity Broker
 - TOTP/WebAuthn/Passkey MFA
-- Front-channel / Back-channel Logout 알림 전송
+- Front-channel Logout 알림 전송
 - Keycloak Admin REST API wire compatibility
 - Keycloak Theme 또는 전체 Admin Console 호환
 - LDAP Changed Users Sync, 중첩 Group 탐색, LDAP Connection Pool
@@ -39,11 +41,14 @@ Claim은 Scope에 따라 최소화됩니다. `profile`은 이름·사용자명, 
 
 `email_verified=true`는 ReSSO가 확인 메일을 발송해 소유권을 검증했다는 뜻이 아니라, Realm 관리자가 조직의 절차와 외부 근거에 따라 해당 이메일을 확인했다는 관리적 attestation입니다. Relying Party는 이 Claim을 조직의 관리자 확인 정책 수준으로 해석해야 하며, 이메일 링크 challenge가 필요한 계정 연결·복구 흐름에서는 별도의 검증을 수행해야 합니다.
 
+Access Token의 `aud`는 발급 Client 자신입니다. 별도 Resource Server를 audience로 하는 Token 발급은 아직 지원하지 않으므로, API는 Introspection 또는 `azp` 기반 인가를 사용해야 합니다.
+
 ReSSO의 목표는 Keycloak 전체 복제가 아니라 issuer 변경만으로 일반 OIDC Client가 연동되는 핵심 L3~L4 호환 서버입니다. 기존 애플리케이션이 Keycloak Admin API, SAML 또는 고유 SPI를 사용한다면 별도의 Migration 분석이 필요합니다.
 
 ## 검증 권장사항
 
 - Spring Security Resource Server의 `issuer-uri` 변경 테스트
 - 사용하는 SDK별 Discovery → Code+PKCE → Token → UserInfo → Refresh → Logout 테스트
-- `iss`, `aud`, `nonce`, `state`, `sid`, `realm_access`, `resource_access` Claim 회귀 테스트
+- `iss`, `aud`, `nonce`, `state`, `sid`, `at_hash`, `realm_access`, `resource_access` Claim 회귀 테스트
+- Back-Channel Logout을 사용하는 RP는 `logout_token` 검증(JWKS 서명, `iss`, `aud`, `events`, `sid`, `nonce` 부재) 테스트
 - OpenID Foundation Conformance Suite는 운영 승격 전 별도 수행 권장
