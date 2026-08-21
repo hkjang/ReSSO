@@ -79,7 +79,8 @@ access_token="$(echo "$tokens" | jq -er '.access_token')"
 refresh_token="$(echo "$tokens" | jq -er '.refresh_token')"
 echo "$tokens" | jq -e '.token_type == "Bearer" and .id_token != null' >/dev/null
 
-curl -fsS -H "Authorization: Bearer $access_token" "$base_url/realms/master/protocol/openid-connect/userinfo" | jq -e '.preferred_username != null and .email_verified == false and .realm_access == null' >/dev/null
+curl -fsS -H "Authorization: Bearer $access_token" "$base_url/realms/master/protocol/openid-connect/userinfo" | \
+  jq -e '.preferred_username != null and (has("email") | not) and (has("email_verified") | not) and .realm_access == null' >/dev/null
 refreshed="$(curl -fsS -X POST --data-urlencode 'grant_type=refresh_token' --data-urlencode "client_id=$client_identifier" --data-urlencode "refresh_token=$refresh_token" "$base_url/realms/master/protocol/openid-connect/token")"
 rotated_refresh="$(echo "$refreshed" | jq -er '.refresh_token')"
 echo "$refreshed" | jq -e '.access_token != null' >/dev/null
