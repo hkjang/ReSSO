@@ -1911,3 +1911,35 @@ func TestIntegrationEmptyLDAPReadDoesNotDisableEveryone(t *testing.T) {
 		t.Error("an account the directory no longer lists stayed enabled")
 	}
 }
+
+// A rotated refresh token inherits its predecessor's expiry, so the whole
+// family dies when the first token would have. That is a deliberate ceiling —
+// a sliding expiry would let a client that keeps refreshing hold a credential
+// forever — but nothing recorded it, and a future change to what rotation
+// copies would flip it silently in the direction that removes the ceiling.
+func TestIntegrationRefreshRotationDoesNotExtendTheFamilyLifetime(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	userID := bootstrap.AdminUserID
+	expiry := time.Now().UTC().Add(30 * time.Minute)
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+		UserID: &userID, Scope: []string{"openid"}, ExpiresAt: expiry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two rotations, so a per-rotation extension would be unmistakable.
+	rotated, rawNext, err := data.RotateRefreshToken(ctx, raw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, _, err = data.RotateRefreshToken(ctx, rawNext, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PostgreSQL stores microseconds, so compare instants rather than values.
+	if drift := rotated.ExpiresAt.Sub(expiry); drift > time.Second || drift < -time.Second {
+		t.Errorf("rotation moved the expiry by %s; the family lifetime must be fixed at issuance", drift)
+	}
+}

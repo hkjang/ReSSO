@@ -90,8 +90,8 @@ export function RealmsPage() {
             <Typography variant="body2" color="text.secondary">끄면 사용자 화면과 관리자 메뉴에서 요청·승인·반려 과정이 제외됩니다.</Typography>
           </Box>
           <Typography variant="h3">Token · Session 수명</Typography>
-          <TextField label="Access Token (초)" type="number" value={form.access_token_ttl_seconds} onChange={(e) => setForm({ ...form, access_token_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 60, max: 3600 }} />
-          <TextField label="Refresh Token (초)" type="number" value={form.refresh_token_ttl_seconds} onChange={(e) => setForm({ ...form, refresh_token_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 300, max: 2592000 }} />
+          <TextField label="Access Token (초)" type="number" value={form.access_token_ttl_seconds} onChange={(e) => setForm({ ...form, access_token_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 60, max: 3600 }} helperText="60초에서 3600초 사이" />
+          <TextField label="Refresh Token (초)" type="number" value={form.refresh_token_ttl_seconds} onChange={(e) => setForm({ ...form, refresh_token_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 300, max: 2592000 }} helperText="최초 발급 시점부터의 총 수명입니다. 회전해도 연장되지 않으므로, 이 시간이 지나면 RP는 인가 과정을 다시 거칩니다." />
           <TextField label="SSO Session (초)" type="number" value={form.session_ttl_seconds} onChange={(e) => setForm({ ...form, session_ttl_seconds: Number(e.target.value) })} inputProps={{ min: 300, max: 2592000 }} helperText="로그인 후 활동과 무관하게 세션이 유지되는 최대 시간" />
           <TextField label="유휴 만료 (초)" type="number" value={form.idle_timeout_seconds} onChange={(e) => setForm({ ...form, idle_timeout_seconds: Number(e.target.value) })} inputProps={{ min: 0, max: 2592000 }} helperText={form.idle_timeout_seconds === 0 ? '0은 사용 안 함. 설정하면 이 시간 동안 사용되지 않은 세션이 만료됩니다.' : `약 ${Math.round(form.idle_timeout_seconds / 60)}분 동안 사용되지 않으면 만료됩니다. 300초 이상, SSO Session 이하로 설정하세요.`} />
           <Typography variant="h3">비밀번호 · 잠금 정책</Typography>
