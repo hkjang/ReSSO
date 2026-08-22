@@ -9,17 +9,32 @@ BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 # exists and ships a vendored Go package that must not be linted.
 GO_PACKAGES = ./cmd/... ./internal/... ./webui/...
 
-lint:
+# Every frontend target below needs node_modules. Without this a fresh clone
+# meets "vitest: not found" from `make test` — the command the README gives as
+# the way to check your work — instead of the install it was missing. CI runs
+# npm ci explicitly, so only people cloning the repository hit it. Make reruns
+# the install only when the lockfile moves.
+web/node_modules: web/package-lock.json web/package.json
+	cd web && npm ci
+	@touch $@
+
+# govulncheck reports on the standard library of whichever Go is on PATH, not
+# the one go.mod names, so it was describing the developer's machine rather
+# than the artifact. That reads as false alarms when the local toolchain is
+# older than the one that ships — and, worse, stays quiet when it is newer.
+# The image builds on the version in the toolchain directive and CI resolves
+# the same from go.mod; asking for it here makes all three agree.
+lint: web/node_modules
 	golangci-lint run $(GO_PACKAGES)
-	govulncheck $(GO_PACKAGES)
+	GOTOOLCHAIN=auto govulncheck $(GO_PACKAGES)
 	cd web && npm run lint
 
-test:
+test: web/node_modules
 	go test -race ./...
 	go vet ./...
 	cd web && npm run test && npm run build
 
-web:
+web: web/node_modules
 	cd web && npm run build
 
 build: web
