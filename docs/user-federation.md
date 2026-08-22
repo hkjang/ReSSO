@@ -2,6 +2,21 @@
 
 ReSSO의 User Federation은 Realm별로 여러 LDAP/Active Directory 공급자를 등록하고 우선순위 순서로 사용자를 인증합니다. 로컬 계정은 기존 방식으로 인증되며, LDAP에 연결된 사용자는 로컬 비밀번호로 우회하지 않습니다.
 
+## 개발 중 디렉터리 연동 테스트
+
+`internal/federation`은 실제 디렉터리와 대화하는 코드이므로 진짜 서버로 검증합니다. `RESSO_TEST_LDAP_URL`이 없으면 해당 테스트는 건너뜁니다.
+
+```bash
+docker run -d --name resso-test-ldap -p 127.0.0.1:13890:389 \
+  -e LDAP_ORGANISATION="ReSSO Test" -e LDAP_DOMAIN="example.test" \
+  -e LDAP_ADMIN_PASSWORD="adminpassword" osixia/openldap:1.5.0
+# 사용자 시딩은 CI 워크플로의 "Seed the test directory" 단계와 동일한 LDIF를 사용합니다.
+RESSO_TEST_LDAP_URL=ldap://127.0.0.1:13890 go test ./internal/federation/
+```
+
+CI는 같은 이미지를 서비스로 띄우고 같은 사용자를 시딩하므로, 로컬에서 통과한 것이 CI에서도 그대로 실행됩니다.
+
+
 ## 권장 구성 순서
 
 1. 관리 → User Federation에서 Realm을 선택합니다.
