@@ -112,8 +112,21 @@ func (n *Notifier) Wait(timeout time.Duration) {
 	}
 }
 
+// deliveryContext bounds one notification.
+//
+// It deliberately outlives cancellation of the base context. Shutdown cancels
+// that the instant the signal arrives, which meant a delivery already under
+// way was abandoned mid-request — the user had logged out, ReSSO had ended the
+// session, and the relying party was never told, leaving them signed in there.
+// Wait exists to give exactly these deliveries a bounded moment to finish, and
+// it was waiting on work that had already given up. The per-attempt timeout
+// still bounds this, and it matches the budget Wait allows.
+func (n *Notifier) deliveryContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(n.base), deliveryTimeout)
+}
+
 func (n *Notifier) deliver(revoked store.RevokedSession) {
-	ctx, cancel := context.WithTimeout(n.base, deliveryTimeout)
+	ctx, cancel := n.deliveryContext()
 	defer cancel()
 	realm, err := n.store.RealmByID(ctx, revoked.RealmID)
 	if err != nil {
@@ -172,6 +185,12 @@ func (n *Notifier) post(ctx context.Context, realmName, clientID, endpoint, toke
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
+			timer.Stop()
+			n.record(outcome)
+			return
+		case <-n.base.Done():
+			// Shutting down: the attempt in hand was allowed to finish, but
+			// waiting out a backoff would outlast the process.
 			timer.Stop()
 			n.record(outcome)
 			return

@@ -163,3 +163,58 @@ func TestPostStopsRetryingWhenTheContextEnds(t *testing.T) {
 		t.Fatal("delivery kept retrying after its context ended")
 	}
 }
+
+// A logout already on its way when the process is asked to stop must still
+// arrive. Shutdown cancels the base context immediately, and deriving the
+// request from it meant the delivery was abandoned mid-flight: the user had
+// logged out, ReSSO had ended the session, and the relying party kept them
+// signed in. Wait was written to give these a bounded moment and was waiting
+// on work that had already been cancelled.
+func TestDeliveryInFlightSurvivesShutdown(t *testing.T) {
+	var delivered atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		delivered.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	base, cancel := context.WithCancel(context.Background())
+	notifier := New(base, nil, nil, slog.New(slog.DiscardHandler), nil)
+	cancel() // the signal arrives while a notification is in hand
+
+	ctx, done := notifier.deliveryContext()
+	defer done()
+	notifier.post(ctx, "master", "rp", server.URL, "logout-token")
+
+	if got := delivered.Load(); got != 1 {
+		t.Errorf("deliveries that reached the relying party = %d, want 1", got)
+	}
+}
+
+// Finishing the attempt in hand is not the same as starting new ones. A
+// relying party that is down when the process is stopping must not hold the
+// shutdown open for the length of the backoff.
+func TestShutdownStopsFurtherRetries(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	base, cancel := context.WithCancel(context.Background())
+	notifier := New(base, nil, nil, slog.New(slog.DiscardHandler), nil)
+	cancel()
+
+	ctx, done := notifier.deliveryContext()
+	defer done()
+	started := time.Now()
+	notifier.post(ctx, "master", "rp", server.URL, "logout-token")
+
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("attempts during shutdown = %d, want 1", got)
+	}
+	if elapsed := time.Since(started); elapsed > retryBackoff[0] {
+		t.Errorf("shutdown waited out a backoff: %s", elapsed)
+	}
+}
