@@ -80,6 +80,56 @@ jobs:
         env:
           PGPASSWORD: integration-password
         run: psql -h 127.0.0.1 -U resso -d resso -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+      - name: Start a directory serving TLS
+        run: |
+          set -euo pipefail
+          certs="$RUNNER_TEMP/ldap-certs"
+          mkdir -p "$certs"
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 2 -nodes \
+            -keyout "$certs/ca.key" -out "$certs/ca.crt" -subj "/CN=ReSSO Test CA" \
+            -addext "basicConstraints=critical,CA:TRUE"
+          openssl req -newkey rsa:2048 -nodes -keyout "$certs/ldap.key" \
+            -out "$certs/ldap.csr" -subj "/CN=localhost"
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$certs/ext.cnf"
+          openssl x509 -req -in "$certs/ldap.csr" -CA "$certs/ca.crt" -CAkey "$certs/ca.key" \
+            -CAcreateserial -out "$certs/ldap.crt" -days 2 -sha256 -extfile "$certs/ext.cnf"
+          chmod 644 "$certs"/*.crt "$certs"/*.key
+          docker run -d --name resso-ldaps -p 127.0.0.1:1636:636 \
+            -e LDAP_ORGANISATION="ReSSO CI" -e LDAP_DOMAIN="example.test" \
+            -e LDAP_ADMIN_PASSWORD="adminpassword" -e LDAP_TLS_VERIFY_CLIENT="never" \
+            -v "$certs:/container/service/slapd/assets/certs" osixia/openldap:1.5.0
+          for attempt in $(seq 1 45); do
+            docker exec resso-ldaps ldapsearch -x -H ldap://localhost -b "dc=example,dc=test" \
+              -D "cn=admin,dc=example,dc=test" -w adminpassword -s base >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec -i resso-ldaps ldapadd -x -H ldap://localhost \
+            -D "cn=admin,dc=example,dc=test" -w adminpassword <<'LDIF'
+          dn: ou=people,dc=example,dc=test
+          objectClass: organizationalUnit
+          ou: people
+
+          dn: uid=alice,ou=people,dc=example,dc=test
+          objectClass: inetOrgPerson
+          uid: alice
+          cn: Alice Kim
+          sn: Kim
+          givenName: Alice
+          mail: alice@example.test
+          userPassword: alice-pass-1234
+          LDIF
+          # The TLS listener comes up a moment after plain LDAP answers, so this
+          # waits rather than asking once and calling it broken.
+          verified=""
+          for attempt in $(seq 1 30); do
+            if openssl s_client -connect 127.0.0.1:1636 -CAfile "$certs/ca.crt" </dev/null 2>&1 \
+                 | grep -q "Verify return code: 0"; then
+              verified=yes
+              break
+            fi
+            sleep 1
+          done
+          test -n "$verified" || { echo "the TLS directory never served a verifiable certificate" >&2; exit 1; }
       - name: Seed the test directory
         run: |
           set -euo pipefail
@@ -133,7 +183,10 @@ jobs:
         env:
           RESSO_TEST_POSTGRES_DSN: postgres://resso:integration-password@127.0.0.1:5432/resso?sslmode=disable
           RESSO_TEST_LDAP_URL: ldap://127.0.0.1:389
-        run: go test -race -coverprofile=coverage.out ./... && go tool cover -func=coverage.out && go vet ./...
+          RESSO_TEST_LDAPS_URL: ldaps://localhost:1636
+        run: |
+          export RESSO_TEST_LDAP_CA="$RUNNER_TEMP/ldap-certs/ca.crt"
+          go test -race -coverprofile=coverage.out ./... && go tool cover -func=coverage.out && go vet ./...
       - name: Build frontend
         working-directory: web
         run: npm ci && npm run test && npm run build

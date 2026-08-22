@@ -15,6 +15,8 @@ docker run -d --name resso-test-ldap -p 127.0.0.1:13890:389 \
 RESSO_TEST_LDAP_URL=ldap://127.0.0.1:13890 go test ./internal/federation/
 ```
 
+TLS 검증 테스트는 확인 가능한 인증서를 내주는 디렉터리가 따로 필요합니다. `RESSO_TEST_LDAPS_URL`과 `RESSO_TEST_LDAP_CA`가 없으면 건너뜁니다. 인증서 생성과 기동 절차는 CI 워크플로의 "Start a directory serving TLS" 단계와 같습니다.
+
 CI는 같은 이미지를 서비스로 띄우고 같은 사용자를 시딩하므로, 로컬에서 통과한 것이 CI에서도 그대로 실행됩니다.
 
 

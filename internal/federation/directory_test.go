@@ -216,3 +216,48 @@ func TestDirectoryPasswordChangeTakesEffect(t *testing.T) {
 		t.Errorf("the old password still worked: ok=%v err=%v", ok, err)
 	}
 }
+
+// LDAPS is where the bind credential and every user's password go, so what the
+// service accepts as a server certificate is the whole of the protection. A
+// configuration that trusts anything would look identical in every other
+// respect — it connects, it searches, it authenticates — which is why this is
+// worth asserting rather than reading.
+//
+// Set RESSO_TEST_LDAPS_URL and RESSO_TEST_LDAP_CA to run these.
+func TestDirectoryOverTLSRequiresACertificateItCanVerify(t *testing.T) {
+	secureURL := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAPS_URL"))
+	caPath := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_CA"))
+	if secureURL == "" || caPath == "" {
+		t.Skip("set RESSO_TEST_LDAPS_URL and RESSO_TEST_LDAP_CA to run the TLS tests")
+	}
+	authority, err := os.ReadFile(caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := directoryConfig(t)
+	config.Provider.ConnectionURL = secureURL
+
+	// Without the authority the certificate is signed by nobody this machine
+	// trusts, and the connection has to fail.
+	if err := TestConnection(context.Background(), config); err == nil {
+		t.Fatal("a certificate from an unknown authority was accepted")
+	}
+
+	// With it, the same server is reachable — so the refusal above is the
+	// verification working, not TLS being broken outright.
+	config.Provider.CACertificate = string(authority)
+	if err := TestConnection(context.Background(), config); err != nil {
+		t.Fatalf("a certificate signed by the configured authority was refused: %v", err)
+	}
+	if _, ok, err := Authenticate(context.Background(), config, "alice", "alice-pass-1234"); err != nil || !ok {
+		t.Errorf("authenticating over TLS failed: ok=%v err=%v", ok, err)
+	}
+
+	// A certificate authority that is not one is refused as configuration,
+	// rather than being ignored and leaving the connection unverified.
+	broken := config
+	broken.Provider.CACertificate = "-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n"
+	if err := TestConnection(context.Background(), broken); err == nil {
+		t.Error("an unparseable CA certificate was accepted")
+	}
+}
