@@ -2693,3 +2693,103 @@ func removeDirectoryEntry(t *testing.T, dn string) error {
 	defer func() { _ = connection.Close() }()
 	return connection.Del(ldap.NewDelRequest(dn, nil))
 }
+
+// What an administrator may do to a federated account depends on the edit
+// mode, and getting that wrong writes into a directory the service does not
+// own — or refuses a change the operator was told they could make. None of it
+// had been run: the READ_ONLY refusal, the WRITABLE write-through, or signing
+// in as a directory account at all.
+func TestIntegrationFederatedAccountsFollowTheEditMode(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	branch := "ou=sync-edit,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "editable")
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported, err := data.userByRealmUsername(ctx, bootstrap.RealmID, "editable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.FederationID == nil || imported.ExternalDN == nil {
+		t.Fatalf("the imported account was not linked to the directory: %+v", imported)
+	}
+
+	// Authenticate is the entry point the sign-in handler uses; it routes a
+	// linked account to the directory instead of to a local hash.
+	result, err := data.Authenticate(ctx, realm, "editable", "editable-pass-1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("a directory account could not sign in: %+v", result)
+	}
+	if wrong, err := data.Authenticate(ctx, realm, "editable", "not-the-password"); err != nil || wrong.Success {
+		t.Errorf("a wrong directory password was accepted: %+v err=%v", wrong, err)
+	}
+
+	// READ_ONLY means the directory is the record: an edit here is refused
+	// rather than quietly diverging from it.
+	if _, err := data.UpdateUser(ctx, imported.ID, UpdateUserInput{
+		Enabled: true, Email: "elsewhere@example.test", DisplayName: "Elsewhere"}); !errors.Is(err, ErrFederationReadOnly) {
+		t.Errorf("editing a READ_ONLY account returned %v, want ErrFederationReadOnly", err)
+	}
+	if err := data.ChangePassword(ctx, imported.ID, "editable-pass-1234", "another-pass-1234", false); !errors.Is(err, ErrFederationPasswordExternal) {
+		t.Errorf("changing a READ_ONLY password returned %v, want ErrFederationPasswordExternal", err)
+	}
+
+	// WRITABLE means the change is carried into the directory, which is the
+	// only way to tell it apart from a local edit that happens to stick.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET edit_mode='WRITABLE' WHERE id=$1`, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.UpdateUser(ctx, imported.ID, UpdateUserInput{
+		Enabled: true, Email: "moved@example.test", DisplayName: "Moved Person"}); err != nil {
+		t.Fatalf("editing a WRITABLE account failed: %v", err)
+	}
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	found, err := connection.Search(ldap.NewSearchRequest(*imported.ExternalDN, ldap.ScopeBaseObject,
+		ldap.NeverDerefAliases, 1, 5, false, "(objectClass=*)", []string{"mail", "cn"}, nil))
+	if err != nil || len(found.Entries) != 1 {
+		t.Fatalf("reading the entry back failed: %v", err)
+	}
+	if got := found.Entries[0].GetAttributeValue("mail"); got != "moved@example.test" {
+		t.Errorf("the directory still holds mail=%q", got)
+	}
+	if got := found.Entries[0].GetAttributeValue("cn"); got != "Moved Person" {
+		t.Errorf("the directory still holds cn=%q", got)
+	}
+
+	// And a password change reaches the directory too, which is what the
+	// person will actually sign in with next.
+	if err := data.ChangePassword(ctx, imported.ID, "editable-pass-1234", "changed-pass-5678", false); err != nil {
+		t.Fatalf("changing a WRITABLE password failed: %v", err)
+	}
+	if after, err := data.Authenticate(ctx, realm, "editable", "changed-pass-5678"); err != nil || !after.Success {
+		t.Errorf("the new directory password was refused: %+v err=%v", after, err)
+	}
+}
