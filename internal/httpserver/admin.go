@@ -706,7 +706,11 @@ func (s *Server) adminListKeys(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	// The threshold travels with the keys so the screen showing them and the
+	// dashboard counting them cannot disagree about the same key. The console
+	// used to carry its own copy of the number with a comment promising it
+	// matched, which is the kind of promise nothing enforces.
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "advisory_days": signingKeyAdvisoryDays})
 }
 
 func (s *Server) adminRotateKey(w http.ResponseWriter, r *http.Request) {

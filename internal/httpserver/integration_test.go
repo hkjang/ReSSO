@@ -1063,3 +1063,60 @@ func TestIntegrationLogMirrorFlushesOnShutdown(t *testing.T) {
 		t.Errorf("the written outcome was not reported: %s", exported.String())
 	}
 }
+
+// The keys screen and the dashboard both decide whether a signing key has aged
+// past the advisory. The console kept its own copy of the threshold with a
+// comment promising it matched the server's — a promise nothing enforced — so
+// the number now travels with the keys and the screen has nothing to copy.
+func TestIntegrationSigningKeyListCarriesTheAdvisoryThreshold(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Jar = jar
+	login := postIntegrationLogin(t, client, server.URL, "admin", "bootstrap-password-123")
+	_ = login.Body.Close()
+	if login.StatusCode != http.StatusOK {
+		t.Fatalf("login status = %d", login.StatusCode)
+	}
+
+	response, err := client.Get(server.URL + "/api/admin/v1/realms/" + realm.ID.String() + "/keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("keys status = %d", response.StatusCode)
+	}
+	var payload struct {
+		Items        []map[string]any `json:"items"`
+		AdvisoryDays int              `json:"advisory_days"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) == 0 {
+		t.Fatal("no signing keys were listed")
+	}
+	if payload.AdvisoryDays != signingKeyAdvisoryDays {
+		t.Errorf("advisory_days = %d, want %d — the screen would fall back to its own number",
+			payload.AdvisoryDays, signingKeyAdvisoryDays)
+	}
+}
