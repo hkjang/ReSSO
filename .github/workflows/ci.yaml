@@ -82,9 +82,13 @@ jobs:
         run: psql -h 127.0.0.1 -U resso -d resso -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
       - name: Seed the test directory
         run: |
-          docker exec "$(docker ps -q --filter ancestor=osixia/openldap:1.5.0)" \
-            ldapadd -x -H ldap://localhost -D "cn=admin,dc=example,dc=test" -w adminpassword \
-            -f /dev/stdin <<'LDIF'
+          set -euo pipefail
+          container="$(docker ps -q --filter ancestor=osixia/openldap:1.5.0)"
+          test -n "$container" || { echo "the directory service is not running" >&2; exit 1; }
+          # docker exec attaches no stdin without -i, so a heredoc reaches
+          # ldapadd as an empty stream: it adds nothing and still exits 0.
+          docker exec -i "$container" ldapadd -x -H ldap://localhost \
+            -D "cn=admin,dc=example,dc=test" -w adminpassword -f /dev/stdin <<'LDIF'
           dn: ou=people,dc=example,dc=test
           objectClass: organizationalUnit
           ou: people
@@ -107,6 +111,12 @@ jobs:
           mail: bob@example.test
           userPassword: bob-pass-1234
           LDIF
+          # Prove the entries are there rather than trusting an exit code, which
+          # is what let the silent no-op above through in the first place.
+          seeded="$(docker exec "$container" ldapsearch -x -H ldap://localhost \
+            -b "ou=people,dc=example,dc=test" -D "cn=admin,dc=example,dc=test" -w adminpassword \
+            "(objectClass=inetOrgPerson)" uid | grep -c '^uid:')"
+          test "$seeded" -eq 2 || { echo "seeded $seeded accounts, expected 2" >&2; exit 1; }
       - name: Test backend
         env:
           RESSO_TEST_POSTGRES_DSN: postgres://resso:integration-password@127.0.0.1:5432/resso?sslmode=disable
