@@ -51,6 +51,23 @@ func routePattern(r *http.Request) string {
 	return "unmatched"
 }
 
+// methodLabel bounds the request method as a metric label.
+//
+// The value arrives on the request line and any RFC 7230 token is accepted as
+// a method, so recording it as given let an unauthenticated caller create one
+// time series per request. The registry never reclaims a series and every one
+// is written on every scrape, so the cost lands twice: memory that only grows,
+// and a /metrics response that eventually becomes the operator's problem.
+// Methods this service does not serve are worth counting, but only together.
+func methodLabel(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodOptions:
+		return method
+	}
+	return "other"
+}
+
 func statusLabel(status int) string {
 	if status == 0 {
 		return "0"

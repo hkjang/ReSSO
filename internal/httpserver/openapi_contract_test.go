@@ -197,3 +197,23 @@ func collectRefs(node any) []string {
 	}
 	return nil
 }
+
+// The method label comes off the request line, and any RFC 7230 token is a
+// valid method. Recording it verbatim let an unauthenticated caller mint a new
+// time series per request: memory the registry never reclaims, and a /metrics
+// response that grows with it until the operator's own scrape is the problem.
+func TestMethodLabelIsBounded(t *testing.T) {
+	for _, method := range []string{
+		http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodOptions,
+	} {
+		if got := methodLabel(method); got != method {
+			t.Errorf("methodLabel(%q) = %q, want it unchanged", method, got)
+		}
+	}
+	for _, invented := range []string{"QUUX", "PROPFIND", "x", "", strings.Repeat("A", 64)} {
+		if got := methodLabel(invented); got != "other" {
+			t.Errorf("methodLabel(%q) = %q, want other", invented, got)
+		}
+	}
+}
