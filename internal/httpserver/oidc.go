@@ -194,6 +194,18 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		return nil
 	})
 	if err != nil {
+		// A replayed code is an incident, not a routine bad request: the
+		// store has already revoked what it could, and this is the only
+		// place an operator can learn it happened.
+		if errors.Is(err, store.ErrCodeReuse) {
+			// Whose code leaked is the first thing an operator needs, so the
+			// name is resolved here even though the grant is already lost.
+			affected, _ := s.store.UserByID(r.Context(), code.UserID)
+			s.audit(r, &realm.ID, &code.UserID, affected.Username, "AUTHORIZATION_CODE_REUSED", "FAILURE",
+				"client", client.ClientID, map[string]any{"session_id": code.SessionID.String()})
+			s.logger.Warn("authorization code replayed", "trace_id", traceIDFrom(r.Context()),
+				"realm", realm.Name, "client", client.ClientID)
+		}
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code is invalid or expired")
 		return
 	}

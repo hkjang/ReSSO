@@ -109,27 +109,62 @@ func (s *Store) CreateAuthorizationCode(ctx context.Context, code AuthorizationC
 	return raw, nil
 }
 
-func scanAuthorizationCode(row pgx.Row) (AuthorizationCode, error) {
+func scanAuthorizationCodeWithState(row pgx.Row, consumed *bool) (AuthorizationCode, error) {
 	var code AuthorizationCode
 	err := row.Scan(&code.ID, &code.RealmID, &code.ClientID, &code.UserID, &code.SessionID,
-		&code.RedirectURI, &code.Scope, &code.Nonce, &code.CodeChallenge, &code.CodeChallengeMethod, &code.ExpiresAt)
+		&code.RedirectURI, &code.Scope, &code.Nonce, &code.CodeChallenge, &code.CodeChallengeMethod,
+		&code.ExpiresAt, consumed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuthorizationCode{}, ErrNotFound
 	}
 	return code, err
 }
 
+// ErrCodeReuse reports that an authorization code was presented twice. Only
+// one of the two callers can have been the relying party, and the server has
+// no way to tell which, so the caller should treat it as a leaked code.
+var ErrCodeReuse = errors.New("authorization code reuse detected")
+
+// RedeemAuthorizationCode consumes a code exactly once.
+//
+// A second presentation is not merely rejected. Redeeming a code is the step
+// that turns a value carried through a browser redirect into tokens, so a code
+// arriving twice means it leaked — through a referrer header, a shared device,
+// or a mis-registered redirect target — and one of the two callers holds
+// tokens it should not. Because the legitimate relying party cannot be
+// identified after the fact, every refresh token this code could have produced
+// is revoked, mirroring how a replayed refresh token takes down its family.
+// Access tokens already minted stay valid until they expire; the refresh
+// tokens are what would have made the compromise durable.
 func (s *Store) RedeemAuthorizationCode(ctx context.Context, raw string, validate func(AuthorizationCode) error) (AuthorizationCode, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return AuthorizationCode{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	code, err := scanAuthorizationCode(tx.QueryRow(ctx, `SELECT id,realm_id,client_id,user_id,session_id,
-		redirect_uri,scope,nonce,code_challenge,code_challenge_method,expires_at FROM authorization_codes
-		WHERE code_hash=ANY($1::bytea[]) AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`, s.Sealer.Digests(raw)))
+	var consumed bool
+	code, err := scanAuthorizationCodeWithState(tx.QueryRow(ctx, `SELECT id,realm_id,client_id,user_id,session_id,
+		redirect_uri,scope,nonce,code_challenge,code_challenge_method,expires_at,consumed_at IS NOT NULL
+		FROM authorization_codes WHERE code_hash=ANY($1::bytea[]) FOR UPDATE`, s.Sealer.Digests(raw)), &consumed)
 	if err != nil {
 		return AuthorizationCode{}, err
+	}
+	if consumed {
+		// Scoped to the session and client this code was issued for, so one
+		// relying party's incident does not sign the user out of the others.
+		if _, err := tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
+			WHERE session_id=$1 AND client_id=$2 AND revoked_at IS NULL`, code.SessionID, code.ClientID); err != nil {
+			return AuthorizationCode{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return AuthorizationCode{}, err
+		}
+		return code, ErrCodeReuse
+	}
+	// An expired code produced nothing, so there is nothing to revoke and it
+	// is indistinguishable from a code that never existed.
+	if !code.ExpiresAt.After(time.Now()) {
+		return AuthorizationCode{}, ErrNotFound
 	}
 	if err := validate(code); err != nil {
 		return AuthorizationCode{}, err

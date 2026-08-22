@@ -120,7 +120,9 @@ func TestIntegrationAuthorizationCodeCanBeRedeemedOnlyOnce(t *testing.T) {
 		switch {
 		case redeemErr == nil:
 			successes++
-		case errors.Is(redeemErr, ErrNotFound):
+		// Losers of the race see the code already consumed, which is the
+		// same signal a replay attempt produces.
+		case errors.Is(redeemErr, ErrNotFound), errors.Is(redeemErr, ErrCodeReuse):
 		default:
 			t.Fatalf("unexpected redemption error: %v", redeemErr)
 		}
@@ -1625,5 +1627,66 @@ func TestIntegrationConcurrentLDAPSyncClaimAdmitsOne(t *testing.T) {
 	// Two full walks of a directory would interleave writes to the same users.
 	if winners != 1 {
 		t.Fatalf("%d racers claimed the synchronization, want exactly 1", winners)
+	}
+}
+
+// A replayed authorization code means the code leaked: one of the two
+// redemptions was not the relying party. The server cannot tell which, so the
+// tokens the first redemption produced have to go, exactly as a replayed
+// refresh token takes down its family.
+func TestIntegrationAuthorizationCodeReuseRevokesIssuedRefreshTokens(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		time.Hour, "127.0.0.1", "integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := data.CreateAuthorizationCode(ctx, AuthorizationCode{
+		RealmID: bootstrap.RealmID, ClientID: clientID, UserID: bootstrap.AdminUserID,
+		SessionID: session.Session.ID, RedirectURI: "https://client.example.test/callback", Scope: []string{"openid"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := data.RedeemAuthorizationCode(ctx, raw, func(AuthorizationCode) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	issued, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: code.RealmID, ClientID: code.ClientID,
+		UserID: &userID, SessionID: &code.SessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := data.RedeemAuthorizationCode(ctx, raw, func(AuthorizationCode) error { return nil }); !errors.Is(err, ErrCodeReuse) {
+		t.Fatalf("replayed code error = %v, want ErrCodeReuse", err)
+	}
+
+	inspected, active, err := data.InspectRefreshToken(ctx, issued)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		t.Errorf("refresh token issued from a replayed code is still active: %+v", inspected)
+	}
+	var revoked bool
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT revoked_at IS NOT NULL FROM refresh_tokens WHERE session_id=$1 AND client_id=$2`,
+		session.Session.ID, clientID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Error("refresh token from the replayed code was left usable")
+	}
+
+	// An unknown code is still just an unknown code: reuse detection must not
+	// turn a stray request into a revocation signal.
+	if _, err := data.RedeemAuthorizationCode(ctx, "not-a-real-code", func(AuthorizationCode) error { return nil }); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown code error = %v, want ErrNotFound", err)
 	}
 }
