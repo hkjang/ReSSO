@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hkjang/ReSSO/internal/cryptoutil"
+	"github.com/hkjang/ReSSO/internal/domain"
 	ressooidc "github.com/hkjang/ReSSO/internal/oidc"
 	"github.com/hkjang/ReSSO/internal/store"
 )
@@ -895,4 +896,138 @@ func TestIntegrationMaxAgeForcesReauthentication(t *testing.T) {
 	if malformed.Query().Get("error") != "invalid_request" {
 		t.Errorf("malformed max_age returned %q", malformed.Query().Get("error"))
 	}
+}
+
+// A relying party sends request objects to protect the parameters inside them,
+// and id_token_hint to name the account it believes it is renewing. Accepting
+// either and acting on neither is a silent downgrade: the first honours the
+// unsigned query string instead, the second can hand back a code for whoever
+// happens to be signed in now.
+func TestIntegrationAuthorizationRefusesUnsupportedAndMismatchedHints(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "hint-probe", Name: "Hint Probe", Type: "public",
+		RedirectURIs: []string{"https://hint.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "hint-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ID tokens are signed, and the key is created lazily on first use.
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	verifier := strings.Repeat("hint-probe-verifier", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	authorize := func(extra string) *url.URL {
+		t.Helper()
+		target := server.URL + "/realms/master/protocol/openid-connect/auth?response_type=code&client_id=hint-probe" +
+			"&redirect_uri=" + url.QueryEscape("https://hint.example.test/cb") + "&scope=openid&state=s" +
+			"&code_challenge=" + challenge + "&code_challenge_method=S256" + extra
+		request, reqErr := http.NewRequest(http.MethodGet, target, nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		location, parseErr := url.Parse(response.Header.Get("Location"))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		return location
+	}
+
+	for parameter, expected := range map[string]string{
+		"&request=eyJhbGciOiJub25lIn0.e30.":               "request_not_supported",
+		"&request_uri=https%3A%2F%2Fattacker.example%2Fr": "request_uri_not_supported",
+	} {
+		if got := authorize(parameter).Query().Get("error"); got != expected {
+			t.Errorf("%s returned %q, want %q", parameter, got, expected)
+		}
+	}
+
+	// A hint naming somebody else must not be answered with a code for the
+	// person who is actually signed in.
+	hint := issueIntegrationIDToken(t, data, realm, "hint-probe", "someone-else")
+	mismatch := authorize("&prompt=none&id_token_hint=" + url.QueryEscape(hint))
+	if got := mismatch.Query().Get("error"); got != "login_required" {
+		t.Errorf("a mismatched id_token_hint returned %q, want login_required", got)
+	}
+	if mismatch.Query().Get("code") != "" {
+		t.Error("a mismatched id_token_hint was answered with a code")
+	}
+
+	// The hint for the account that is signed in is satisfied silently.
+	admin, err := data.UserByID(ctx, bootstrap.AdminUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matching := issueIntegrationIDTokenFor(t, data, realm, "hint-probe", admin, session.Session.ID)
+	if got := authorize("&prompt=none&id_token_hint=" + url.QueryEscape(matching)); got.Query().Get("code") == "" {
+		t.Errorf("a matching id_token_hint was refused: %s", got)
+	}
+
+	// Something that is not a token this issuer signed is refused outright.
+	if got := authorize("&id_token_hint=not-a-jwt").Query().Get("error"); got != "invalid_request" {
+		t.Errorf("a malformed id_token_hint returned %q", got)
+	}
+}
+
+// issueIntegrationIDToken mints a real ID token for a freshly created account,
+// which is how a hint naming a different person is produced without forging
+// anything the server would refuse for the wrong reason.
+func issueIntegrationIDToken(t *testing.T, data *store.Store, realm domain.Realm, clientID, username string) string {
+	t.Helper()
+	ctx := context.Background()
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: username, Password: username + "-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatalf("create hint user: %v", err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "hint-test", "password")
+	if err != nil {
+		t.Fatalf("create hint session: %v", err)
+	}
+	return issueIntegrationIDTokenFor(t, data, realm, clientID, user, session.Session.ID)
+}
+
+func issueIntegrationIDTokenFor(t *testing.T, data *store.Store, realm domain.Realm,
+	clientID string, user domain.User, sessionID uuid.UUID) string {
+	t.Helper()
+	ctx := context.Background()
+	client, err := data.ClientByIdentifier(ctx, realm.ID, clientID)
+	if err != nil {
+		t.Fatalf("load hint client %q: %v", clientID, err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, client, user, sessionID, []string{"openid"}, "", false)
+	if err != nil {
+		t.Fatalf("issue hint tokens: %v", err)
+	}
+	if tokens.IDToken == "" {
+		t.Fatal("no ID token was issued")
+	}
+	return tokens.IDToken
 }

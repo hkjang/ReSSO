@@ -106,6 +106,19 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "unsupported_response_mode", "only query response mode is supported")
 		return
 	}
+	// Discovery says these are unsupported, and saying so again here is what
+	// makes that true. A signed request object exists to protect the
+	// parameters inside it; ignoring one and honouring the plain query string
+	// instead is a silent downgrade of exactly the protection the relying
+	// party asked for. The specification names both errors for this case.
+	if query.Get("request") != "" {
+		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "request_not_supported", "request objects are not supported")
+		return
+	}
+	if query.Get("request_uri") != "" {
+		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "request_uri_not_supported", "request_uri is not supported")
+		return
+	}
 	scopes, err := validatedScopes(query.Get("scope"), client.DefaultScopes, true)
 	if err != nil {
 		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "invalid_scope", err.Error())
@@ -133,19 +146,35 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 		}
 		maxAge = parsed
 	}
+	// id_token_hint names the account the relying party believes it is
+	// renewing. Ignoring it meant a silent renewal could come back with a code
+	// for whoever happens to be signed in now — a different person than the
+	// one the relying party asked about, handed over without a word.
+	hintedSubject := ""
+	if hint := query.Get("id_token_hint"); hint != "" {
+		subject, hintErr := s.oidc.SubjectFromIDTokenHint(r.Context(), realm, hint)
+		if hintErr != nil {
+			redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "invalid_request", "id_token_hint is not a token this issuer signed")
+			return
+		}
+		hintedSubject = subject
+	}
 	prompt := query.Get("prompt")
 	if prompt != "login" {
 		if authenticated, sessionErr := s.store.SessionByToken(r.Context(), sessionCookie(r)); sessionErr == nil && authenticated.User.RealmID == realm.ID {
-			recentEnough := true
-			if maxAge >= 0 {
+			// The existing session may be reused only if it belongs to the
+			// account the relying party named and authenticated recently
+			// enough for what it asked.
+			reusable := hintedSubject == "" || hintedSubject == authenticated.User.ID.String()
+			if reusable && maxAge >= 0 {
 				authTime, authErr := s.store.SessionAuthTime(r.Context(), authenticated.Session.ID)
 				if authErr != nil {
 					redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authentication time is unavailable")
 					return
 				}
-				recentEnough = time.Since(authTime) <= time.Duration(maxAge)*time.Second
+				reusable = time.Since(authTime) <= time.Duration(maxAge)*time.Second
 			}
-			if recentEnough {
+			if reusable {
 				code, codeErr := s.store.CreateAuthorizationCode(r.Context(), store.AuthorizationCode{
 					RealmID: realm.ID, ClientID: client.ID, UserID: authenticated.User.ID, SessionID: authenticated.Session.ID,
 					RedirectURI: redirectURI, Scope: scopes, Nonce: query.Get("nonce"), CodeChallenge: challenge,
