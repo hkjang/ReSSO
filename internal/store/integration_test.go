@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	ldap "github.com/go-ldap/ldap/v3"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -2446,5 +2447,217 @@ func TestIntegrationLockAndKeyStateComeFromTheServer(t *testing.T) {
 	}
 	if keys[0].Active {
 		t.Error("a revoked key was still listed as active")
+	}
+}
+
+// The DISABLE policy deactivates the accounts a sync did not see and ends
+// their sessions. It is the most consequential thing this service does on its
+// own, and until a real directory could be pointed at it there was no way to
+// run it end to end — the guard against an empty read was tested by calling
+// the sweep directly, not by synchronising anything.
+//
+// Set RESSO_TEST_LDAP_URL alongside the database DSN to run this.
+func TestIntegrationFederationSyncImportsThenDisablesOnlyWhatLeft(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "DISABLE",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := data.SyncLDAPFederation(ctx, provider.ID)
+	if err != nil {
+		t.Fatalf("synchronising a reachable directory failed: %v (%+v)", err, summary)
+	}
+	if summary.Read < 2 || summary.Failed != 0 {
+		t.Fatalf("first sync summary = %+v", summary)
+	}
+	enabled := func(username string) (bool, bool) {
+		t.Helper()
+		var isEnabled bool
+		err := data.Pool.QueryRow(ctx,
+			`SELECT enabled FROM users WHERE realm_id=$1 AND username=$2 AND federation_id=$3`,
+			bootstrap.RealmID, username, provider.ID).Scan(&isEnabled)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return isEnabled, true
+	}
+	for _, username := range []string{"alice", "bob"} {
+		if isEnabled, found := enabled(username); !found || !isEnabled {
+			t.Fatalf("%s was not imported as an enabled account (found=%v)", username, found)
+		}
+	}
+	// Attributes come across, not just the username.
+	var email string
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT email FROM users WHERE realm_id=$1 AND username='alice'`, bootstrap.RealmID).Scan(&email); err != nil {
+		t.Fatal(err)
+	}
+	if email != "alice@example.test" {
+		t.Errorf("imported email = %q", email)
+	}
+
+	// Somebody leaves the directory. Only that account may be deactivated.
+	if err := removeDirectoryEntry(t, "uid=bob,ou=people,dc=example,dc=test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { restoreDirectoryBob(t) })
+	summary, err = data.SyncLDAPFederation(ctx, provider.ID)
+	if err != nil {
+		t.Fatalf("second sync failed: %v (%+v)", err, summary)
+	}
+	if summary.Disabled != 1 {
+		t.Errorf("accounts disabled = %d, want 1", summary.Disabled)
+	}
+	if isEnabled, _ := enabled("bob"); isEnabled {
+		t.Error("an account the directory no longer lists stayed enabled")
+	}
+	if isEnabled, _ := enabled("alice"); !isEnabled {
+		t.Error("an account still in the directory was deactivated")
+	}
+}
+
+// A directory that answers with nothing looks the same whether everybody left
+// or the search was pointed somewhere wrong, and under the DISABLE policy the
+// second reading would deactivate every federated account in the Realm. The
+// guard against that was previously exercised by calling the sweep directly;
+// this runs a whole synchronisation against a real, empty branch.
+func TestIntegrationFederationSyncRefusesToActOnAnEmptyDirectory(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "DISABLE",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	var imported int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM users WHERE federation_id=$1 AND enabled=true`, provider.ID).Scan(&imported); err != nil {
+		t.Fatal(err)
+	}
+	if imported < 2 {
+		t.Fatalf("imported %d accounts, expected the directory's users", imported)
+	}
+
+	// The search now points at a branch that exists and holds nobody, which is
+	// what a mistyped base or a lost read permission looks like.
+	emptyBranch := "ou=nobody,dc=example,dc=test"
+	createEmptyDirectoryBranch(t, emptyBranch)
+	t.Cleanup(func() { _ = removeDirectoryEntry(t, emptyBranch) })
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET users_dn=$2 WHERE id=$1`, provider.ID, emptyBranch); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := data.SyncLDAPFederation(ctx, provider.ID)
+	if !errors.Is(err, ErrSyncReadNothing) {
+		t.Fatalf("an empty directory returned %v, want ErrSyncReadNothing", err)
+	}
+	if summary.Disabled != 0 {
+		t.Errorf("an empty read disabled %d accounts", summary.Disabled)
+	}
+	var stillEnabled int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM users WHERE federation_id=$1 AND enabled=true`, provider.ID).Scan(&stillEnabled); err != nil {
+		t.Fatal(err)
+	}
+	if stillEnabled != imported {
+		t.Errorf("enabled accounts went from %d to %d on an empty read", imported, stillEnabled)
+	}
+	// The operator has to be able to see why, so the run is recorded as failed.
+	var status, message string
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT last_sync_status,last_sync_error FROM user_federations WHERE id=$1`, provider.ID).Scan(&status, &message); err != nil {
+		t.Fatal(err)
+	}
+	if status != "FAILURE" || message == "" {
+		t.Errorf("the run was recorded as %q with message %q", status, message)
+	}
+}
+
+func createEmptyDirectoryBranch(t *testing.T, dn string) {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	request := ldap.NewAddRequest(dn, nil)
+	request.Attribute("objectClass", []string{"organizationalUnit"})
+	request.Attribute("ou", []string{"nobody"})
+	if err := connection.Add(request); err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
+		t.Fatal(err)
+	}
+}
+
+// The directory is modified through the same library the service uses, so the
+// test needs no command-line tools on whatever machine it runs on.
+func directoryConnection(t *testing.T) *ldap.Conn {
+	t.Helper()
+	connection, err := ldap.DialURL(strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.Bind("cn=admin,dc=example,dc=test", "adminpassword"); err != nil {
+		_ = connection.Close()
+		t.Fatal(err)
+	}
+	return connection
+}
+
+func removeDirectoryEntry(t *testing.T, dn string) error {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	return connection.Del(ldap.NewDelRequest(dn, nil))
+}
+
+// restoreDirectoryBob puts the entry back so the directory is left as the
+// other tests in this package expect to find it.
+func restoreDirectoryBob(t *testing.T) {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	request := ldap.NewAddRequest("uid=bob,ou=people,dc=example,dc=test", nil)
+	request.Attribute("objectClass", []string{"inetOrgPerson"})
+	request.Attribute("uid", []string{"bob"})
+	request.Attribute("cn", []string{"Bob Lee"})
+	request.Attribute("sn", []string{"Lee"})
+	request.Attribute("givenName", []string{"Bob"})
+	request.Attribute("mail", []string{"bob@example.test"})
+	request.Attribute("userPassword", []string{"bob-pass-1234"})
+	if err := connection.Add(request); err != nil {
+		t.Logf("restoring the directory entry failed: %v", err)
 	}
 }
