@@ -2009,3 +2009,101 @@ func TestIntegrationLockedAccountStillVerifiesThePassword(t *testing.T) {
 		t.Errorf("the lockout moved: %v then %v", locked.LockedUntil, after.LockedUntil)
 	}
 }
+
+// Which relying parties took part in a session is not recorded anywhere; it is
+// inferred from the refresh tokens and authorization codes still on file. A
+// client that does not use refresh tokens leaves only the code, and the code is
+// swept a day after it expires — so for any session outliving that, back-channel
+// logout quietly stops reaching it. The Realm session lifetime goes to 30 days.
+func TestIntegrationBackchannelTargetsSurvivePruning(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	created, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "no-refresh", Name: "No Refresh", Type: "confidential",
+		RedirectURIs: []string{"https://no-refresh.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"},
+		BackchannelLogoutURI: "https://no-refresh.example.test/backchannel-logout"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		20*24*time.Hour, "127.0.0.1", "prune-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateAuthorizationCode(ctx, AuthorizationCode{
+		RealmID: bootstrap.RealmID, ClientID: created.Client.ID, UserID: bootstrap.AdminUserID,
+		SessionID: session.Session.ID, RedirectURI: "https://no-refresh.example.test/cb",
+		Scope: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := data.BackchannelLogoutTargets(ctx, bootstrap.RealmID, session.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("targets before pruning = %d, want 1", len(targets))
+	}
+
+	// Age the code past the sweep and run the real maintenance pass.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE authorization_codes SET expires_at=now()-interval '3 days' WHERE session_id=$1`,
+		session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.PruneOperationalData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	targets, err = data.BackchannelLogoutTargets(ctx, bootstrap.RealmID, session.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 {
+		t.Errorf("a live session lost its logout target to pruning: %d targets", len(targets))
+	}
+
+	// Retention is one row per client, not every code the session ever used,
+	// so a client that keeps returning to the authorization endpoint cannot
+	// make the table grow without bound.
+	for range 4 {
+		if _, err := data.CreateAuthorizationCode(ctx, AuthorizationCode{
+			RealmID: bootstrap.RealmID, ClientID: created.Client.ID, UserID: bootstrap.AdminUserID,
+			SessionID: session.Session.ID, RedirectURI: "https://no-refresh.example.test/cb",
+			Scope: []string{"openid"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE authorization_codes SET expires_at=expires_at-interval '3 days' WHERE session_id=$1`,
+		session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.PruneOperationalData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var kept int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM authorization_codes WHERE session_id=$1`, session.Session.ID).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 1 {
+		t.Errorf("kept %d codes for one client, want 1", kept)
+	}
+
+	// Once the session is over there is nobody left to notify, so the record
+	// goes with it rather than lingering.
+	if err := data.RevokeSession(ctx, session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.PruneOperationalData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM authorization_codes WHERE session_id=$1`, session.Session.ID).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 0 {
+		t.Errorf("an ended session left %d codes behind", kept)
+	}
+}

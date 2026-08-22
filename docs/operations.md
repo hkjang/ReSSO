@@ -81,6 +81,7 @@ ReSSO는 확장을 직접 설치하지 않습니다. 확장 설치는 데이터�
 - 전달은 Best effort이며 사용자의 로그아웃 응답을 지연시키지 않습니다. 저절로 해소될 수 있는 실패(연결 실패, 5xx, 429)만 2초·8초 간격으로 재시도하고, RP가 명시적으로 거절한 4xx는 반복하지 않습니다. 종료 중에는 즉시 중단합니다.
 - RP는 `logout_token`을 Realm JWKS로 검증하고 `iss`, `aud`, `events`, `sid`를 확인해야 합니다.
 - 실패는 서버 로그와 `resso_backchannel_logout_total`에 기록됩니다.
+- 통지 대상은 해당 Session에 실제로 참여한 Client입니다. 참여 기록은 Session이 살아 있는 동안 유지되며 Session이 끝나면 정리됩니다.
 
 ## Token과 Session 수명
 
