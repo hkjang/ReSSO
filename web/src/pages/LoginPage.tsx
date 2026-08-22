@@ -8,6 +8,7 @@ import { Alert, Box, Button, CircularProgress, IconButton, InputAdornment, Link,
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { api, APIError, jsonBody } from '../lib/api'
 import { useAuth } from '../lib/auth-context'
+import { useDocumentTitle } from '../lib/documentTitle'
 
 function formatWait(seconds: number): string {
   if (seconds >= 60) {
@@ -38,6 +39,7 @@ export function LoginPage() {
   // lockout policy without the server having to disclose whether an account
   // exists or is currently locked.
   const [failures, setFailures] = useState(0)
+  useDocumentTitle('로그인')
   const [waitSeconds, setWaitSeconds] = useState(0)
   const [lockedOut, setLockedOut] = useState(false)
   const challenge = useQuery({
