@@ -170,7 +170,7 @@ scrape_configs:
 | `resso_http_requests_total` | Route 패턴·Method·Status별 요청 수 |
 | `resso_http_request_duration_seconds` | Route 패턴별 요청 지연 Histogram |
 | `resso_tokens_issued_total` | Grant type별 Token 발급 수 |
-| `resso_login_attempts_total` | 로그인 성공·실패·Rate limit 수 |
+| `resso_login_attempts_total` | 로그인 성공·실패·Rate limit·처리 실패 수 |
 | `resso_client_auth_failures_total` | Realm별 OIDC Client 인증 실패 수 |
 | `resso_backchannel_logout_total` | Back-Channel Logout 전달 결과 |
 | `resso_federation_sync_total` | 주기 LDAP 동기화 성공·실패 수 |

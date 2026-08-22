@@ -1120,3 +1120,59 @@ func TestIntegrationSigningKeyListCarriesTheAdvisoryThreshold(t *testing.T) {
 			payload.AdvisoryDays, signingKeyAdvisoryDays)
 	}
 }
+
+// An attempt that cannot be completed is neither a success nor a rejected
+// credential. Counting it as neither meant a directory outage — where every
+// attempt fails before either outcome — showed up as the login series going
+// quiet, and quiet is what a working night looks like.
+func TestIntegrationLoginErrorsAreCounted(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A linked account whose directory does not answer: the attempt cannot be
+	// completed, rather than being right or wrong.
+	provider, err := data.CreateLDAPFederation(ctx, realm.ID, store.LDAPFederationInput{
+		Name: "gone", Vendor: "OTHER", ConnectionURL: "ldap://127.0.0.1:1",
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "linked", Password: "linked-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dn := "uid=linked,ou=people,dc=example,dc=test"
+	external := "linked-external"
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE users SET federation_id=$2,external_id=$3,external_dn=$4 WHERE id=$1`,
+		linked.ID, provider.ID, external, dn); err != nil {
+		t.Fatal(err)
+	}
+
+	metrics := observability.NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	response := postIntegrationLogin(t, server.Client(), server.URL, "linked", "linked-password-1234")
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("an unreachable directory answered %d", response.StatusCode)
+	}
+	var exported strings.Builder
+	metrics.WritePrometheus(&exported)
+	if !strings.Contains(exported.String(), `resso_login_attempts_total{result="error"} 1`) {
+		t.Errorf("the attempt was not counted as an error:\n%s", exported.String())
+	}
+}

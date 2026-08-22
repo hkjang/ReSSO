@@ -2891,3 +2891,80 @@ func removeDirectoryGroupMember(t *testing.T, groupDN, memberDN string) {
 	}
 	_ = memberDN
 }
+
+// A directory that cannot be reached must not be mistaken for a wrong
+// password. Counting those attempts would mean an outage locks people out of
+// their own accounts, and the lockout would outlast the outage — everybody
+// affected would still be barred once the directory came back.
+func TestIntegrationDirectoryOutageDoesNotCountAsAFailedPassword(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE realms SET max_login_attempts=3, lockout_seconds=600 WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "ou=sync-outage,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "onleave")
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := data.Authenticate(ctx, realm, "onleave", "onleave-pass-1234"); err != nil || !result.Success {
+		t.Fatalf("the account could not sign in before the outage: %+v err=%v", result, err)
+	}
+
+	// The directory goes away.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET connection_url='ldap://127.0.0.1:1' WHERE id=$1`, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		result, err := data.Authenticate(ctx, realm, "onleave", "onleave-pass-1234")
+		if err == nil {
+			t.Fatalf("an unreachable directory was answered with %+v rather than an error", result)
+		}
+	}
+	var attempts int
+	var locked *time.Time
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT failed_attempts,locked_until FROM users WHERE realm_id=$1 AND username='onleave'`,
+		bootstrap.RealmID).Scan(&attempts, &locked); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Errorf("an outage counted %d failed attempts", attempts)
+	}
+	if locked != nil {
+		t.Error("an outage locked the account, which would outlast the outage itself")
+	}
+
+	// And once the directory is back, the same password works.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET connection_url=$2 WHERE id=$1`, provider.ID, directory); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := data.Authenticate(ctx, realm, "onleave", "onleave-pass-1234"); err != nil || !result.Success {
+		t.Errorf("the account could not sign in after the outage: %+v err=%v", result, err)
+	}
+}
