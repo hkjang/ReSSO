@@ -2164,3 +2164,62 @@ func TestIntegrationRollbackLeavesAConcurrentRefreshAlone(t *testing.T) {
 		t.Error("the predecessor was revived while a live successor exists")
 	}
 }
+
+// Idle expiry is meant to end sessions nobody is using. Only the browser
+// console recorded use, so a session driven entirely through OIDC — a relying
+// party refreshing tokens for someone who is working in it all afternoon —
+// looked idle from the moment they signed in, and was cut off mid-work.
+func TestIntegrationOIDCUseKeepsASessionFromGoingIdle(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE realms SET idle_timeout_seconds=600 WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		8*time.Hour, "127.0.0.1", "idle-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(8 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lastAccess := func() time.Time {
+		t.Helper()
+		var value time.Time
+		if err := data.Pool.QueryRow(ctx,
+			`SELECT last_access FROM sso_sessions WHERE id=$1`, sessionID).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	// Five minutes of working through the relying party, inside the timeout.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE sso_sessions SET last_access=now()-interval '5 minutes' WHERE id=$1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	before := lastAccess()
+	if _, _, err := data.RotateRefreshToken(ctx, raw, nil); err != nil {
+		t.Fatalf("refresh inside the idle window failed: %v", err)
+	}
+	if after := lastAccess(); !after.After(before) {
+		t.Errorf("a token refresh did not count as using the session: %s", after)
+	}
+
+	// Genuinely idle past the timeout still expires, which is the point.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE sso_sessions SET last_access=now()-interval '20 minutes' WHERE id=$1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.ValidateActiveSessionBinding(ctx, sessionID, userID, bootstrap.RealmID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("an idle session stayed usable: %v", err)
+	}
+}

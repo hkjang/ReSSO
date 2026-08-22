@@ -55,6 +55,21 @@ type AuthenticatedSession struct {
 	RealmAdmin bool
 }
 
+// touchSession records that a session was used.
+//
+// Idle expiry ends sessions nobody is using, so every path that enforces it
+// has to be a path that also renews it. Only the browser console did, which
+// meant a session driven entirely through OIDC — a relying party refreshing
+// tokens for somebody working in it all day — looked idle from the moment they
+// signed in. The write is skipped while the timestamp is fresh, because
+// otherwise every token verification would write a row; the staleness test is
+// part of the statement so it costs nothing and asks the same clock that
+// decides whether the session is live at all.
+func (s *Store) touchSession(ctx context.Context, id uuid.UUID) {
+	_, _ = s.Pool.Exec(ctx, `UPDATE sso_sessions SET last_access=now()
+        WHERE id=$1 AND last_access < now()-interval '1 minute'`, id)
+}
+
 func (s *Store) SessionByToken(ctx context.Context, rawToken string) (AuthenticatedSession, error) {
 	if rawToken == "" {
 		return AuthenticatedSession{}, ErrNotFound
@@ -83,9 +98,7 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 	if err != nil {
 		return AuthenticatedSession{}, err
 	}
-	if time.Since(result.Session.LastAccess) > time.Minute {
-		_, _ = s.Pool.Exec(ctx, "UPDATE sso_sessions SET last_access=now() WHERE id=$1", result.Session.ID)
-	}
+	s.touchSession(ctx, result.Session.ID)
 	return result, nil
 }
 
@@ -118,6 +131,9 @@ func (s *Store) SessionAuthTime(ctx context.Context, id uuid.UUID) (time.Time, e
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, ErrNotFound
 	}
+	if err == nil {
+		s.touchSession(ctx, id)
+	}
 	return authTime, err
 }
 
@@ -140,6 +156,7 @@ func (s *Store) ValidateActiveSessionBinding(ctx context.Context, sessionID, use
 	if !valid {
 		return ErrNotFound
 	}
+	s.touchSession(ctx, sessionID)
 	return nil
 }
 

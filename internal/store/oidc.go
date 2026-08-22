@@ -268,6 +268,13 @@ func (s *Store) RotateRefreshToken(ctx context.Context, raw string, reducedScope
 			old.SessionID).Scan(&sessionActive); err != nil || !sessionActive {
 			return RefreshToken{}, "", ErrNotFound
 		}
+		// Refreshing a token is somebody working in a relying party, which is
+		// the clearest possible evidence the session is not idle. Done in the
+		// transaction so it lands with the rotation or not at all.
+		if _, err := tx.Exec(ctx, `UPDATE sso_sessions SET last_access=now()
+            WHERE id=$1 AND last_access < now()-interval '1 minute'`, old.SessionID); err != nil {
+			return RefreshToken{}, "", err
+		}
 	}
 	// COALESCE keeps the first rotation timestamp so the grace window is fixed
 	// from the original rotation and cannot be extended by repeated retries.
