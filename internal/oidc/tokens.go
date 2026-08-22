@@ -280,40 +280,9 @@ func (s *Service) parseSigned(ctx context.Context, realm domain.Realm, raw strin
 }
 
 func (s *Service) Verify(ctx context.Context, realm domain.Realm, raw string, expectedAudience string) (VerifiedToken, error) {
-	parsed, err := jwt.ParseSigned(raw, []jose.SignatureAlgorithm{jose.RS256})
-	if err != nil {
-		return VerifiedToken{}, errors.New("token is not a signed RS256 JWT")
-	}
-	if len(parsed.Headers) != 1 {
-		return VerifiedToken{}, errors.New("token has an invalid JOSE header count")
-	}
-	kid := parsed.Headers[0].KeyID
-	if kid == "" {
-		return VerifiedToken{}, errors.New("token has no kid header")
-	}
-	keys, err := s.Store.PublishedSigningKeys(ctx, realm.ID)
+	standard, extra, err := s.parseSigned(ctx, realm, raw)
 	if err != nil {
 		return VerifiedToken{}, err
-	}
-	var publicKey *rsa.PublicKey
-	for _, metadata := range keys {
-		if metadata.KID != kid {
-			continue
-		}
-		var jwk jose.JSONWebKey
-		if err := json.Unmarshal(metadata.PublicJWK, &jwk); err != nil {
-			return VerifiedToken{}, err
-		}
-		publicKey, _ = jwk.Key.(*rsa.PublicKey)
-		break
-	}
-	if publicKey == nil {
-		return VerifiedToken{}, errors.New("token signing key is unavailable")
-	}
-	var standard jwt.Claims
-	var extra keycloakClaims
-	if err := parsed.Claims(publicKey, &standard, &extra); err != nil {
-		return VerifiedToken{}, errors.New("token signature validation failed")
 	}
 	expected := jwt.Expected{Issuer: realm.IssuerURL, Time: time.Now().UTC()}
 	if expectedAudience != "" {

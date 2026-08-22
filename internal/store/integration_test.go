@@ -2107,3 +2107,60 @@ func TestIntegrationBackchannelTargetsSurvivePruning(t *testing.T) {
 		t.Errorf("an ended session left %d codes behind", kept)
 	}
 }
+
+// Undoing a rotation must not disturb a concurrent refresh that succeeded.
+// Two tabs refreshing at once both come back with tokens, and if the first
+// exchange then fails and rolls back, the second one's tokens are already
+// somebody's — rolling those back would sign a working client out.
+func TestIntegrationRollbackLeavesAConcurrentRefreshAlone(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	userID := bootstrap.AdminUserID
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+		UserID: &userID, Scope: []string{"openid"}, ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, _, err := data.InspectRefreshToken(ctx, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Both tabs present the same token inside the grace window.
+	first, _, err := data.RotateRefreshToken(ctx, raw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondRaw, err := data.RotateRefreshToken(ctx, raw, nil)
+	if err != nil {
+		t.Fatalf("a second refresh inside the grace window was refused: %v", err)
+	}
+
+	// The first tab's exchange fails and is undone.
+	if err := data.RollbackRefreshRotation(ctx, original.ID, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, active, err := data.InspectRefreshToken(ctx, secondRaw); err != nil || !active {
+		t.Errorf("the concurrent refresh lost its token: active=%v err=%v", active, err)
+	}
+	var survived int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM refresh_tokens WHERE id=$1 AND revoked_at IS NULL`, second.ID).Scan(&survived); err != nil {
+		t.Fatal(err)
+	}
+	if survived != 1 {
+		t.Error("the successful exchange's token was removed by another exchange's rollback")
+	}
+	// The predecessor keeps its rotation, because a successor built on it is
+	// still in use; clearing it would let the old token be replayed.
+	var rotatedAt *time.Time
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT rotated_at FROM refresh_tokens WHERE id=$1`, original.ID).Scan(&rotatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if rotatedAt == nil {
+		t.Error("the predecessor was revived while a live successor exists")
+	}
+}
