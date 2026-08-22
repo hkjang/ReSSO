@@ -6,7 +6,7 @@
 |---|---|
 | Realm 기반 Issuer | 구현 |
 | OIDC Discovery | 구현 |
-| Authorization Code | 구현 |
+| Authorization Code | 구현. 1회 사용이며 재사용 시 해당 Session·Client의 Refresh Token 폐기 |
 | PKCE S256 | 구현, Public Client 강제 |
 | ID Token / JWT Access Token | RS256 구현 |
 | Refresh Token | 회전·재사용 탐지 구현 |

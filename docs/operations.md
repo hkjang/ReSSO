@@ -61,6 +61,15 @@ ReSSO는 확장을 직접 설치하지 않습니다. 확장 설치는 데이터�
 - `resso_backchannel_logout_total{result!="delivered"}` — RP가 로그아웃 통지를 받지 못하는 상태
 - `resso_federation_sync_total{result="failure"}` — LDAP 동기화 실패
 - `resso_http_request_duration_seconds` 상위 분위 상승 — 커넥션 풀 포화 또는 LDAP 지연
+- `resso_system_log_records_total{result!="written"}` — 서버 로그가 데이터베이스에 남지 않는 상태. 관리 화면의 로그에 구멍이 생깁니다.
+
+지표만으로는 드러나지 않는 신호는 감사 이벤트에 있습니다. 관리 → 운영 → 감사에서 종류로 걸러 확인하세요.
+
+| 이벤트 | 의미 |
+|---|---|
+| `AUTHORIZATION_CODE_REUSED` | 인가 코드가 두 번 제시되었습니다. 코드가 유출된 것이며, 해당 Session·Client의 Refresh Token은 이미 폐기되었습니다. 기록된 계정과 Client를 확인하고 RP의 Redirect 설정과 Referrer 정책을 점검하세요. |
+| `REFRESH_TOKEN_REUSE` | Refresh Token이 회전 이후 다시 제시되어 계열이 폐기되었습니다. |
+| `LDAP_FEDERATION_SYNC` `result=FAILURE` | 동기화 실패. `DISABLE` 정책이면 계정 비활성화가 반영되지 않습니다. |
 
 ## Back-Channel Logout
 
@@ -68,7 +77,7 @@ ReSSO는 확장을 직접 설치하지 않습니다. 확장 설치는 데이터�
 
 - 사용자 로그아웃, RP-Initiated Logout, 관리자의 Session 강제 폐기, 계정 복구가 모두 통지를 발생시킵니다.
 - URI는 HTTPS(또는 Loopback HTTP)만 허용하며 Redirect는 따라가지 않습니다.
-- 전달은 Best effort입니다. 재시도하지 않으며 사용자의 로그아웃 응답을 지연시키지 않습니다.
+- 전달은 Best effort이며 사용자의 로그아웃 응답을 지연시키지 않습니다. 저절로 해소될 수 있는 실패(연결 실패, 5xx, 429)만 2초·8초 간격으로 재시도하고, RP가 명시적으로 거절한 4xx는 반복하지 않습니다. 종료 중에는 즉시 중단합니다.
 - RP는 `logout_token`을 Realm JWKS로 검증하고 `iss`, `aud`, `events`, `sid`를 확인해야 합니다.
 - 실패는 서버 로그와 `resso_backchannel_logout_total`에 기록됩니다.
 
