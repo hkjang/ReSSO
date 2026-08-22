@@ -38,7 +38,7 @@ test: web/node_modules
 		skipped=$$(go test ./internal/... -run 'TestIntegration|TestDirectory' -v 2>&1 | grep -c '^--- SKIP' || true); \
 		if [ "$$skipped" -gt 0 ]; then \
 			echo; \
-			echo "$$skipped integration tests were skipped because their services were not reachable."; \
+			echo "$$skipped integration test(s) did not run: their services were not reachable."; \
 			echo "Start them with: eval \"\$$(scripts/test-services.sh)\""; \
 		fi; \
 		exit $$status
