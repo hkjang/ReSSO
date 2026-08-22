@@ -1,4 +1,4 @@
-.PHONY: lint test build web image release
+.PHONY: lint test test-services test-services-stop build web image release
 
 VERSION ?= v0.4.1-dev
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
@@ -29,10 +29,28 @@ lint: web/node_modules
 	GOTOOLCHAIN=auto govulncheck $(GO_PACKAGES)
 	cd web && npm run lint
 
+# A skipped test still lets `go test` print ok, and sixty of these are gated on
+# services being reachable — so a run without them looks exactly like a clean
+# one, right up until CI disagrees. The count is reported rather than hidden.
 test: web/node_modules
-	go test -race ./...
+	go test -race ./... 2>&1 | tee /tmp/resso-go-test.log; \
+		status=$$?; \
+		skipped=$$(go test ./internal/... -run 'TestIntegration|TestDirectory' -v 2>&1 | grep -c '^--- SKIP' || true); \
+		if [ "$$skipped" -gt 0 ]; then \
+			echo; \
+			echo "$$skipped integration tests were skipped because their services were not reachable."; \
+			echo "Start them with: eval \"\$$(scripts/test-services.sh)\""; \
+		fi; \
+		exit $$status
 	go vet ./...
 	cd web && npm run test && npm run build
+
+# Brings up PostgreSQL and the two directories the integration tests need.
+test-services:
+	@./scripts/test-services.sh
+
+test-services-stop:
+	@./scripts/test-services.sh --stop
 
 web: web/node_modules
 	cd web && npm run build

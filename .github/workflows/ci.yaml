@@ -38,31 +38,6 @@ jobs:
 
   verify:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: resso
-          POSTGRES_PASSWORD: integration-password
-          POSTGRES_DB: resso
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U resso -d resso"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
-      # The federation package talks to a directory, and a fixture cannot
-      # rehearse what a real one does with a wrong base, a missing attribute or
-      # a bind that should be refused. Its tests skip without this.
-      openldap:
-        image: osixia/openldap:1.5.0
-        env:
-          LDAP_ORGANISATION: ReSSO CI
-          LDAP_DOMAIN: example.test
-          LDAP_ADMIN_PASSWORD: adminpassword
-        ports:
-          - 389:389
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -74,121 +49,18 @@ jobs:
           node-version: 22.23.0
           cache: npm
           cache-dependency-path: web/package-lock.json
-      # The optional trigram indexes are only created when pg_trgm is present,
-      # so install it here to exercise that path.
-      - name: Enable optional PostgreSQL extensions
-        env:
-          PGPASSWORD: integration-password
-        run: psql -h 127.0.0.1 -U resso -d resso -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
-      - name: Seed the test directory
+      # The same script contributors run, so what CI exercises and what they
+      # can reproduce cannot drift apart. It reuses the PostgreSQL service
+      # above by leaving that container alone.
+      - name: Start the integration test services
         run: |
           set -euo pipefail
-          container="$(docker ps -q --filter ancestor=osixia/openldap:1.5.0)"
-          test -n "$container" || { echo "the directory service is not running" >&2; exit 1; }
-          # Group membership only reaches an entry's memberOf through this
-          # overlay, and the role mapping tests read it there.
-          database="$(docker exec "$container" ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config \
-            "(olcSuffix=dc=example,dc=test)" dn 2>/dev/null | awk '/^dn: / && !seen {print substr($0,5); seen=1}')"
-          test -n "$database" || { echo "the directory database was not found" >&2; exit 1; }
-          docker exec -i "$container" ldapadd -Y EXTERNAL -H ldapi:/// >/dev/null <<OVERLAY
-          dn: olcOverlay=memberof,$database
-          objectClass: olcOverlayConfig
-          objectClass: olcMemberOf
-          olcOverlay: memberof
-          olcMemberOfRefint: TRUE
-          OVERLAY
-          # docker exec attaches no stdin without -i, so a heredoc reaches
-          # ldapadd as an empty stream: it adds nothing and still exits 0.
-          docker exec -i "$container" ldapadd -x -H ldap://localhost \
-            -D "cn=admin,dc=example,dc=test" -w adminpassword -f /dev/stdin <<'LDIF'
-          dn: ou=people,dc=example,dc=test
-          objectClass: organizationalUnit
-          ou: people
-
-          dn: uid=alice,ou=people,dc=example,dc=test
-          objectClass: inetOrgPerson
-          uid: alice
-          cn: Alice Kim
-          sn: Kim
-          givenName: Alice
-          mail: alice@example.test
-          userPassword: alice-pass-1234
-
-          dn: uid=bob,ou=people,dc=example,dc=test
-          objectClass: inetOrgPerson
-          uid: bob
-          cn: Bob Lee
-          sn: Lee
-          givenName: Bob
-          mail: bob@example.test
-          userPassword: bob-pass-1234
-          LDIF
-          # Prove the entries are there rather than trusting an exit code, which
-          # is what let the silent no-op above through in the first place.
-          seeded="$(docker exec "$container" ldapsearch -x -H ldap://localhost \
-            -b "ou=people,dc=example,dc=test" -D "cn=admin,dc=example,dc=test" -w adminpassword \
-            "(objectClass=inetOrgPerson)" uid | grep -c '^uid:')"
-          test "$seeded" -eq 2 || { echo "seeded $seeded accounts, expected 2" >&2; exit 1; }
-      # This runs after the seeding above on purpose: that step finds the
-      # service container by image, and a second container from the same image
-      # makes the lookup ambiguous.
-      - name: Start a directory serving TLS
-        run: |
-          set -euo pipefail
-          certs="$RUNNER_TEMP/ldap-certs"
-          mkdir -p "$certs"
-          openssl req -x509 -newkey rsa:2048 -sha256 -days 2 -nodes \
-            -keyout "$certs/ca.key" -out "$certs/ca.crt" -subj "/CN=ReSSO Test CA" \
-            -addext "basicConstraints=critical,CA:TRUE"
-          openssl req -newkey rsa:2048 -nodes -keyout "$certs/ldap.key" \
-            -out "$certs/ldap.csr" -subj "/CN=localhost"
-          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$certs/ext.cnf"
-          openssl x509 -req -in "$certs/ldap.csr" -CA "$certs/ca.crt" -CAkey "$certs/ca.key" \
-            -CAcreateserial -out "$certs/ldap.crt" -days 2 -sha256 -extfile "$certs/ext.cnf"
-          chmod 644 "$certs"/*.crt "$certs"/*.key
-          docker run -d --name resso-ldaps -p 127.0.0.1:1636:636 \
-            -e LDAP_ORGANISATION="ReSSO CI" -e LDAP_DOMAIN="example.test" \
-            -e LDAP_ADMIN_PASSWORD="adminpassword" -e LDAP_TLS_VERIFY_CLIENT="never" \
-            -v "$certs:/container/service/slapd/assets/certs" osixia/openldap:1.5.0
-          for attempt in $(seq 1 45); do
-            docker exec resso-ldaps ldapsearch -x -H ldap://localhost -b "dc=example,dc=test" \
-              -D "cn=admin,dc=example,dc=test" -w adminpassword -s base >/dev/null 2>&1 && break
-            sleep 1
-          done
-          docker exec -i resso-ldaps ldapadd -x -H ldap://localhost \
-            -D "cn=admin,dc=example,dc=test" -w adminpassword <<'LDIF'
-          dn: ou=people,dc=example,dc=test
-          objectClass: organizationalUnit
-          ou: people
-
-          dn: uid=alice,ou=people,dc=example,dc=test
-          objectClass: inetOrgPerson
-          uid: alice
-          cn: Alice Kim
-          sn: Kim
-          givenName: Alice
-          mail: alice@example.test
-          userPassword: alice-pass-1234
-          LDIF
-          # The TLS listener comes up a moment after plain LDAP answers, so this
-          # waits rather than asking once and calling it broken.
-          verified=""
-          for attempt in $(seq 1 30); do
-            if openssl s_client -connect 127.0.0.1:1636 -CAfile "$certs/ca.crt" </dev/null 2>&1 \
-                 | grep -q "Verify return code: 0"; then
-              verified=yes
-              break
-            fi
-            sleep 1
-          done
-          test -n "$verified" || { echo "the TLS directory never served a verifiable certificate" >&2; exit 1; }
+          ./scripts/test-services.sh > "$RUNNER_TEMP/test-env.sh"
+          cat "$RUNNER_TEMP/test-env.sh"
       - name: Test backend
-        env:
-          RESSO_TEST_POSTGRES_DSN: postgres://resso:integration-password@127.0.0.1:5432/resso?sslmode=disable
-          RESSO_TEST_LDAP_URL: ldap://127.0.0.1:389
-          RESSO_TEST_LDAPS_URL: ldaps://localhost:1636
         run: |
-          export RESSO_TEST_LDAP_CA="$RUNNER_TEMP/ldap-certs/ca.crt"
+          set -euo pipefail
+          . "$RUNNER_TEMP/test-env.sh"
           go test -race -coverprofile=coverage.out ./... && go tool cover -func=coverage.out && go vet ./...
       - name: Build frontend
         working-directory: web
@@ -196,11 +68,15 @@ jobs:
       - name: Integration smoke test
         shell: bash
         env:
-          POSTGRES_DSN: postgres://resso:integration-password@127.0.0.1:5432/resso?sslmode=disable
+          # Its own database on the instance the services script started, so a
+          # smoke run and the integration tests cannot tread on each other.
+          POSTGRES_DSN: postgres://resso:resso@127.0.0.1:55439/smoke?sslmode=disable
           BOOTSTRAP_ADMIN: admin
           BOOTSTRAP_ADMIN_PASSWORD: integration-password-123
           ENCRYPTION_KEY: MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
         run: |
+          docker exec resso-test-pg psql -U resso -d postgres \
+            -c 'CREATE DATABASE smoke' >/dev/null 2>&1 || true
           go build -o /tmp/resso ./cmd/resso
           /tmp/resso >/tmp/resso.log 2>&1 &
           server_pid=$!

@@ -4,21 +4,15 @@ ReSSO의 User Federation은 Realm별로 여러 LDAP/Active Directory 공급자�
 
 ## 개발 중 디렉터리 연동 테스트
 
-`internal/federation`은 실제 디렉터리와 대화하는 코드이므로 진짜 서버로 검증합니다. `RESSO_TEST_LDAP_URL`이 없으면 해당 테스트는 건너뜁니다.
+통합 테스트는 PostgreSQL과 디렉터리 두 개(평문, TLS)를 필요로 합니다. 없으면 60여 개가 건너뛰어지는데, 건너뛴 테스트도 `go test`는 `ok`로 보고하므로 로컬에서는 초록이고 CI에서 실패하는 일이 생깁니다. `make test`가 건너뛴 개수를 알려줍니다.
 
 ```bash
-docker run -d --name resso-test-ldap -p 127.0.0.1:13890:389 \
-  -e LDAP_ORGANISATION="ReSSO Test" -e LDAP_DOMAIN="example.test" \
-  -e LDAP_ADMIN_PASSWORD="adminpassword" osixia/openldap:1.5.0
-# 사용자 시딩과 memberof 오버레이 설정은 CI 워크플로의 "Seed the test directory"
-# 단계와 동일합니다. 그룹 → Role 매핑 테스트는 이 오버레이 없이는 memberOf를 읽을 수 없습니다.
-RESSO_TEST_LDAP_URL=ldap://127.0.0.1:13890 go test ./internal/federation/
+eval "$(scripts/test-services.sh)"   # 서비스 기동 + 환경변수 설정
+go test ./internal/...
+scripts/test-services.sh --stop      # 정리
 ```
 
-TLS 검증 테스트는 확인 가능한 인증서를 내주는 디렉터리가 따로 필요합니다. `RESSO_TEST_LDAPS_URL`과 `RESSO_TEST_LDAP_CA`가 없으면 건너뜁니다. 인증서 생성과 기동 절차는 CI 워크플로의 "Start a directory serving TLS" 단계와 같습니다.
-
-CI는 같은 이미지를 서비스로 띄우고 같은 사용자를 시딩하므로, 로컬에서 통과한 것이 CI에서도 그대로 실행됩니다.
-
+CI도 같은 스크립트를 실행하므로, 로컬에서 통과한 것과 CI가 검증하는 것이 갈라지지 않습니다.
 
 ## 권장 구성 순서
 
