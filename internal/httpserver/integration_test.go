@@ -722,3 +722,85 @@ func TestIntegrationRefreshFailureLeavesTheClientsTokenUsable(t *testing.T) {
 		t.Errorf("an undelivered successor token was left behind: %d", children)
 	}
 }
+
+// Revocation answers 200 whether or not the token matched, which is what the
+// specification requires but leaves the audit trail unable to say whether a
+// token is actually dead. The entry has to distinguish the three outcomes.
+func TestIntegrationRevocationAuditRecordsWhatWasRevoked(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "revoke-probe", Name: "Revoke Probe", Type: "confidential",
+		RedirectURIs: []string{"https://probe.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "revoke-integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: created.Client.ID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	revoke := func(token string) {
+		t.Helper()
+		form := url.Values{"token": {token}, "client_id": {"revoke-probe"},
+			"client_secret": {created.ClientSecret}}
+		response, postErr := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/revoke", form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("revoke status = %d", response.StatusCode)
+		}
+	}
+
+	revoke("not-a-token-anyone-issued")
+	revoke(raw)
+
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "TOKEN_REVOKED", Ascending: true, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("audit entries = %d, want 2", len(page.Items))
+	}
+	detailOf := func(index int) map[string]any {
+		t.Helper()
+		var decoded map[string]any
+		if err := json.Unmarshal(page.Items[index].Detail, &decoded); err != nil {
+			t.Fatalf("decode audit detail: %v", err)
+		}
+		return decoded
+	}
+	if got := detailOf(0)["revoked"]; got != "none" {
+		t.Errorf("an unmatched token recorded revoked=%v, want none", got)
+	}
+	matched := detailOf(1)
+	if got := matched["revoked"]; got != "refresh_token" {
+		t.Errorf("a revoked refresh token recorded revoked=%v", got)
+	}
+	if matched["family_id"] == nil {
+		t.Error("the revoked family was not recorded")
+	}
+}

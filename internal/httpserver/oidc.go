@@ -500,14 +500,25 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	raw := r.Form.Get("token")
+	// RFC 7009 answers 200 whether or not the token matched, so the audit
+	// entry has to carry what actually happened. Recording only that revoke
+	// was called leaves the one question an incident asks — is that token
+	// dead? — answered by implication rather than by the trail.
+	detail := map[string]any{"revoked": "none"}
 	if refresh, _, inspectErr := s.store.InspectRefreshToken(r.Context(), raw); inspectErr == nil && refresh.ClientID == client.ID {
-		_ = s.store.RevokeRefreshToken(r.Context(), raw)
+		if revokeErr := s.store.RevokeRefreshToken(r.Context(), raw); revokeErr == nil {
+			detail["revoked"] = "refresh_token"
+			detail["family_id"] = refresh.FamilyID.String()
+		}
 	} else if verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, client.ClientID); verifyErr == nil {
 		if jti, parseErr := uuid.Parse(verified.Claims.ID); parseErr == nil && verified.Claims.Expiry != nil {
-			_ = s.store.RevokeAccessJTI(r.Context(), jti, verified.Claims.Expiry.Time())
+			if revokeErr := s.store.RevokeAccessJTI(r.Context(), jti, verified.Claims.Expiry.Time()); revokeErr == nil {
+				detail["revoked"] = "access_token"
+				detail["jti"] = jti.String()
+			}
 		}
 	}
-	s.audit(r, &realm.ID, nil, client.ClientID, "TOKEN_REVOKED", "SUCCESS", "client", client.ClientID, nil)
+	s.audit(r, &realm.ID, nil, client.ClientID, "TOKEN_REVOKED", "SUCCESS", "client", client.ClientID, detail)
 	w.WriteHeader(http.StatusOK)
 }
 
