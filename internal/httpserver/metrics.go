@@ -21,8 +21,8 @@ const (
 	metricFederationSync = MetricFederationSync
 )
 
-func newMetrics() *observability.Registry {
-	registry := observability.NewRegistry()
+// registerMetrics declares this package's series on a shared registry.
+func registerMetrics(registry *observability.Registry) {
 	registry.Counter(metricRequests, "HTTP requests handled, by route pattern, method and status.",
 		"route", "method", "status")
 	registry.Histogram(metricRequestTime, "HTTP request duration in seconds, by route pattern.",
@@ -32,7 +32,6 @@ func newMetrics() *observability.Registry {
 	registry.Counter(metricClientAuth, "Failed OIDC client authentications.", "realm")
 	registry.Counter(metricLogoutNotices, "Back-channel logout deliveries, by outcome.", "result")
 	registry.Counter(metricFederationSync, "Scheduled LDAP federation syncs, by outcome.", "result")
-	return registry
 }
 
 func (s *Server) serveMetrics(w http.ResponseWriter, _ *http.Request) {

@@ -88,7 +88,7 @@ func TestOpenAPICoversEveryRegisteredRoute(t *testing.T) {
 		t.Fatal("spec has no paths object")
 	}
 
-	router, ok := New(nil, nil, nil).Handler().(*chi.Mux)
+	router, ok := New(nil, nil, nil, nil).Handler().(*chi.Mux)
 	if !ok {
 		t.Fatal("handler is not a chi router")
 	}

@@ -90,7 +90,9 @@ func main() {
 		}
 	}
 
-	logger := slog.New(observability.NewDBHandler(console, data, "resso"))
+	metrics := observability.NewRegistry()
+	logMirror := observability.NewDBHandler(console, data, "resso", metrics)
+	logger := slog.New(logMirror)
 	slog.SetDefault(logger)
 	logger.Info("ReSSO starting", "version", version.Version, "commit", version.Commit,
 		"listen", cfg.ListenAddress, "bootstrap_admin_created", bootstrap.Created)
@@ -98,7 +100,7 @@ func main() {
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	app := httpserver.New(data, logger, cfg.TrustedProxyCIDRs)
+	app := httpserver.New(data, logger, cfg.TrustedProxyCIDRs, metrics)
 
 	// Relying parties that registered a back-channel logout URI are notified
 	// whenever a session ends, including administrative revocations.
@@ -126,6 +128,9 @@ func main() {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
 		logoutNotifier.Wait(10 * time.Second)
+		// Write out the buffered log records before the process exits, so the
+		// administration log does not lose the last seconds before a restart.
+		logMirror.Close(5 * time.Second)
 	}()
 
 	err = httpServer.ListenAndServe()

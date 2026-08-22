@@ -40,7 +40,7 @@ func TestIntegrationLoginCountsFailuresAndResetsOnSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil).Handler())
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
 	t.Cleanup(server.Close)
 	client := server.Client()
 
@@ -115,7 +115,7 @@ func TestIntegrationMCPUserTokenRequiresExactActiveSessionBinding(t *testing.T) 
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil).Handler())
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
 	t.Cleanup(server.Close)
 	client := server.Client()
 	clientToken := requestIntegrationClientCredentialsToken(t, client, server.URL,
@@ -378,7 +378,7 @@ func TestIntegrationMetricsRequireAdminAuthorizationAndRecordRequests(t *testing
 		t.Fatal(bootstrapErr)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil).Handler())
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
 	t.Cleanup(server.Close)
 	client := server.Client()
 	jar, err := cookiejar.New(nil)
@@ -456,7 +456,7 @@ func TestIntegrationClientSecretBruteForceIsLimitedWithoutBlockingNeighbours(t *
 	neighbour := newClient("neighbour-client")
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil).Handler())
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
 	t.Cleanup(server.Close)
 	client := server.Client()
 
@@ -517,7 +517,7 @@ func TestIntegrationQuickSearchPointsAtRoutesTheConsoleHas(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil).Handler())
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
 	t.Cleanup(server.Close)
 	client := server.Client()
 	jar, err := cookiejar.New(nil)
