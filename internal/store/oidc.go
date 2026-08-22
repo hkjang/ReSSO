@@ -109,11 +109,11 @@ func (s *Store) CreateAuthorizationCode(ctx context.Context, code AuthorizationC
 	return raw, nil
 }
 
-func scanAuthorizationCodeWithState(row pgx.Row, consumed *bool) (AuthorizationCode, error) {
+func scanAuthorizationCodeWithState(row pgx.Row, consumed, live *bool) (AuthorizationCode, error) {
 	var code AuthorizationCode
 	err := row.Scan(&code.ID, &code.RealmID, &code.ClientID, &code.UserID, &code.SessionID,
 		&code.RedirectURI, &code.Scope, &code.Nonce, &code.CodeChallenge, &code.CodeChallengeMethod,
-		&code.ExpiresAt, consumed)
+		&code.ExpiresAt, consumed, live)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuthorizationCode{}, ErrNotFound
 	}
@@ -142,10 +142,18 @@ func (s *Store) RedeemAuthorizationCode(ctx context.Context, raw string, validat
 		return AuthorizationCode{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var consumed bool
+	// Both judgements are the database's. Reuse detection needs the row even
+	// when it is spent, which the previous WHERE clause excluded, but moving
+	// the expiry comparison into this process would make a ninety-second
+	// window depend on the app and database clocks agreeing — early rejection
+	// looks to a relying party like an intermittently broken login, and late
+	// acceptance keeps a leaked code usable. Every other lifetime in the
+	// schema is decided by now() for the same reason.
+	var consumed, live bool
 	code, err := scanAuthorizationCodeWithState(tx.QueryRow(ctx, `SELECT id,realm_id,client_id,user_id,session_id,
-		redirect_uri,scope,nonce,code_challenge,code_challenge_method,expires_at,consumed_at IS NOT NULL
-		FROM authorization_codes WHERE code_hash=ANY($1::bytea[]) FOR UPDATE`, s.Sealer.Digests(raw)), &consumed)
+		redirect_uri,scope,nonce,code_challenge,code_challenge_method,expires_at,
+		consumed_at IS NOT NULL, expires_at>now()
+		FROM authorization_codes WHERE code_hash=ANY($1::bytea[]) FOR UPDATE`, s.Sealer.Digests(raw)), &consumed, &live)
 	if err != nil {
 		return AuthorizationCode{}, err
 	}
@@ -163,7 +171,7 @@ func (s *Store) RedeemAuthorizationCode(ctx context.Context, raw string, validat
 	}
 	// An expired code produced nothing, so there is nothing to revoke and it
 	// is indistinguishable from a code that never existed.
-	if !code.ExpiresAt.After(time.Now()) {
+	if !live {
 		return AuthorizationCode{}, ErrNotFound
 	}
 	if err := validate(code); err != nil {

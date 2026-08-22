@@ -89,6 +89,27 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 	return result, nil
 }
 
+// SessionAuthenticatedRecently reports whether the session proved who the user
+// is within the given number of seconds.
+//
+// The comparison belongs to the database rather than to this process. It is
+// the answer to a relying party's max_age, so getting it wrong in one
+// direction accepts an authentication older than was asked for — which is the
+// whole point of the parameter — and in the other turns a working sign-in into
+// an unexplained loop back to the login page. Every other lifetime in the
+// schema is judged by now(), and this one is judged against a timestamp the
+// same database wrote.
+func (s *Store) SessionAuthenticatedRecently(ctx context.Context, id uuid.UUID, withinSeconds int) (bool, error) {
+	var recent bool
+	err := s.Pool.QueryRow(ctx, `SELECT s.created_at > now()-make_interval(secs => $2)
+		FROM sso_sessions s JOIN realms r ON r.id=s.realm_id
+		WHERE s.id=$1 AND `+sessionIsLive, id, withinSeconds).Scan(&recent)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	return recent, err
+}
+
 func (s *Store) SessionAuthTime(ctx context.Context, id uuid.UUID) (time.Time, error) {
 	var authTime time.Time
 	err := s.Pool.QueryRow(ctx, `SELECT s.created_at FROM sso_sessions s

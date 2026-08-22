@@ -167,12 +167,12 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 			// enough for what it asked.
 			reusable := hintedSubject == "" || hintedSubject == authenticated.User.ID.String()
 			if reusable && maxAge >= 0 {
-				authTime, authErr := s.store.SessionAuthTime(r.Context(), authenticated.Session.ID)
+				recent, authErr := s.store.SessionAuthenticatedRecently(r.Context(), authenticated.Session.ID, maxAge)
 				if authErr != nil {
 					redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authentication time is unavailable")
 					return
 				}
-				reusable = time.Since(authTime) <= time.Duration(maxAge)*time.Second
+				reusable = recent
 			}
 			if reusable {
 				code, codeErr := s.store.CreateAuthorizationCode(r.Context(), store.AuthorizationCode{
