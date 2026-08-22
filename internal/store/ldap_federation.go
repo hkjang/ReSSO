@@ -457,24 +457,61 @@ func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncS
 			summary.Updated++
 		}
 	}
+	var sweepErr error
 	if summary.Failed == 0 && runtime.Provider.MissingUserAction == "DISABLE" {
-		command, disableErr := s.Pool.Exec(ctx, `UPDATE users SET enabled=false,updated_at=now()
-            WHERE federation_id=$1 AND (federation_synced_at IS NULL OR federation_synced_at<$2) AND enabled=true`, id, summary.StartedAt)
-		if disableErr != nil {
+		summary.Disabled, sweepErr = s.disableUnseenFederatedUsers(ctx, id, summary.StartedAt, summary.Read)
+		if sweepErr != nil && !errors.Is(sweepErr, ErrSyncReadNothing) {
 			summary.Failed++
-		} else {
-			summary.Disabled = command.RowsAffected()
-			_, _ = s.Pool.Exec(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())
-                WHERE user_id IN (SELECT id FROM users WHERE federation_id=$1 AND enabled=false)`, id)
 		}
 	}
 	summary.CompletedAt = time.Now().UTC()
 	var syncErr error
-	if summary.Failed > 0 {
+	switch {
+	case errors.Is(sweepErr, ErrSyncReadNothing):
+		syncErr = sweepErr
+	case summary.Failed > 0:
 		syncErr = fmt.Errorf("%d LDAP users could not be synchronized", summary.Failed)
 	}
 	s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, syncErr)
 	return summary, syncErr
+}
+
+// ErrSyncReadNothing reports a sync that saw no users at all in a directory
+// that is known to hold some.
+var ErrSyncReadNothing = errors.New("LDAP directory returned no users; accounts were left enabled")
+
+// disableUnseenFederatedUsers deactivates the accounts a completed sync did
+// not encounter, which is what the DISABLE policy is for.
+//
+// It refuses to act on an empty read. A search that returns nothing looks
+// identical whether everybody really left the directory or the search simply
+// pointed somewhere wrong — a mistyped users DN, a subtree the bind account
+// lost permission to read, a base that was renamed. Those are ordinary
+// mistakes, and the previous behaviour turned each of them into every
+// federated account in the Realm being disabled and every one of their
+// sessions revoked on the next scheduled sweep. When the directory says
+// nothing and the database knows otherwise, the database is the better
+// witness, so the run reports a failure instead.
+func (s *Store) disableUnseenFederatedUsers(ctx context.Context, providerID uuid.UUID, startedAt time.Time, read int) (int64, error) {
+	if read == 0 {
+		var known int
+		if err := s.Pool.QueryRow(ctx,
+			"SELECT count(*) FROM users WHERE federation_id=$1 AND enabled=true", providerID).Scan(&known); err != nil {
+			return 0, err
+		}
+		if known > 0 {
+			return 0, ErrSyncReadNothing
+		}
+	}
+	command, err := s.Pool.Exec(ctx, `UPDATE users SET enabled=false,updated_at=now()
+        WHERE federation_id=$1 AND (federation_synced_at IS NULL OR federation_synced_at<$2) AND enabled=true`,
+		providerID, startedAt)
+	if err != nil {
+		return 0, err
+	}
+	_, _ = s.Pool.Exec(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())
+        WHERE user_id IN (SELECT id FROM users WHERE federation_id=$1 AND enabled=false)`, providerID)
+	return command.RowsAffected(), nil
 }
 
 func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederation, summary LDAPSyncSummary, syncErr error) {

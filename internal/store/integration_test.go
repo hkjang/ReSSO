@@ -1840,3 +1840,74 @@ func TestIntegrationFailedRefreshExchangeDoesNotStrandTheClient(t *testing.T) {
 		t.Errorf("retry started a new family: %v want %v", retry.FamilyID, original.FamilyID)
 	}
 }
+
+// A directory that returns nothing looks the same whether every account really
+// left or the search was simply pointed at the wrong place. Under the DISABLE
+// policy the old behaviour read it the first way and deactivated every
+// federated account in the Realm, ending all of their sessions — so a mistyped
+// users DN locked the organisation out on the next scheduled sweep.
+func TestIntegrationEmptyLDAPReadDoesNotDisableEveryone(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldaps://ldap.invalid:636",
+		UsersDN: "ou=people,dc=example,dc=com", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "DISABLE",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"kim", "lee", "park"} {
+		user, createErr := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+			Username: name, Password: name + "-password-1234", Enabled: true})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		if _, err := data.Pool.Exec(ctx, `UPDATE users SET federation_id=$2,external_id=$3,
+			federation_synced_at=now()-interval '1 day' WHERE id=$1`, user.ID, provider.ID, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startedAt := time.Now().UTC()
+	disabled, err := data.disableUnseenFederatedUsers(ctx, provider.ID, startedAt, 0)
+	if !errors.Is(err, ErrSyncReadNothing) {
+		t.Fatalf("empty read error = %v, want ErrSyncReadNothing", err)
+	}
+	if disabled != 0 {
+		t.Errorf("an empty read disabled %d accounts", disabled)
+	}
+	var stillEnabled int
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM users WHERE federation_id=$1 AND enabled=true", provider.ID).Scan(&stillEnabled); err != nil {
+		t.Fatal(err)
+	}
+	if stillEnabled != 3 {
+		t.Errorf("enabled federated accounts = %d, want 3", stillEnabled)
+	}
+
+	// The policy must still do its job when the directory actually answered:
+	// two accounts were seen this run, the third was not.
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET federation_synced_at=now()
+		WHERE federation_id=$1 AND username IN ('kim','lee')`, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err = data.disableUnseenFederatedUsers(ctx, provider.ID, startedAt, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled != 1 {
+		t.Errorf("disabled %d accounts, want 1", disabled)
+	}
+	var parkEnabled bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT enabled FROM users WHERE federation_id=$1 AND username='park'", provider.ID).Scan(&parkEnabled); err != nil {
+		t.Fatal(err)
+	}
+	if parkEnabled {
+		t.Error("an account the directory no longer lists stayed enabled")
+	}
+}
