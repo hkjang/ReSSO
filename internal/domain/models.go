@@ -130,6 +130,12 @@ type Session struct {
 	LastAccess time.Time  `json:"last_access"`
 	ExpiresAt  time.Time  `json:"expires_at"`
 	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+	// Active is whether this session would still be accepted, which is not
+	// something a reader can work out from the other fields: a Realm may
+	// expire sessions that go unused, and such a session is refused long
+	// before expires_at arrives. The console listed those as active because
+	// that was all it could see.
+	Active bool `json:"active"`
 }
 
 type SigningKey struct {

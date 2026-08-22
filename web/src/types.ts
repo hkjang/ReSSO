@@ -120,6 +120,9 @@ export interface Session {
   last_access: string
   expires_at: string
   revoked_at?: string
+  /** Whether the server would still accept this session. Idle expiry refuses
+   *  a session well before expires_at, so this cannot be derived here. */
+  active: boolean
 }
 
 export interface SigningKey {

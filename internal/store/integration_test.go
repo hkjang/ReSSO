@@ -2328,3 +2328,58 @@ func TestIntegrationStaleSyncIsNotReportedAsRunning(t *testing.T) {
 		t.Errorf("the raw status was expected to remain RUNNING, got %q", stale.LastSyncStatus)
 	}
 }
+
+// A Realm that expires unused sessions refuses them long before expires_at
+// arrives, and that is not something a reader of the listed columns can work
+// out. The console derived "active" from revoked_at and expires_at alone, so
+// it showed sessions as usable that the server had already stopped accepting —
+// an administrator looking for who is signed in, and a user checking their own
+// devices, both being told about sessions that no longer exist.
+func TestIntegrationListedSessionReportsWhetherItStillWorks(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE realms SET idle_timeout_seconds=600 WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		8*time.Hour, "127.0.0.1", "listing-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := func() domain.Session {
+		t.Helper()
+		items, listErr := data.ListSessions(ctx, &bootstrap.RealmID, nil, 10)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		for _, item := range items {
+			if item.ID == session.Session.ID {
+				return item
+			}
+		}
+		t.Fatal("the session was not listed")
+		return domain.Session{}
+	}
+	if !listed().Active {
+		t.Fatal("a fresh session was listed as unusable")
+	}
+
+	// Unused past the idle timeout: refused by the server, while expires_at is
+	// still hours away.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE sso_sessions SET last_access=now()-interval '30 minutes' WHERE id=$1`, session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	idle := listed()
+	if idle.Active {
+		t.Error("an idle-expired session was listed as active")
+	}
+	if !idle.ExpiresAt.After(time.Now()) {
+		t.Fatal("the test needs expires_at to still be in the future to mean anything")
+	}
+	if idle.RevokedAt != nil {
+		t.Error("the session was revoked, which is not the case being tested")
+	}
+}

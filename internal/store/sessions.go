@@ -255,9 +255,16 @@ func (s *Store) ListSessions(ctx context.Context, realmID *uuid.UUID, userID *uu
 	if limit < 1 || limit > 500 {
 		limit = 100
 	}
+	// Whether a session is still usable is answered here with the same
+	// predicate that decides it everywhere else. A reader cannot derive it
+	// from the columns: idle expiry refuses a session while expires_at is
+	// still comfortably in the future.
 	rows, err := s.Pool.Query(ctx, `SELECT s.id,s.realm_id,s.user_id,u.username,s.ip_address,s.user_agent,
-        s.auth_method,s.created_at,s.last_access,s.expires_at,s.revoked_at FROM sso_sessions s
-        JOIN users u ON u.id=s.user_id WHERE ($1::uuid IS NULL OR s.realm_id=$1)
+        s.auth_method,s.created_at,s.last_access,s.expires_at,s.revoked_at,`+sessionIsLive+`
+        FROM sso_sessions s
+        JOIN users u ON u.id=s.user_id
+        JOIN realms r ON r.id=s.realm_id
+        WHERE ($1::uuid IS NULL OR s.realm_id=$1)
         AND ($2::uuid IS NULL OR s.user_id=$2) ORDER BY s.last_access DESC LIMIT $3`, realmID, userID, limit)
 	if err != nil {
 		return nil, err
@@ -268,7 +275,7 @@ func (s *Store) ListSessions(ctx context.Context, realmID *uuid.UUID, userID *uu
 		var session domain.Session
 		if err := rows.Scan(&session.ID, &session.RealmID, &session.UserID, &session.Username,
 			&session.IPAddress, &session.UserAgent, &session.AuthMethod, &session.CreatedAt,
-			&session.LastAccess, &session.ExpiresAt, &session.RevokedAt); err != nil {
+			&session.LastAccess, &session.ExpiresAt, &session.RevokedAt, &session.Active); err != nil {
 			return nil, err
 		}
 		sessions = append(sessions, session)
