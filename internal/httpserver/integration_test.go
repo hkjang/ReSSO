@@ -28,6 +28,7 @@ import (
 
 	"github.com/hkjang/ReSSO/internal/cryptoutil"
 	"github.com/hkjang/ReSSO/internal/domain"
+	"github.com/hkjang/ReSSO/internal/observability"
 	ressooidc "github.com/hkjang/ReSSO/internal/oidc"
 	"github.com/hkjang/ReSSO/internal/store"
 )
@@ -1030,4 +1031,35 @@ func issueIntegrationIDTokenFor(t *testing.T, data *store.Store, realm domain.Re
 		t.Fatal("no ID token was issued")
 	}
 	return tokens.IDToken
+}
+
+// Shutdown has to write out what is buffered. The last seconds before a
+// restart are exactly the ones an operator goes looking for afterwards, and
+// the mirror batches on a timer, so without a flush they are simply gone.
+func TestIntegrationLogMirrorFlushesOnShutdown(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	metrics := observability.NewRegistry()
+	handler := observability.NewDBHandler(slog.NewTextHandler(io.Discard, nil), data, "shutdown-test", metrics)
+	logger := slog.New(handler)
+	for index := range 5 {
+		logger.Info("buffered before shutdown", "index", index)
+	}
+
+	// Close returns only once the writer has drained, so no sleep is needed.
+	handler.Close(5 * time.Second)
+
+	var written int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM system_logs WHERE component='shutdown-test'`).Scan(&written); err != nil {
+		t.Fatal(err)
+	}
+	if written != 5 {
+		t.Errorf("records written on shutdown = %d, want 5", written)
+	}
+	var exported strings.Builder
+	metrics.WritePrometheus(&exported)
+	if !strings.Contains(exported.String(), `result="written"`) {
+		t.Errorf("the written outcome was not reported: %s", exported.String())
+	}
 }

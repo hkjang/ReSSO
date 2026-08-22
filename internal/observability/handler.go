@@ -38,6 +38,12 @@ type DBHandler struct {
 	once      *sync.Once
 	metrics   *Registry
 	done      chan struct{}
+	// closing is signalled instead of closing the queue. Records can still
+	// arrive while the process unwinds — background workers finishing, the
+	// final line from the main goroutine — and a send on a closed channel
+	// panics no matter what the sender does about it.
+	closing   chan struct{}
+	closeOnce *sync.Once
 }
 
 // NewDBHandler mirrors records into PostgreSQL. The registry is optional; when
@@ -47,7 +53,8 @@ func NewDBHandler(next slog.Handler, data *store.Store, component string, metric
 		metrics.Counter(MetricLogRecords, "Structured log records mirrored to the database, by outcome.", "result")
 	}
 	h := &DBHandler{next: next, store: data, queue: make(chan store.SystemLogEntry, queueDepth),
-		component: component, once: &sync.Once{}, metrics: metrics, done: make(chan struct{})}
+		component: component, once: &sync.Once{}, metrics: metrics, done: make(chan struct{}),
+		closing: make(chan struct{}), closeOnce: &sync.Once{}}
 	h.once.Do(func() { go h.run() })
 	return h
 }
@@ -61,7 +68,7 @@ func (h *DBHandler) record(result string, count int) {
 // Close stops accepting records and waits for the buffered ones to be written,
 // so a shutdown does not discard the last few seconds of the log.
 func (h *DBHandler) Close(timeout time.Duration) {
-	close(h.queue)
+	h.closeOnce.Do(func() { close(h.closing) })
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
@@ -90,6 +97,9 @@ func (h *DBHandler) Handle(ctx context.Context, record slog.Record) error {
 	item := store.SystemLogEntry{OccurredAt: occurredAt.UTC(), Level: strings.ToUpper(record.Level.String()),
 		Component: h.component, Message: record.Message, TraceID: traceID, Attributes: attrs}
 	select {
+	case <-h.closing:
+		// The writer has finished; console logging still carries this line.
+		h.record("dropped", 1)
 	case h.queue <- item:
 	default:
 		// The database cannot keep up. Console logging is unaffected, but the
@@ -153,17 +163,30 @@ func (h *DBHandler) run() {
 	}
 	for {
 		select {
-		case item, ok := <-h.queue:
-			if !ok {
-				flush()
-				return
-			}
+		case item := <-h.queue:
 			batch = append(batch, item)
 			if len(batch) >= batchSize {
 				flush()
 			}
 		case <-ticker.C:
 			flush()
+		case <-h.closing:
+			// Take whatever is already queued, then stop. Anything arriving
+			// after this point is counted as dropped by the sender.
+			for {
+				select {
+				case item := <-h.queue:
+					batch = append(batch, item)
+					if len(batch) >= batchSize {
+						flush()
+					}
+					continue
+				default:
+				}
+				break
+			}
+			flush()
+			return
 		}
 	}
 }
