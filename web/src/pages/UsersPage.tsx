@@ -124,7 +124,10 @@ export function UsersPage() {
   })
   const toggle = (values: string[], value: string, setter: (next: string[]) => void) => setter(values.includes(value) ? values.filter((item) => item !== value) : [...values, value])
   const emailMatchesSelected = normalizeEmail(editForm?.email) === normalizeEmail(selected?.email)
-  const isLocked = (user: User) => Boolean(user.locked_until && new Date(user.locked_until) > new Date())
+  // The server decides this against the clock that wrote locked_until. It
+  // gates whether the unlock action is offered, so a browser running fast used
+  // to hide the only way to release an account nobody could sign in to.
+  const isLocked = (user: User) => user.locked
   // The filter narrows the page that is already loaded; the server-side query
   // stays a plain paged search so the count in the pager remains truthful.
   const visibleUsers = (users.data?.items ?? []).filter((user) => {

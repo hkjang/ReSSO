@@ -2383,3 +2383,68 @@ func TestIntegrationListedSessionReportsWhetherItStillWorks(t *testing.T) {
 		t.Error("the session was revoked, which is not the case being tested")
 	}
 }
+
+// Whether a lockout is in force and whether an API key is still accepted both
+// gate an action in the console: the unlock button only appears for a locked
+// account, and rotate and revoke are offered only for a live key. Deciding
+// either against the browser's clock meant a machine running fast hid the only
+// way to release an account nobody could sign in to, and offered no way to
+// withdraw a key that still worked.
+func TestIntegrationLockAndKeyStateComeFromTheServer(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	user, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "locked-probe", Password: "locked-probe-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetched, err := data.UserByID(ctx, user.ID); err != nil || fetched.Locked {
+		t.Fatalf("a new account reported locked=%v err=%v", fetched.Locked, err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE users SET locked_until=now()+interval '10 minutes' WHERE id=$1`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := data.UserByID(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !locked.Locked {
+		t.Error("a locked account did not report it, which hides the unlock action")
+	}
+	// A lockout that has run its course is not in force, even though the
+	// timestamp is still on the row.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE users SET locked_until=now()-interval '1 minute' WHERE id=$1`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if released, err := data.UserByID(ctx, user.ID); err != nil || released.Locked {
+		t.Errorf("an elapsed lockout still reported as locked: %v", err)
+	}
+
+	created, err := data.CreatePersonalAPIKey(ctx, user.ID, "probe", []string{"api:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created.Key.Active {
+		t.Error("a key was reported inactive at the moment it was issued")
+	}
+	keys, err := data.ListPersonalAPIKeys(ctx, user.ID)
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("listed %d keys, err=%v", len(keys), err)
+	}
+	if !keys[0].Active {
+		t.Error("a live key was listed as inactive, which hides rotate and revoke")
+	}
+	if err := data.RevokePersonalAPIKey(ctx, user.ID, created.Key.ID); err != nil {
+		t.Fatal(err)
+	}
+	keys, err = data.ListPersonalAPIKeys(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys[0].Active {
+		t.Error("a revoked key was still listed as active")
+	}
+}

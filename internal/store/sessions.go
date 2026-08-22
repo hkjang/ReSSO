@@ -79,7 +79,8 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
         s.created_at,s.last_access,s.expires_at,s.revoked_at,s.csrf_hash,
 		u.id,u.realm_id,u.username,u.email,u.email_verified,u.display_name,u.enabled,u.platform_admin,u.manager_id,
 		u.federation_id,u.external_id,u.external_dn,u.federation_synced_at,
-		u.failed_attempts,u.locked_until,u.password_changed_at,u.created_at,u.updated_at,
+		u.failed_attempts,u.locked_until,u.password_changed_at,
+		(u.locked_until IS NOT NULL AND u.locked_until > now()),u.created_at,u.updated_at,
 		EXISTS(SELECT 1 FROM user_roles ur JOIN roles rr ON rr.id=ur.role_id
 		    WHERE ur.user_id=u.id AND rr.name='realm-admin')
         FROM sso_sessions s JOIN users u ON u.id=s.user_id JOIN realms r ON r.id=s.realm_id
@@ -91,7 +92,7 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 		&result.User.Enabled, &result.User.PlatformAdmin, &result.User.ManagerID, &result.User.FederationID,
 		&result.User.ExternalID, &result.User.ExternalDN, &result.User.FederationSyncedAt,
 		&result.User.FailedAttempts, &result.User.LockedUntil, &result.User.PasswordChanged,
-		&result.User.CreatedAt, &result.User.UpdatedAt, &result.RealmAdmin)
+		&result.User.Locked, &result.User.CreatedAt, &result.User.UpdatedAt, &result.RealmAdmin)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuthenticatedSession{}, ErrNotFound
 	}

@@ -46,8 +46,14 @@ type User struct {
 	FailedAttempts     int        `json:"failed_attempts"`
 	LockedUntil        *time.Time `json:"locked_until,omitempty"`
 	PasswordChanged    time.Time  `json:"password_changed_at"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	// Locked is whether the lockout is in force now, decided by the same
+	// clock that wrote locked_until. The console used to compare that
+	// timestamp against the browser's clock, and it is what decides whether
+	// the unlock action is offered at all — so an administrator whose machine
+	// ran fast saw a locked account as normal, with no way to release it.
+	Locked    bool      `json:"locked"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type LDAPFederation struct {

@@ -18,14 +18,14 @@ const maxEmailLength = 320
 
 const userColumns = `id,realm_id,username,email,email_verified,display_name,enabled,platform_admin,manager_id,
     federation_id,external_id,external_dn,federation_synced_at,failed_attempts,locked_until,
-    password_changed_at,created_at,updated_at`
+    password_changed_at,(locked_until IS NOT NULL AND locked_until > now()),created_at,updated_at`
 
 func scanUser(row pgx.Row) (domain.User, error) {
 	var user domain.User
 	err := row.Scan(&user.ID, &user.RealmID, &user.Username, &user.Email, &user.EmailVerified, &user.DisplayName, &user.Enabled,
 		&user.PlatformAdmin, &user.ManagerID, &user.FederationID, &user.ExternalID, &user.ExternalDN,
 		&user.FederationSyncedAt, &user.FailedAttempts, &user.LockedUntil,
-		&user.PasswordChanged, &user.CreatedAt, &user.UpdatedAt)
+		&user.PasswordChanged, &user.Locked, &user.CreatedAt, &user.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.User{}, ErrNotFound
 	}
@@ -379,7 +379,7 @@ func (s *Store) AuthenticatePassword(ctx context.Context, realm domain.Realm, us
 		&user.ID, &user.RealmID, &user.Username, &user.Email, &user.EmailVerified, &user.DisplayName,
 		&user.Enabled, &user.PlatformAdmin, &user.ManagerID, &user.FederationID, &user.ExternalID,
 		&user.ExternalDN, &user.FederationSyncedAt, &user.FailedAttempts, &user.LockedUntil,
-		&user.PasswordChanged, &user.CreatedAt, &user.UpdatedAt, &passwordHash)
+		&user.PasswordChanged, &user.Locked, &user.CreatedAt, &user.UpdatedAt, &passwordHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Equalize the dominant Argon2 work factor for unknown users.
 		_, _ = s.dummyPasswordVerification(ctx, suppliedPassword)

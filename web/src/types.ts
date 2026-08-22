@@ -40,6 +40,8 @@ export interface User {
   federation_synced_at?: string
   failed_attempts: number
   locked_until?: string
+  /** Whether the lockout is in force now, decided by the server's clock. */
+  locked: boolean
   password_changed_at: string
   created_at: string
   updated_at: string
@@ -172,6 +174,8 @@ export interface APIKey {
   last_used_at?: string
   revoked_at?: string
   rotated_from?: string
+  /** Whether the server would still accept this key. */
+  active: boolean
 }
 
 export interface ApprovalRequest {
