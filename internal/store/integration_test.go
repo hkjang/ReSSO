@@ -1690,3 +1690,101 @@ func TestIntegrationAuthorizationCodeReuseRevokesIssuedRefreshTokens(t *testing.
 		t.Fatalf("unknown code error = %v, want ErrNotFound", err)
 	}
 }
+
+// The approval workflow exists so that nobody grants themselves a role. Its
+// only enforcement is that the reviewer is the requester's manager, and
+// manager_id was accepted without checking who it points at — so pointing it
+// at the requester, or at somebody in another realm entirely, dissolved the
+// control it was there to provide.
+func TestIntegrationApprovalReviewerCannotBeSelfOrForeign(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx, `UPDATE realms SET approval_enabled=true WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	role, err := data.CreateRole(ctx, bootstrap.RealmID, "payments-admin", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "alice", Password: "alice-password-123", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Naming yourself as your own approver must be refused outright.
+	if _, err := data.UpdateUser(ctx, alice.ID, UpdateUserInput{
+		Enabled: true, ManagerID: &alice.ID}); err == nil {
+		t.Error("a user was accepted as their own manager")
+	}
+
+	other, err := data.CreateRealm(ctx, CreateRealmInput{
+		Name: "partner", DisplayName: "Partner", IssuerURL: "https://partner.example.test/realms/partner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsider, err := data.CreateUser(ctx, other.ID, CreateUserInput{
+		Username: "outsider", Password: "outsider-password-123", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.UpdateUser(ctx, alice.ID, UpdateUserInput{
+		Enabled: true, ManagerID: &outsider.ID}); err == nil {
+		t.Error("a manager from another realm was accepted")
+	}
+
+	// Even if such a pairing already exists in an upgraded database, deciding
+	// the request must not work: authorization is checked at the decision.
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET manager_id=$2 WHERE id=$1`, alice.ID, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+	alice, err = data.UserByID(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := data.CreateRoleApprovalRequest(ctx, alice, role.ID, "need it")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.DecideApprovalRequest(ctx, request.ID, alice.ID, false, false, uuid.Nil, true, ""); err == nil {
+		t.Error("a requester approved their own role request")
+	}
+	var granted bool
+	if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id=$1 AND role_id=$2)`,
+		alice.ID, role.ID).Scan(&granted); err != nil {
+		t.Fatal(err)
+	}
+	if granted {
+		t.Error("self-approval granted the role")
+	}
+
+	// The workflow itself must still work: a real manager, in the same realm,
+	// approves and the role lands.
+	lead, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "lead", Password: "lead-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET manager_id=$2 WHERE id=$1`, alice.ID, lead.ID); err != nil {
+		t.Fatal(err)
+	}
+	alice, err = data.UserByID(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legitimate, err := data.CreateRoleApprovalRequest(ctx, alice, role.ID, "still need it")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.DecideApprovalRequest(ctx, legitimate.ID, lead.ID, false, false, uuid.Nil, true, "ok"); err != nil {
+		t.Fatalf("a manager could not approve their report's request: %v", err)
+	}
+	if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id=$1 AND role_id=$2)`,
+		alice.ID, role.ID).Scan(&granted); err != nil {
+		t.Fatal(err)
+	}
+	if !granted {
+		t.Error("an approved request did not grant the role")
+	}
+}

@@ -108,6 +108,36 @@ type CreateUserInput struct {
 	ManagerID     *uuid.UUID `json:"manager_id,omitempty"`
 }
 
+// validateManagerID rejects a manager assignment that would hollow out the
+// approval workflow.
+//
+// A request's reviewer is the requester's manager, and that is the only thing
+// standing between asking for a role and holding it. Pointing manager_id at
+// the user themselves makes the requester their own approver; pointing it into
+// another realm hands the decision to somebody with no standing there, since
+// the reviewer check compares identifiers and not realms. Neither is a
+// meaningful reporting line, so both are refused where they are written.
+func (s *Store) validateManagerID(ctx context.Context, userID, realmID uuid.UUID, managerID *uuid.UUID) error {
+	if managerID == nil {
+		return nil
+	}
+	if *managerID == userID {
+		return fmt.Errorf("%w: a user cannot be their own manager", ErrInvalidManager)
+	}
+	var managerRealm uuid.UUID
+	err := s.Pool.QueryRow(ctx, "SELECT realm_id FROM users WHERE id=$1", *managerID).Scan(&managerRealm)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: manager does not exist", ErrInvalidManager)
+	}
+	if err != nil {
+		return err
+	}
+	if managerRealm != realmID {
+		return fmt.Errorf("%w: manager must belong to the same realm", ErrInvalidManager)
+	}
+	return nil
+}
+
 func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateUserInput) (domain.User, error) {
 	input.Username = strings.TrimSpace(input.Username)
 	var err error
@@ -134,7 +164,11 @@ func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateU
 		return domain.User{}, err
 	}
 	now := time.Now().UTC()
-	user := domain.User{ID: uuid.New(), RealmID: realmID, Username: input.Username, Email: input.Email,
+	userID := uuid.New()
+	if err := s.validateManagerID(ctx, userID, realmID, input.ManagerID); err != nil {
+		return domain.User{}, err
+	}
+	user := domain.User{ID: userID, RealmID: realmID, Username: input.Username, Email: input.Email,
 		EmailVerified: input.Email != "" && input.EmailVerified,
 		DisplayName:   input.DisplayName, Enabled: input.Enabled, ManagerID: input.ManagerID,
 		PasswordChanged: now, CreatedAt: now, UpdatedAt: now}
@@ -172,6 +206,9 @@ func (s *Store) UpdateUser(ctx context.Context, userID uuid.UUID, input UpdateUs
 		return domain.User{}, err
 	}
 	displayName := strings.TrimSpace(input.DisplayName)
+	if err := s.validateManagerID(ctx, userID, current.RealmID, input.ManagerID); err != nil {
+		return domain.User{}, err
+	}
 	emailChanged := !strings.EqualFold(strings.TrimSpace(current.Email), email)
 	if emailChanged || current.DisplayName != displayName {
 		if err := s.updateFederatedAttributes(ctx, current, email, displayName); err != nil {

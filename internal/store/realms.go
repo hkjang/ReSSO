@@ -17,6 +17,11 @@ import (
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
 var ErrInvalidInput = errors.New("invalid input")
+
+// ErrInvalidManager marks a rejected reporting line. It is distinct from a
+// generic invalid input so the console can say which field is wrong and why,
+// rather than leaving an administrator to guess at a bare 400.
+var ErrInvalidManager = errors.New("invalid manager")
 var ErrFederationReadOnly = errors.New("LDAP federation is read-only")
 var ErrFederationPasswordExternal = errors.New("password is managed by the source LDAP directory")
 var ErrFederationOperation = errors.New("LDAP federation operation failed")
