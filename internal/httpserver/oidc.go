@@ -118,20 +118,46 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// max_age caps how long ago the user may have proved who they are. A
+	// relying party sending a small value is gating something on a fresh
+	// proof — a payment, a change of credentials — so reusing an older SSO
+	// session silently would answer a question it did not ask. A malformed
+	// value is refused rather than ignored, because ignoring it looks to the
+	// relying party exactly like a reauthentication that happened.
+	maxAge := -1
+	if raw := strings.TrimSpace(query.Get("max_age")); raw != "" {
+		parsed, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || parsed < 0 {
+			redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "invalid_request", "max_age must be a non-negative number of seconds")
+			return
+		}
+		maxAge = parsed
+	}
 	prompt := query.Get("prompt")
 	if prompt != "login" {
 		if authenticated, sessionErr := s.store.SessionByToken(r.Context(), sessionCookie(r)); sessionErr == nil && authenticated.User.RealmID == realm.ID {
-			code, codeErr := s.store.CreateAuthorizationCode(r.Context(), store.AuthorizationCode{
-				RealmID: realm.ID, ClientID: client.ID, UserID: authenticated.User.ID, SessionID: authenticated.Session.ID,
-				RedirectURI: redirectURI, Scope: scopes, Nonce: query.Get("nonce"), CodeChallenge: challenge,
-				CodeChallengeMethod: method,
-			})
-			if codeErr != nil {
-				redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authorization code could not be created")
+			recentEnough := true
+			if maxAge >= 0 {
+				authTime, authErr := s.store.SessionAuthTime(r.Context(), authenticated.Session.ID)
+				if authErr != nil {
+					redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authentication time is unavailable")
+					return
+				}
+				recentEnough = time.Since(authTime) <= time.Duration(maxAge)*time.Second
+			}
+			if recentEnough {
+				code, codeErr := s.store.CreateAuthorizationCode(r.Context(), store.AuthorizationCode{
+					RealmID: realm.ID, ClientID: client.ID, UserID: authenticated.User.ID, SessionID: authenticated.Session.ID,
+					RedirectURI: redirectURI, Scope: scopes, Nonce: query.Get("nonce"), CodeChallenge: challenge,
+					CodeChallengeMethod: method,
+				})
+				if codeErr != nil {
+					redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authorization code could not be created")
+					return
+				}
+				http.Redirect(w, r, authorizationRedirect(redirectURI, code, query.Get("state"), realm.IssuerURL, authenticated.Session.ID), http.StatusFound)
 				return
 			}
-			http.Redirect(w, r, authorizationRedirect(redirectURI, code, query.Get("state"), realm.IssuerURL, authenticated.Session.ID), http.StatusFound)
-			return
 		}
 	}
 	if prompt == "none" {

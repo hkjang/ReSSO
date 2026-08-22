@@ -3,6 +3,8 @@ package httpserver
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -802,5 +804,95 @@ func TestIntegrationRevocationAuditRecordsWhatWasRevoked(t *testing.T) {
 	}
 	if matched["family_id"] == nil {
 		t.Error("the revoked family was not recorded")
+	}
+}
+
+// max_age is how a relying party demands a fresh proof of identity before
+// something sensitive. It was accepted and ignored, so the request came back
+// with a code minted from whatever session already existed — indistinguishable,
+// from the relying party's side, from a reauthentication that never happened.
+func TestIntegrationMaxAgeForcesReauthentication(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "step-up", Name: "Step Up", Type: "public",
+		RedirectURIs: []string{"https://step-up.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "max-age-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	// Public clients must use PKCE, so every probe carries a valid challenge.
+	verifier := strings.Repeat("step-up-verifier", 4)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	authorize := func(extra string) *url.URL {
+		t.Helper()
+		target := server.URL + "/realms/master/protocol/openid-connect/auth?response_type=code&client_id=step-up" +
+			"&redirect_uri=" + url.QueryEscape("https://step-up.example.test/cb") + "&scope=openid&state=s" +
+			"&code_challenge=" + challenge + "&code_challenge_method=S256" + extra
+		request, reqErr := http.NewRequest(http.MethodGet, target, nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		location, parseErr := url.Parse(response.Header.Get("Location"))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		return location
+	}
+
+	// A generous max_age is satisfied by the session that already exists.
+	if got := authorize("&max_age=3600"); got.Query().Get("code") == "" {
+		t.Fatalf("a fresh session did not satisfy max_age=3600: %s", got)
+	}
+
+	// Age the authentication past what the relying party will accept.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE sso_sessions SET created_at=now()-interval '20 minutes' WHERE id=$1`, session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	stale := authorize("&max_age=300")
+	if stale.Query().Get("code") != "" {
+		t.Errorf("max_age=300 was satisfied by a 20-minute-old authentication: %s", stale)
+	}
+	if stale.Path != "/login" || stale.Query().Get("request") == "" {
+		t.Errorf("a stale authentication did not send the user to sign in again: %s", stale)
+	}
+
+	// With prompt=none there is nobody to ask, so the relying party has to be
+	// told rather than handed a code it asked not to receive.
+	silent := authorize("&max_age=300&prompt=none")
+	if silent.Query().Get("error") != "login_required" {
+		t.Errorf("prompt=none with a stale authentication returned %q", silent.Query().Get("error"))
+	}
+
+	// A value that is not a number is refused, not quietly dropped.
+	malformed := authorize("&max_age=soon")
+	if malformed.Query().Get("error") != "invalid_request" {
+		t.Errorf("malformed max_age returned %q", malformed.Query().Get("error"))
 	}
 }

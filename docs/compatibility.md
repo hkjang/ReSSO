@@ -8,6 +8,8 @@
 | OIDC Discovery | 구현 |
 | Authorization Code | 구현. 1회 사용이며 재사용 시 해당 Session·Client의 Refresh Token 폐기 |
 | PKCE S256 | 구현, Public Client 강제 |
+| `prompt=login` / `prompt=none` | 구현 |
+| `max_age` | 구현. 마지막 인증이 지정한 시간보다 오래되었으면 SSO Session이 있어도 재인증을 요구하며, `prompt=none`이면 `login_required`를 반환합니다 |
 | ID Token / JWT Access Token | RS256 구현 |
 | Refresh Token | 회전·재사용 탐지 구현 |
 | Client Credentials | Confidential Client 구현 |
