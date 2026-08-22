@@ -110,6 +110,8 @@ Client에 Back-Channel Logout URI를 등록하면 Session이 종료될 때(사�
 
 개인 설정 → 개인 API 키에서 `mcp:read` 범위의 키를 만든 후 다음처럼 연결합니다. `api:read`는 개인 REST GET API, 관리자는 추가 `admin:read`로 권한 범위 내 관리 GET API를 호출할 수 있습니다. 변경 API는 CSRF가 적용된 브라우저 세션만 허용합니다.
 
+MCP 도구도 같은 기준을 따릅니다. `mcp:read`만 가진 키는 서비스 상태만 조회할 수 있고, Client·User·Federation 목록을 다루는 도구는 관리자 계정에 `admin:read` 범위가 함께 있어야 `tools/list`에 나타나고 호출할 수 있습니다.
+
 ```json
 {
   "mcpServers": {

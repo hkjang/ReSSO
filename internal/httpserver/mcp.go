@@ -158,16 +158,31 @@ func (s *Server) writeMCPError(w http.ResponseWriter, id json.RawMessage, code i
 	writeJSON(w, http.StatusOK, mcpResponse{JSONRPC: "2.0", ID: id, Error: &mcpError{Code: code, Message: message, Data: data}})
 }
 
+// mcpReadsDirectory reports whether a principal may read the records of
+// people and relying parties rather than just the service's own health.
+//
+// Every user may mint a personal API key carrying mcp:read, so that scope
+// alone establishes only that an agent is acting for someone. The REST routes
+// returning these same records require an administrator holding admin:read,
+// and the member list of a realm is precisely what turns one compromised
+// account into a target list for everyone else, so the bar has to match.
+func mcpReadsDirectory(principal domain.Principal) bool {
+	return (principal.PlatformAdmin || principal.RealmAdmin) && slices.Contains(principal.Scopes, "admin:read")
+}
+
 func (s *Server) mcpTools(principal domain.Principal) []any {
 	tools := []any{
 		map[string]any{"name": "resso_service_status", "description": "ReSSO 버전과 데이터베이스 상태를 조회합니다.",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}},
-		map[string]any{"name": "resso_list_clients", "description": "접근 가능한 Realm의 OIDC Client 목록을 조회합니다. Secret은 반환하지 않습니다.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"realm_id": map[string]any{"type": "string", "format": "uuid"}}, "additionalProperties": false}},
-		map[string]any{"name": "resso_search_users", "description": "접근 가능한 Realm에서 사용자를 검색합니다.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
-				"realm_id": map[string]any{"type": "string", "format": "uuid"}, "query": map[string]any{"type": "string", "minLength": 2}},
-				"required": []string{"query"}, "additionalProperties": false}},
+	}
+	if mcpReadsDirectory(principal) {
+		tools = append(tools,
+			map[string]any{"name": "resso_list_clients", "description": "접근 가능한 Realm의 OIDC Client 목록을 조회합니다. Secret은 반환하지 않습니다.",
+				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"realm_id": map[string]any{"type": "string", "format": "uuid"}}, "additionalProperties": false}},
+			map[string]any{"name": "resso_search_users", "description": "접근 가능한 Realm에서 사용자를 검색합니다.",
+				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
+					"realm_id": map[string]any{"type": "string", "format": "uuid"}, "query": map[string]any{"type": "string", "minLength": 2}},
+					"required": []string{"query"}, "additionalProperties": false}})
 	}
 	if principal.PlatformAdmin && slices.Contains(principal.Scopes, "admin:read") {
 		tools = append(tools, map[string]any{"name": "resso_list_realms", "description": "모든 Realm의 공개 운영 설정을 조회합니다.",
@@ -201,12 +216,9 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 		}
 		output, err = s.store.ListRealms(r.Context())
 	case "resso_list_clients":
-		realmID, parseErr := mcpRealmID(call.Arguments, principal)
+		realmID, parseErr := mcpDirectoryRealm(call.Arguments, principal)
 		if parseErr != nil {
 			return nil, parseErr
-		}
-		if realmID != principal.RealmID && (!principal.PlatformAdmin || !slices.Contains(principal.Scopes, "admin:read")) {
-			return nil, errors.New("다른 Realm을 조회할 권한이 없습니다")
 		}
 		output, err = s.store.ListClients(r.Context(), realmID)
 	case "resso_list_user_federations":
@@ -239,15 +251,9 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 		if err := json.Unmarshal(call.Arguments, &args); err != nil || len([]rune(strings.TrimSpace(args.Query))) < 2 {
 			return nil, errors.New("두 글자 이상의 query가 필요합니다")
 		}
-		realmID := principal.RealmID
-		if args.RealmID != "" {
-			realmID, err = uuid.Parse(args.RealmID)
-			if err != nil {
-				return nil, errors.New("realm_id가 올바른 UUID가 아닙니다")
-			}
-		}
-		if realmID != principal.RealmID && (!principal.PlatformAdmin || !slices.Contains(principal.Scopes, "admin:read")) {
-			return nil, errors.New("다른 Realm을 조회할 권한이 없습니다")
+		realmID, permitErr := mcpDirectoryRealm(call.Arguments, principal)
+		if permitErr != nil {
+			return nil, permitErr
 		}
 		output, err = s.store.ListUsers(r.Context(), realmID, args.Query, store.UserSort{}, 20, 0)
 	default:
@@ -262,6 +268,23 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 	}
 	return map[string]any{"content": []any{map[string]any{"type": "text", "text": string(encoded)}},
 		"structuredContent": output, "isError": false}, nil
+}
+
+// mcpDirectoryRealm resolves which realm a directory tool should read, and
+// refuses the request outright when the caller would not be allowed to ask.
+// Reaching outside one's own realm stays reserved for platform administrators.
+func mcpDirectoryRealm(raw json.RawMessage, principal domain.Principal) (uuid.UUID, error) {
+	if !mcpReadsDirectory(principal) {
+		return uuid.Nil, errors.New("관리자 권한과 admin:read 범위가 필요합니다")
+	}
+	realmID, err := mcpRealmID(raw, principal)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if realmID != principal.RealmID && !principal.PlatformAdmin {
+		return uuid.Nil, errors.New("다른 Realm을 조회할 권한이 없습니다")
+	}
+	return realmID, nil
 }
 
 func mcpRealmID(raw json.RawMessage, principal domain.Principal) (uuid.UUID, error) {

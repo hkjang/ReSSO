@@ -565,3 +565,89 @@ func TestIntegrationQuickSearchPointsAtRoutesTheConsoleHas(t *testing.T) {
 		}
 	}
 }
+
+// A personal API key carrying only mcp:read belongs to whoever asked for one —
+// every user may mint one. The directory tools must still refuse it: the REST
+// routes that return the same records sit behind requireAdmin, and reading the
+// member list of a realm is what turns one compromised account into a target
+// list for the rest.
+func TestIntegrationMCPDirectoryToolsRefuseNonAdminKeys(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intern, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "intern", Password: "intern-password-123", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	internKey, err := data.CreatePersonalAPIKey(ctx, intern.ID, "agent", []string{"mcp:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminKey, err := data.CreatePersonalAPIKey(ctx, bootstrap.AdminUserID, "agent",
+		[]string{"mcp:read", "admin:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+
+	listed := callIntegrationMCP(t, client, server.URL, internKey.Secret,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
+	for _, name := range []string{"resso_search_users", "resso_list_clients"} {
+		if strings.Contains(listed, name) {
+			t.Errorf("tools/list offered %s to a non-admin key: %s", name, listed)
+		}
+	}
+
+	for _, call := range []string{
+		`{"name":"resso_search_users","arguments":{"query":"ad"}}`,
+		`{"name":"resso_list_clients","arguments":{}}`,
+	} {
+		body := callIntegrationMCP(t, client, server.URL, internKey.Secret,
+			`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":`+call+`}`)
+		if !strings.Contains(body, `"isError":true`) {
+			t.Errorf("non-admin key ran %s: %s", call, body)
+		}
+		if strings.Contains(body, "admin") && !strings.Contains(body, `"isError":true`) {
+			t.Errorf("non-admin key read directory records: %s", body)
+		}
+	}
+
+	// The same tools must keep working for a key that does carry admin:read,
+	// so the fix bounds the audience rather than removing the capability.
+	body := callIntegrationMCP(t, client, server.URL, adminKey.Secret,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"resso_search_users","arguments":{"query":"ad"}}}`)
+	if strings.Contains(body, `"isError":true`) || !strings.Contains(body, `"username":"admin"`) {
+		t.Fatalf("admin key could not search users: %s", body)
+	}
+}
+
+func callIntegrationMCP(t *testing.T, client *http.Client, baseURL, token, payload string) string {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/mcp", strings.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("MCP status = %d, body=%s", response.StatusCode, body)
+	}
+	return string(body)
+}
