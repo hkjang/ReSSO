@@ -352,11 +352,16 @@ func (s *Store) ChangePassword(ctx context.Context, userID uuid.UUID, current, r
 }
 
 type AuthenticationResult struct {
-	User           domain.User
-	Success        bool
-	FailureReason  string
-	SessionSeconds int
-	AuthMethod     string
+	User          domain.User
+	Success       bool
+	FailureReason string
+	// CredentialsValid reports that the password was right even though the
+	// attempt failed, which happens when the account is locked or disabled.
+	// It is what lets the caller name the real obstacle without telling an
+	// anonymous guesser that the account exists.
+	CredentialsValid bool
+	SessionSeconds   int
+	AuthMethod       string
 }
 
 // AuthenticatePassword verifies a local password without holding a database
@@ -383,12 +388,24 @@ func (s *Store) AuthenticatePassword(ctx context.Context, realm domain.Realm, us
 	if err != nil {
 		return AuthenticationResult{}, err
 	}
-	if reason := accountFailureReason(realm, user, time.Now().UTC()); reason != "" {
-		return AuthenticationResult{User: user, FailureReason: reason}, nil
-	}
+	// The password is checked even when the account is already barred, for two
+	// reasons. Skipping the hash answered a locked account in a fraction of
+	// the time an ordinary rejection takes, which told an attacker the account
+	// exists and is locked — exactly what the identical error message is there
+	// to withhold, and the same leak the dummy verification above exists to
+	// close for unknown users. And knowing the credentials were right is what
+	// makes it safe to tell the person that their account is locked rather
+	// than that they have forgotten their password: whoever supplies the
+	// correct password already knows more than enumeration would reveal.
+	barred := accountFailureReason(realm, user, time.Now().UTC())
 	ok, verifyErr := password.VerifyContext(ctx, suppliedPassword, passwordHash)
 	if verifyErr != nil {
 		return AuthenticationResult{}, verifyErr
+	}
+	if barred != "" {
+		// No failure is recorded: the account is already barred, and counting
+		// these would let an attacker keep extending someone's lockout.
+		return AuthenticationResult{User: user, FailureReason: barred, CredentialsValid: ok}, nil
 	}
 	if !ok {
 		locked, err := s.recordFailedLogin(ctx, user.ID)

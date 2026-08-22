@@ -39,6 +39,7 @@ export function LoginPage() {
   // exists or is currently locked.
   const [failures, setFailures] = useState(0)
   const [waitSeconds, setWaitSeconds] = useState(0)
+  const [lockedOut, setLockedOut] = useState(false)
   const challenge = useQuery({
     queryKey: ['auth-challenge', requestToken],
     queryFn: () => api<Challenge>(`/api/v1/auth/challenge/${encodeURIComponent(requestToken)}`),
@@ -64,8 +65,12 @@ export function LoginPage() {
     },
     onError: (error) => {
       setFailures((count) => count + 1)
-      if (error instanceof APIError && error.status === 429) {
+      // A lockout carries its own Retry-After, so the countdown that already
+      // exists for rate limiting can tell the user exactly when they may try
+      // again instead of leaving them to keep guessing at their password.
+      if (error instanceof APIError && (error.status === 429 || error.code === 'account_locked')) {
         setWaitSeconds(error.retryAfterSeconds ?? 60)
+        setLockedOut(error.code === 'account_locked')
       }
     },
   })
@@ -102,7 +107,12 @@ export function LoginPage() {
           {expired && !errorMessage && <Alert severity="warning" sx={{ mb: 2 }}>세션이 만료되어 로그아웃되었습니다. 다시 로그인하세요.</Alert>}
           {challenge.isError && <Alert severity="error" sx={{ mb: 2 }}>로그인 요청이 만료되었습니다. 연결한 서비스에서 다시 시작하세요.</Alert>}
           {errorMessage && !rateLimited && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
-          {rateLimited && (
+          {rateLimited && lockedOut && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              연속된 로그인 실패로 계정이 잠겼습니다. <strong>{formatWait(waitSeconds)}</strong> 후에 다시 시도하거나, 관리자에게 잠금 해제를 요청하세요.
+            </Alert>
+          )}
+          {rateLimited && !lockedOut && (
             <Alert severity="warning" sx={{ mb: 2 }}>
               로그인 시도가 제한되었습니다. <strong>{formatWait(waitSeconds)}</strong> 후에 다시 시도할 수 있습니다.
             </Alert>

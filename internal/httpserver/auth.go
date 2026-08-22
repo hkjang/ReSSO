@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -117,6 +118,27 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		})
 		if !failureDecision.Allowed {
 			writeLoginRateLimited(w, r, failureDecision.RetryAfterSeconds)
+			return
+		}
+		// Someone who supplied the right password and is still refused is
+		// locked out, not mistaken about their password. Telling them so —
+		// and when it lifts — is what stops them working through variations,
+		// extending nothing and calling the help desk about the wrong
+		// problem. It reveals the account exists only to a caller who already
+		// proved they know its password.
+		if result.CredentialsValid && result.FailureReason == "ACCOUNT_LOCKED" && result.User.LockedUntil != nil {
+			remaining := int(time.Until(*result.User.LockedUntil).Round(time.Minute) / time.Minute)
+			if remaining < 1 {
+				remaining = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(int(time.Until(*result.User.LockedUntil).Seconds())+1))
+			writeError(w, r, http.StatusUnauthorized, "account_locked",
+				fmt.Sprintf("연속된 로그인 실패로 계정이 잠겼습니다. 약 %d분 뒤에 다시 시도하거나 관리자에게 잠금 해제를 요청하세요.", remaining))
+			return
+		}
+		if result.CredentialsValid && result.FailureReason == "ACCOUNT_DISABLED" {
+			writeError(w, r, http.StatusUnauthorized, "account_disabled",
+				"계정이 비활성화되어 있습니다. 관리자에게 문의하세요.")
 			return
 		}
 		message := "아이디 또는 비밀번호가 올바르지 않습니다."

@@ -1943,3 +1943,69 @@ func TestIntegrationRefreshRotationDoesNotExtendTheFamilyLifetime(t *testing.T) 
 		t.Errorf("rotation moved the expiry by %s; the family lifetime must be fixed at issuance", drift)
 	}
 }
+
+// A locked account used to be refused without the password ever being hashed,
+// so it answered in a fraction of the time an ordinary rejection takes. The
+// login error is deliberately identical for every failure, and that timing
+// gap handed back exactly what the wording withholds: this account exists and
+// is locked. Verifying regardless also tells the caller whether the password
+// was right, which is what makes it safe to name the real obstacle.
+func TestIntegrationLockedAccountStillVerifiesThePassword(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE realms SET max_login_attempts=3, lockout_seconds=600 WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "victim-password-1234"
+	victim, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "victim", Password: secret, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if _, err := data.AuthenticatePassword(ctx, realm, "victim", "wrong-password-here"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locked, err := data.UserByID(ctx, victim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if locked.LockedUntil == nil {
+		t.Fatal("the account was not locked by repeated failures")
+	}
+
+	wrong, err := data.AuthenticatePassword(ctx, realm, "victim", "still-wrong-here")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrong.FailureReason != "ACCOUNT_LOCKED" || wrong.CredentialsValid {
+		t.Errorf("locked with a wrong password = %+v", wrong)
+	}
+	right, err := data.AuthenticatePassword(ctx, realm, "victim", secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if right.Success {
+		t.Error("a locked account was allowed in")
+	}
+	if right.FailureReason != "ACCOUNT_LOCKED" || !right.CredentialsValid {
+		t.Errorf("locked with the right password = %+v", right)
+	}
+
+	// Attempts against a locked account must not push the lockout further out,
+	// or anyone could keep a colleague signed out indefinitely.
+	after, err := data.UserByID(ctx, victim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.LockedUntil == nil || !after.LockedUntil.Equal(*locked.LockedUntil) {
+		t.Errorf("the lockout moved: %v then %v", locked.LockedUntil, after.LockedUntil)
+	}
+}
