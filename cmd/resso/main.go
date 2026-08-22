@@ -232,7 +232,12 @@ func maintenance(ctx context.Context, data *store.Store, logger *slog.Logger) {
 	case <-startup.C:
 		prune()
 	}
-	ticker := time.NewTicker(24 * time.Hour)
+	// Hourly rather than daily. The long retentions here settle after the
+	// first pass and delete almost nothing afterwards, but the short-lived
+	// tables — expired pending authorizations above all — accumulate from
+	// unauthenticated traffic, and a daily sweep let a burst sit on disk for
+	// up to two days after it ended.
+	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for {
 		select {

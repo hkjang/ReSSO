@@ -2223,3 +2223,44 @@ func TestIntegrationOIDCUseKeepsASessionFromGoingIdle(t *testing.T) {
 		t.Errorf("an idle session stayed usable: %v", err)
 	}
 }
+
+// The authorization endpoint writes a row for every sign-in that needs a login
+// screen, and reaching it takes only a client identifier and a redirect URI —
+// both visible in any relying party's sign-in link. Anyone can therefore drive
+// one insert per request, so an expired row must not linger: it is invisible
+// to every reader from the moment it expires.
+func TestIntegrationExpiredPendingAuthorizationsAreSweptPromptly(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	pending := func(expiresAt time.Time) string {
+		t.Helper()
+		token, err := data.CreateAuthorizationRequest(ctx, AuthorizationRequest{
+			RealmID: bootstrap.RealmID, ClientID: clientID, RedirectURI: "https://client.example.test/callback",
+			ResponseType: "code", Scope: []string{"openid"}, ExpiresAt: expiresAt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return token
+	}
+	stale := pending(time.Now().UTC().Add(-time.Minute))
+	live := pending(time.Now().UTC().Add(5 * time.Minute))
+
+	if _, err := data.AuthorizationRequestByToken(ctx, stale); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("an expired request was still readable: %v", err)
+	}
+	if err := data.PruneOperationalData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM authorization_requests`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Errorf("rows left after the sweep = %d, want 1", remaining)
+	}
+	if _, err := data.AuthorizationRequestByToken(ctx, live); err != nil {
+		t.Errorf("the sweep took a request that was still valid: %v", err)
+	}
+}

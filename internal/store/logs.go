@@ -99,7 +99,14 @@ func (s *Store) PruneOperationalData(ctx context.Context) error {
 		"UPDATE signing_keys SET status='RETIRED' WHERE status='PASSIVE' AND retire_at<now()",
 		"DELETE FROM system_logs WHERE occurred_at < now() - interval '30 days'",
 		"DELETE FROM audit_events WHERE occurred_at < now() - interval '365 days'",
-		"DELETE FROM authorization_requests WHERE expires_at < now() - interval '1 day'",
+		// A pending request is invisible to every reader the moment it
+		// expires, so the extra day bought nothing — and this table fills
+		// from unauthenticated traffic. Reaching the endpoint that writes a
+		// row needs only a client identifier and a redirect URI, both of
+		// which appear in any relying party's sign-in link, so anyone can
+		// drive one insert per request. Keeping those for a day turned a
+		// burst of traffic into storage that outlives it.
+		"DELETE FROM authorization_requests WHERE expires_at < now()",
 		// An authorization code outlives its usefulness as a credential in
 		// ninety seconds, but it is also the only record that a client took
 		// part in a session — back-channel logout reads it to decide who to
