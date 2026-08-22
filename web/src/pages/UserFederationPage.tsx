@@ -131,7 +131,7 @@ export function UserFederationPage() {
     enabled: Boolean(selection.realmID),
     // Poll only while something is running, so a finished synchronization
     // reports itself without the page refetching forever.
-    refetchInterval: (query) => query.state.data?.items.some((item) => item.last_sync_status === 'RUNNING') ? 5_000 : false,
+    refetchInterval: (query) => query.state.data?.items.some((item) => item.sync_running) ? 5_000 : false,
   })
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['ldap-federations', selection.realmID] })
   const save = useMutation({
@@ -160,7 +160,11 @@ export function UserFederationPage() {
     onSuccess: async () => { setDeleteOpen(false); setUnlinkUsers(false); setDrawerOpen(false); setEditing(null); await invalidate() },
   })
   const liveEditing = providers.data?.items.find((item) => item.id === editing?.id) ?? editing
-  const syncRunning = liveEditing?.last_sync_status === 'RUNNING'
+  // The server reconciles this against how long ago the run reported in: a
+  // sync whose process died leaves last_sync_status saying RUNNING for ever,
+  // and believing that column kept the button disabled and the page polling
+  // with no way back.
+  const syncRunning = liveEditing?.sync_running ?? false
   const openCreate = () => { setEditing(null); setForm({ ...presets.OTHER }); setDrawerOpen(true) }
   const openEdit = (item: LDAPFederation) => { setEditing(item); setForm(toForm(item)); setDrawerOpen(true); setTestUsername(''); setTestPassword('') }
   const applyPreset = (vendor: 'OTHER' | 'AD') => setForm({ ...presets[vendor], name: form.name || presets[vendor].name, priority: form.priority, enabled: form.enabled })
@@ -188,7 +192,7 @@ export function UserFederationPage() {
             <TableCell><Typography className="mono" variant="body2" sx={{ maxWidth: 360, overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.connection_url}</Typography></TableCell>
             <TableCell><Chip size="small" variant="outlined" label={item.edit_mode} /></TableCell>
             <TableCell>{item.last_sync_at ? <><Typography variant="body2">{formatDate(item.last_sync_at)}</Typography><Typography variant="caption" color="text.secondary">추가 {item.last_sync_added} · 갱신 {item.last_sync_updated} · 실패 {item.last_sync_failed}</Typography></> : '실행 전'}</TableCell>
-            <TableCell><StatusChip active={item.enabled && item.last_sync_status !== 'FAILURE'} activeLabel={item.last_sync_status === 'RUNNING' ? '동기화 중' : '활성'} inactiveLabel={!item.enabled ? '비활성' : '동기화 실패'} /></TableCell>
+            <TableCell><StatusChip active={item.enabled && item.last_sync_status !== 'FAILURE'} activeLabel={item.sync_running ? '동기화 중' : '활성'} inactiveLabel={!item.enabled ? '비활성' : '동기화 실패'} /></TableCell>
           </TableRow>)}</TableBody></Table></TableContainer>}
     </ContentCard>
 

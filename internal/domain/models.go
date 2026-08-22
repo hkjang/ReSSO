@@ -88,8 +88,14 @@ type LDAPFederation struct {
 	LastSyncAdded            int               `json:"last_sync_added"`
 	LastSyncUpdated          int               `json:"last_sync_updated"`
 	LastSyncFailed           int               `json:"last_sync_failed"`
-	CreatedAt                time.Time         `json:"created_at"`
-	UpdatedAt                time.Time         `json:"updated_at"`
+	// SyncRunning is the reconciled answer to "is a run happening now", not
+	// the raw status column. A run whose process died leaves that column
+	// saying RUNNING for ever, and the console used to believe it: the sync
+	// button stayed disabled and the page polled every few seconds, with no
+	// way back, while the server would have accepted a new run.
+	SyncRunning bool      `json:"sync_running"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type Client struct {

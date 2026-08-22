@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,13 +17,19 @@ import (
 	"github.com/hkjang/ReSSO/internal/password"
 )
 
-const ldapFederationColumns = `id,realm_id,name,vendor,priority,enabled,connection_url,start_tls,
+var ldapFederationColumns = `id,realm_id,name,vendor,priority,enabled,connection_url,start_tls,
     ca_certificate,bind_dn,bind_credential_cipher,users_dn,username_ldap_attribute,rdn_ldap_attribute,
     uuid_ldap_attribute,user_object_classes,user_ldap_filter,search_scope,email_ldap_attribute,
     first_name_ldap_attribute,last_name_ldap_attribute,display_name_ldap_attribute,member_of_ldap_attribute,
     group_role_mappings,import_enabled,sync_registrations,missing_user_action,edit_mode,batch_size,
     sync_period_seconds,next_sync_at,last_sync_at,last_sync_status,last_sync_error,last_sync_added,
-    last_sync_updated,last_sync_failed,created_at,updated_at`
+    last_sync_updated,last_sync_failed,
+    (last_sync_status='RUNNING' AND updated_at >= now()-make_interval(secs => ` + staleSyncAfterSeconds + `)),
+    created_at,updated_at`
+
+// staleSyncAfterSeconds carries staleSyncAfter into the column list so the
+// listed answer and the guard that refuses a second run cannot drift apart.
+var staleSyncAfterSeconds = strconv.Itoa(int(staleSyncAfter.Seconds()))
 
 type LDAPFederationInput struct {
 	Name                     string            `json:"name"`
@@ -95,7 +102,8 @@ func (s *Store) scanLDAPFederation(row pgx.Row) (ldapRuntime, error) {
 		&runtime.Provider.EditMode, &runtime.Provider.BatchSize, &runtime.Provider.SyncPeriodSeconds,
 		&runtime.Provider.NextSyncAt, &runtime.Provider.LastSyncAt, &runtime.Provider.LastSyncStatus,
 		&runtime.Provider.LastSyncError, &runtime.Provider.LastSyncAdded, &runtime.Provider.LastSyncUpdated,
-		&runtime.Provider.LastSyncFailed, &runtime.Provider.CreatedAt, &runtime.Provider.UpdatedAt)
+		&runtime.Provider.LastSyncFailed, &runtime.Provider.SyncRunning,
+		&runtime.Provider.CreatedAt, &runtime.Provider.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ldapRuntime{}, ErrNotFound
 	}
@@ -402,8 +410,8 @@ const staleSyncAfter = 30 * time.Minute
 func (s *Store) LDAPSyncRunning(ctx context.Context, id uuid.UUID) (bool, error) {
 	var running bool
 	err := s.Pool.QueryRow(ctx, `SELECT last_sync_status='RUNNING'
-        AND updated_at >= now()-make_interval(secs => $2) FROM user_federations WHERE id=$1`,
-		id, int(staleSyncAfter.Seconds())).Scan(&running)
+        AND updated_at >= now()-make_interval(secs => `+staleSyncAfterSeconds+`)
+        FROM user_federations WHERE id=$1`, id).Scan(&running)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrNotFound
 	}

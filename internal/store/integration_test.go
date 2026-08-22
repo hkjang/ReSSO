@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hkjang/ReSSO/internal/cryptoutil"
+	"github.com/hkjang/ReSSO/internal/domain"
 	"github.com/hkjang/ReSSO/internal/password"
 )
 
@@ -2262,5 +2263,68 @@ func TestIntegrationExpiredPendingAuthorizationsAreSweptPromptly(t *testing.T) {
 	}
 	if _, err := data.AuthorizationRequestByToken(ctx, live); err != nil {
 		t.Errorf("the sweep took a request that was still valid: %v", err)
+	}
+}
+
+// "Is a sync running" had two answers. The guard that refuses a second run
+// bounded the RUNNING status by how long ago it reported in; the listed
+// provider carried the raw column. A run whose process died — a container
+// stopped during a directory walk that may take half an hour — leaves that
+// column saying RUNNING for ever, so the console disabled the sync button and
+// polled every few seconds with no way back, while the server would have
+// accepted a new run all along.
+func TestIntegrationStaleSyncIsNotReportedAsRunning(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldaps://ldap.invalid:636",
+		UsersDN: "ou=people,dc=example,dc=com", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := data.ClaimLDAPSyncForTest(ctx, provider.ID)
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, err = %v", claimed, err)
+	}
+	listed := func() domain.LDAPFederation {
+		t.Helper()
+		items, listErr := data.ListLDAPFederations(ctx, bootstrap.RealmID)
+		if listErr != nil || len(items) != 1 {
+			t.Fatalf("list = %d items, err = %v", len(items), listErr)
+		}
+		return items[0]
+	}
+	running, err := data.LDAPSyncRunning(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !running || !listed().SyncRunning {
+		t.Fatalf("a claimed sync was not reported as running: guard=%v listed=%v", running, listed().SyncRunning)
+	}
+
+	// The process dies without ever reporting back.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET updated_at=now()-interval '2 hours' WHERE id=$1`, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	running, err = data.LDAPSyncRunning(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := listed()
+	if running {
+		t.Error("the guard still considered an abandoned run to be running")
+	}
+	if stale.SyncRunning {
+		t.Error("the listed provider still reported a run in progress, which locks the console out")
+	}
+	if stale.LastSyncStatus != "RUNNING" {
+		t.Errorf("the raw status was expected to remain RUNNING, got %q", stale.LastSyncStatus)
 	}
 }
