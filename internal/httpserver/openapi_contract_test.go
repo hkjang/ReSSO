@@ -117,3 +117,83 @@ func TestOpenAPICoversEveryRegisteredRoute(t *testing.T) {
 		t.Fatalf("routes missing from the OpenAPI document:\n  %s", strings.Join(missing, "\n  "))
 	}
 }
+
+// The console offers this document as the API contract and the service
+// promises a consistent error format, so every operation has to describe what
+// a refusal looks like — and every schema it points at has to exist, since a
+// dangling $ref breaks generation for the whole document, not just one path.
+func TestOpenAPIDescribesErrorsAndResolvesEveryReference(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/openapi.json", nil)
+	response := httptest.NewRecorder()
+	(&Server{}).openAPISpec(response, request)
+	var document map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	components, _ := document["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+	if _, ok := schemas["Error"]; !ok {
+		t.Fatal("the document defines no Error schema")
+	}
+
+	paths, _ := document["paths"].(map[string]any)
+	if len(paths) == 0 {
+		t.Fatal("the document defines no paths")
+	}
+	for path, rawItem := range paths {
+		item, _ := rawItem.(map[string]any)
+		for method, rawOperation := range item {
+			if method == "parameters" {
+				continue
+			}
+			operation, _ := rawOperation.(map[string]any)
+			responses, _ := operation["responses"].(map[string]any)
+			for _, status := range []string{"4XX", "5XX"} {
+				response, ok := responses[status].(map[string]any)
+				if !ok {
+					t.Errorf("%s %s does not describe a %s response", method, path, status)
+					continue
+				}
+				if _, ok := response["content"]; !ok {
+					t.Errorf("%s %s describes %s without a body schema", method, path, status)
+				}
+			}
+		}
+	}
+
+	for _, ref := range collectRefs(document) {
+		name, found := strings.CutPrefix(ref, "#/components/schemas/")
+		if !found {
+			t.Errorf("unexpected reference form: %s", ref)
+			continue
+		}
+		if _, ok := schemas[name]; !ok {
+			t.Errorf("the document references a schema it does not define: %s", name)
+		}
+	}
+}
+
+// collectRefs walks the decoded document and returns every $ref value.
+func collectRefs(node any) []string {
+	switch typed := node.(type) {
+	case map[string]any:
+		refs := make([]string, 0)
+		for key, value := range typed {
+			if key == "$ref" {
+				if ref, ok := value.(string); ok {
+					refs = append(refs, ref)
+				}
+				continue
+			}
+			refs = append(refs, collectRefs(value)...)
+		}
+		return refs
+	case []any:
+		refs := make([]string, 0)
+		for _, value := range typed {
+			refs = append(refs, collectRefs(value)...)
+		}
+		return refs
+	}
+	return nil
+}
