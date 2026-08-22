@@ -1788,3 +1788,55 @@ func TestIntegrationApprovalReviewerCannotBeSelfOrForeign(t *testing.T) {
 		t.Error("an approved request did not grant the role")
 	}
 }
+
+// A refresh that fails after the rotation has committed must not cost the
+// client its token family. The exchange is two steps — rotate, then issue —
+// and if the second fails the caller never receives the new token while the
+// old one is already marked rotated. Once the grace window passes, presenting
+// the only token it still holds looks exactly like theft.
+func TestIntegrationFailedRefreshExchangeDoesNotStrandTheClient(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	userID := bootstrap.AdminUserID
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+		UserID: &userID, Scope: []string{"openid"}, ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, _, err := data.InspectRefreshToken(ctx, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, _, err := data.RotateRefreshToken(ctx, raw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stand in for the issue step failing: the caller never saw rotated.
+	if err := data.RollbackRefreshRotation(ctx, original.ID, rotated.ID); err != nil {
+		t.Fatal(err)
+	}
+	var orphans int
+	if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM refresh_tokens WHERE id=$1`, rotated.ID).Scan(&orphans); err != nil {
+		t.Fatal(err)
+	}
+	if orphans != 0 {
+		t.Error("the undelivered token was left behind")
+	}
+
+	// The grace window must not be what saves the retry, so age the rotation
+	// past it before trying again.
+	if _, err := data.Pool.Exec(ctx, `UPDATE refresh_tokens SET rotated_at=now()-interval '10 minutes'
+		WHERE id=$1 AND rotated_at IS NOT NULL`, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	retry, _, err := data.RotateRefreshToken(ctx, raw, nil)
+	if err != nil {
+		t.Fatalf("the client's only refresh token was rejected after a failed exchange: %v", err)
+	}
+	if retry.FamilyID != original.FamilyID {
+		t.Errorf("retry started a new family: %v want %v", retry.FamilyID, original.FamilyID)
+	}
+}

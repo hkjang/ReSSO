@@ -249,6 +249,14 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 		}
 		inspected.Scope = reducedScopes
 	}
+	// Checked before the rotation, not after: a disabled account is the
+	// likeliest reason for this exchange to fail, and rotating first would
+	// spend the caller's token to reject it.
+	user, err := s.store.UserByID(r.Context(), *inspected.UserID)
+	if err != nil || !user.Enabled {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "user is unavailable")
+		return
+	}
 	rotated, rawNew, err := s.store.RotateRefreshToken(r.Context(), raw, reducedScopes)
 	if err != nil {
 		if errors.Is(err, store.ErrTokenReuse) {
@@ -258,17 +266,19 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 		return
 	}
 	rotated.Scope = inspected.Scope
-	user, err := s.store.UserByID(r.Context(), *rotated.UserID)
-	if err != nil || !user.Enabled {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "user is unavailable")
-		return
-	}
 	response, err := s.oidc.IssueRefreshedUserTokens(r.Context(), realm, client, user, rotated, rawNew)
 	if err != nil {
+		// The caller never received rawNew, so leaving the old token rotated
+		// would turn this failure into a revoked family on the next attempt.
+		if rollbackErr := s.store.RollbackRefreshRotation(r.Context(), inspected.ID, rotated.ID); rollbackErr != nil {
+			s.logger.Error("refresh rotation could not be undone", "trace_id", traceIDFrom(r.Context()),
+				"client", client.ClientID, "error", rollbackErr)
+		}
 		if errors.Is(err, store.ErrNotFound) {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization session is no longer active")
 			return
 		}
+		s.logger.Error("refresh token issue failed", "trace_id", traceIDFrom(r.Context()), "error", err)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}

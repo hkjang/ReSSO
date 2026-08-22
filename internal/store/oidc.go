@@ -301,6 +301,43 @@ func (s *Store) InspectRefreshToken(ctx context.Context, raw string) (RefreshTok
 	return token, active, err
 }
 
+// RollbackRefreshRotation undoes a rotation whose exchange never completed.
+//
+// Refreshing is two steps: rotate the token, then mint the tokens that go back
+// to the caller. If the second step fails — the signing key cannot be opened,
+// the session ended between the two, the database stumbled — the caller is
+// left holding a token the server has already marked rotated. It works for the
+// length of the grace window and then, on the next attempt, looks exactly like
+// a replayed token: the family is revoked, the user is signed out of that
+// relying party, and an incident that never happened is written to the audit
+// log. Undoing the rotation is what makes the caller's retry ordinary.
+//
+// Only an untouched successor is removed. If a concurrent refresh has already
+// built on it, that exchange succeeded and its tokens are somebody's now.
+func (s *Store) RollbackRefreshRotation(ctx context.Context, oldID, newID uuid.UUID) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, `DELETE FROM refresh_tokens
+        WHERE id=$1 AND rotated_at IS NULL AND revoked_at IS NULL`, newID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 0 {
+		return nil
+	}
+	// The predecessor is restored only while it is still the live token, so a
+	// family revoked in the meantime stays revoked.
+	if _, err := tx.Exec(ctx, `UPDATE refresh_tokens SET rotated_at=NULL
+        WHERE id=$1 AND revoked_at IS NULL
+        AND NOT EXISTS(SELECT 1 FROM refresh_tokens c WHERE c.parent_id=$1)`, oldID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Store) RevokeRefreshToken(ctx context.Context, raw string) error {
 	_, err := s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
         WHERE family_id=(SELECT family_id FROM refresh_tokens WHERE token_hash=ANY($1::bytea[]) LIMIT 1)`, s.Sealer.Digests(raw))

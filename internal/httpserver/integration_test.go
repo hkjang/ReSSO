@@ -651,3 +651,74 @@ func callIntegrationMCP(t *testing.T, client *http.Client, baseURL, token, paylo
 	}
 	return string(body)
 }
+
+// The refresh exchange rotates before it issues. A rejection that happens
+// after the rotation costs the relying party the only token it holds: it works
+// for the length of the grace window and then reads as a replay, revoking the
+// family and reporting a theft that never happened. Rejecting before the
+// rotation is what keeps the caller whole.
+func TestIntegrationRefreshFailureLeavesTheClientsTokenUsable(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "refresh-probe", Name: "Refresh Probe", Type: "public",
+		RedirectURIs: []string{"https://probe.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "refresh-integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: created.Client.ID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	// A disabled account is the common way this exchange fails, and the
+	// rejection must not cost the caller its token.
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET enabled=false WHERE id=$1`, userID); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {raw}, "client_id": {"refresh-probe"}}
+	response, err := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("refresh for a disabled account status = %d", response.StatusCode)
+	}
+
+	var rotatedAt *time.Time
+	var children int
+	if err := data.Pool.QueryRow(ctx, `SELECT rotated_at,
+		(SELECT count(*) FROM refresh_tokens c WHERE c.parent_id=t.id) FROM refresh_tokens t
+		WHERE t.session_id=$1 AND t.parent_id IS NULL`, sessionID).Scan(&rotatedAt, &children); err != nil {
+		t.Fatal(err)
+	}
+	if rotatedAt != nil {
+		t.Error("the client's token was left marked rotated after a failed exchange")
+	}
+	if children != 0 {
+		t.Errorf("an undelivered successor token was left behind: %d", children)
+	}
+}
