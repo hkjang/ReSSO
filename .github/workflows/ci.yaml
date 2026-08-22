@@ -85,6 +85,18 @@ jobs:
           set -euo pipefail
           container="$(docker ps -q --filter ancestor=osixia/openldap:1.5.0)"
           test -n "$container" || { echo "the directory service is not running" >&2; exit 1; }
+          # Group membership only reaches an entry's memberOf through this
+          # overlay, and the role mapping tests read it there.
+          database="$(docker exec "$container" ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config \
+            "(olcSuffix=dc=example,dc=test)" dn 2>/dev/null | awk '/^dn: / && !seen {print substr($0,5); seen=1}')"
+          test -n "$database" || { echo "the directory database was not found" >&2; exit 1; }
+          docker exec -i "$container" ldapadd -Y EXTERNAL -H ldapi:/// >/dev/null <<OVERLAY
+          dn: olcOverlay=memberof,$database
+          objectClass: olcOverlayConfig
+          objectClass: olcMemberOf
+          olcOverlay: memberof
+          olcMemberOfRefint: TRUE
+          OVERLAY
           # docker exec attaches no stdin without -i, so a heredoc reaches
           # ldapadd as an empty stream: it adds nothing and still exits 0.
           docker exec -i "$container" ldapadd -x -H ldap://localhost \

@@ -10,7 +10,8 @@ ReSSO의 User Federation은 Realm별로 여러 LDAP/Active Directory 공급자�
 docker run -d --name resso-test-ldap -p 127.0.0.1:13890:389 \
   -e LDAP_ORGANISATION="ReSSO Test" -e LDAP_DOMAIN="example.test" \
   -e LDAP_ADMIN_PASSWORD="adminpassword" osixia/openldap:1.5.0
-# 사용자 시딩은 CI 워크플로의 "Seed the test directory" 단계와 동일한 LDIF를 사용합니다.
+# 사용자 시딩과 memberof 오버레이 설정은 CI 워크플로의 "Seed the test directory"
+# 단계와 동일합니다. 그룹 → Role 매핑 테스트는 이 오버레이 없이는 memberOf를 읽을 수 없습니다.
 RESSO_TEST_LDAP_URL=ldap://127.0.0.1:13890 go test ./internal/federation/
 ```
 

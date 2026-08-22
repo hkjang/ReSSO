@@ -2793,3 +2793,101 @@ func TestIntegrationFederatedAccountsFollowTheEditMode(t *testing.T) {
 		t.Errorf("the new directory password was refused: %+v err=%v", after, err)
 	}
 }
+
+// A directory group deciding a Realm role is permissions coming from a system
+// this service does not control, and the half that matters is the removal:
+// somebody leaving a group has to lose the role at the next synchronisation.
+// Retaining it is how a person keeps access after being moved off a team.
+func TestIntegrationDirectoryGroupsGrantAndWithdrawRoles(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	branch := "ou=sync-groups,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "member")
+	memberDN := "uid=member," + branch
+	groupBranch := "ou=sync-teams,dc=example,dc=test"
+	groupDN := "cn=payments," + groupBranch
+	createDirectoryGroup(t, groupBranch, groupDN, memberDN)
+
+	role, err := data.CreateRole(ctx, bootstrap.RealmID, "payments-operator", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn", MemberOfLDAPAttribute: "memberOf",
+		GroupRoleMappings: map[string]string{"payments": "payments-operator"},
+		ImportEnabled:     true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	holdsRole := func() bool {
+		t.Helper()
+		var held bool
+		if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_roles ur
+			JOIN users u ON u.id=ur.user_id
+			WHERE u.realm_id=$1 AND u.username='member' AND ur.role_id=$2)`,
+			bootstrap.RealmID, role.ID).Scan(&held); err != nil {
+			t.Fatal(err)
+		}
+		return held
+	}
+	if !holdsRole() {
+		t.Fatal("membership of the mapped group did not grant the role")
+	}
+
+	// Off the team. The role has to go with the membership.
+	removeDirectoryGroupMember(t, groupDN, memberDN)
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	if holdsRole() {
+		t.Error("leaving the group left the role in place, so access outlived the membership")
+	}
+}
+
+func createDirectoryGroup(t *testing.T, branch, groupDN, memberDN string) {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	unit := ldap.NewAddRequest(branch, nil)
+	unit.Attribute("objectClass", []string{"organizationalUnit"})
+	unit.Attribute("ou", []string{strings.SplitN(strings.TrimPrefix(branch, "ou="), ",", 2)[0]})
+	if err := connection.Add(unit); err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
+		t.Fatal(err)
+	}
+	group := ldap.NewAddRequest(groupDN, nil)
+	group.Attribute("objectClass", []string{"groupOfNames"})
+	group.Attribute("cn", []string{strings.SplitN(strings.TrimPrefix(groupDN, "cn="), ",", 2)[0]})
+	group.Attribute("member", []string{memberDN})
+	if err := connection.Add(group); err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { removeDirectoryBranch(t, branch) })
+}
+
+// removeDirectoryGroupMember empties the group rather than deleting the entry,
+// because groupOfNames requires at least one member and the directory would
+// refuse to remove the last one.
+func removeDirectoryGroupMember(t *testing.T, groupDN, memberDN string) {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	if err := connection.Del(ldap.NewDelRequest(groupDN, nil)); err != nil {
+		t.Fatalf("removing the group failed: %v", err)
+	}
+	_ = memberDN
+}
