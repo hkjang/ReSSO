@@ -198,7 +198,7 @@ RESSO_TEST_POSTGRES_DSN='postgres://resso:testpw@127.0.0.1:55432/resso?sslmode=d
 ./scripts/smoke-test.sh http://127.0.0.1:8080 admin 'your-password'
 ```
 
-Smoke test는 PKCE, Scope 기반 Claim, Refresh Token 재사용 탐지, Web Origin CORS, Realm/Client Role, Realm 관리자 격리, 개인 API Key REST와 MCP를 함께 검증합니다.
+Smoke test는 PKCE, Scope 기반 Claim, Refresh Token 재사용 탐지, Web Origin CORS, Realm/Client Role, Realm 관리자 격리, 개인 API Key REST와 MCP를 함께 검증합니다. MCP는 handshake뿐 아니라 도구 권한 경계까지 확인합니다 — `admin:read`가 있는 키는 Client·User 도구를 쓸 수 있고, `mcp:read`만 있는 키에는 목록에 나타나지도 호출되지도 않아야 합니다.
 
 ## 운영 보안
 
