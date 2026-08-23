@@ -1,6 +1,6 @@
 .PHONY: lint test test-services test-services-stop build web image release
 
-VERSION ?= v0.4.1-dev
+VERSION ?= v0.5.0-dev
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
