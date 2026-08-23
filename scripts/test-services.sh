@@ -131,6 +131,10 @@ start_directory() {
     -e LDAP_ADMIN_PASSWORD="adminpassword" osixia/openldap:1.5.0 >/dev/null
   wait_for_directory "$directory_container"
   add_memberof_overlay "$directory_container"
+  # Adding an overlay makes the server reload, so it has to be waited for again
+  # before anything is written. Locally an already-warm container hid this; a
+  # fresh one in CI did not.
+  wait_for_directory "$directory_container"
   seed_directory "$directory_container"
 }
 
@@ -139,7 +143,7 @@ make_certificates() {
   mkdir -p "$certs"
   openssl req -x509 -newkey rsa:2048 -sha256 -days 30 -nodes \
     -keyout "$certs/ca.key" -out "$certs/ca.crt" -subj "/CN=ReSSO Test CA" \
-    -addext "basicConstraints=critical,CA:TRUE"
+    -addext "basicConstraints=critical,CA:TRUE" 2>&1 | grep -vE '^[.+*]*$|self-signature ok|^-----' || true
   openssl req -newkey rsa:2048 -nodes -keyout "$certs/ldap.key" \
     -out "$certs/ldap.csr" -subj "/CN=localhost"
   printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$certs/ext.cnf"
