@@ -132,10 +132,17 @@ MCP 도구는 기본적으로 읽기 전용이며 Secret이나 Private Key를 �
 GitHub Release에서 `resso-vX.Y.Z.tar.gz`를 내려받아 오프라인망으로 옮깁니다.
 공식 오프라인 아카이브는 `linux/amd64` 전용입니다. ARM64 환경에서는 동일 태그의 소스에서 대상 플랫폼용 이미지를 별도로 빌드해야 합니다.
 
+Release에는 아카이브와 함께 `release-sha256.txt`가 첨부됩니다. 두 파일을 같이 옮기면 반입 스크립트가 대조까지 수행합니다.
+
 ```bash
-sha256sum resso-vX.Y.Z.tar.gz
 ./scripts/offline-load.sh resso-vX.Y.Z.tar.gz
 docker image inspect resso:vX.Y.Z
+```
+
+체크섬 파일이 없으면 반입을 거절합니다. 이동식 매체로 오프라인망에 들어온 아카이브야말로 확인할 값어치가 있기 때문입니다. 확인 없이 진행해야 한다면 `--no-verify`를 붙이고, 파일 이름을 바꿨거나 다른 곳에 두었다면 두 번째 인자로 경로를 넘기세요.
+
+```bash
+./scripts/offline-load.sh resso-vX.Y.Z.tar.gz /media/usb/release-sha256.txt
 ```
 
 릴리즈 태그 `vX.Y.Z`를 GitHub에 push하면 CI가 다음 하나의 실행 산출물을 Release에 첨부합니다.
