@@ -226,6 +226,16 @@ func (s *Store) UpdateUser(ctx context.Context, userID uuid.UUID, input UpdateUs
 	if command.RowsAffected() == 0 {
 		return domain.User{}, ErrNotFound
 	}
+	// Disabling is the emergency stop, so it has to stop something. Without
+	// this the account was only hidden: the cookie stopped resolving while the
+	// session row stayed live, so re-enabling the account later handed the
+	// same session back, and every relying party went on believing the person
+	// was signed in the whole time.
+	if current.Enabled && !input.Enabled {
+		if err := s.EndSessionsOfDisabledUsers(ctx, []uuid.UUID{userID}); err != nil {
+			return domain.User{}, fmt.Errorf("end sessions of disabled user: %w", err)
+		}
+	}
 	return s.UserByID(ctx, userID)
 }
 

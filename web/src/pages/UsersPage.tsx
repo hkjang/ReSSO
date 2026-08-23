@@ -185,6 +185,7 @@ export function UsersPage() {
             <FormControlLabel control={<Switch checked={editForm.email_verified} disabled={!editForm.email.trim() || !emailMatchesSelected} onChange={(e) => setEditForm({ ...editForm, email_verified: e.target.checked })} />} label="관리자가 이메일을 확인함" />
             <TextField select label="팀장" value={editForm.manager_id ?? ''} onChange={(e) => setEditForm({ ...editForm, manager_id: e.target.value || undefined })}><MenuItem value="">지정 안 함</MenuItem>{managers.data?.items.filter((u) => u.id !== editForm.id).map((user) => <MenuItem key={user.id} value={user.id}>{user.display_name} ({user.username})</MenuItem>)}</TextField>
             <FormControlLabel control={<Switch checked={editForm.enabled} onChange={(e) => setEditForm({ ...editForm, enabled: e.target.checked })} />} label="계정 활성" />
+            {selected?.enabled && !editForm.enabled && <Alert severity="warning">저장하면 이 계정의 모든 세션과 Refresh Token이 즉시 종료되고, 연결된 애플리케이션에 로그아웃이 전달됩니다. 다시 활성화해도 기존 세션은 돌아오지 않습니다.</Alert>}
             <Button type="submit" variant="contained" disabled={update.isPending}>변경 저장</Button>
           </Stack>
           <Box sx={{ borderTop: '1px solid', borderColor: 'divider', pt: 3 }}>

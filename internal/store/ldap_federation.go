@@ -511,15 +511,32 @@ func (s *Store) disableUnseenFederatedUsers(ctx context.Context, providerID uuid
 			return 0, ErrSyncReadNothing
 		}
 	}
-	command, err := s.Pool.Exec(ctx, `UPDATE users SET enabled=false,updated_at=now()
-        WHERE federation_id=$1 AND (federation_synced_at IS NULL OR federation_synced_at<$2) AND enabled=true`,
-		providerID, startedAt)
+	rows, err := s.Pool.Query(ctx, `UPDATE users SET enabled=false,updated_at=now()
+        WHERE federation_id=$1 AND (federation_synced_at IS NULL OR federation_synced_at<$2) AND enabled=true
+        RETURNING id`, providerID, startedAt)
 	if err != nil {
 		return 0, err
 	}
-	_, _ = s.Pool.Exec(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())
-        WHERE user_id IN (SELECT id FROM users WHERE federation_id=$1 AND enabled=false)`, providerID)
-	return command.RowsAffected(), nil
+	disabled := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		disabled = append(disabled, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	// Named accounts rather than every already-disabled account of the
+	// provider, so a sweep that finds nothing new stops resending logouts for
+	// people who left long ago.
+	if err := s.EndSessionsOfDisabledUsers(ctx, disabled); err != nil {
+		return int64(len(disabled)), err
+	}
+	return int64(len(disabled)), nil
 }
 
 func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederation, summary LDAPSyncSummary, syncErr error) {

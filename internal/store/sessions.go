@@ -210,23 +210,61 @@ func (s *Store) RevokeAllUserSessions(ctx context.Context, userID uuid.UUID, exc
 	if err != nil {
 		return err
 	}
-	revoked := make([]RevokedSession, 0)
-	for rows.Next() {
-		var session RevokedSession
-		if err := rows.Scan(&session.RealmID, &session.SessionID, &session.UserID); err != nil {
-			rows.Close()
-			return err
-		}
-		revoked = append(revoked, session)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	revoked, err := scanRevokedSessions(rows)
+	if err != nil {
 		return err
 	}
 	_, _ = s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
         WHERE user_id=$1 AND ($2::uuid IS NULL OR session_id<>$2)`, userID, except)
 	s.notifyRevoked(revoked)
 	return nil
+}
+
+// EndSessionsOfDisabledUsers signs the given accounts out everywhere: their SSO
+// sessions, the refresh tokens issued from them, and a back-channel logout to
+// each relying party that took part.
+//
+// Disabling somebody happens in three places — an administrator in the console,
+// the LDAP DISABLE sweep, and unlinking a provider — and each had its own idea
+// of what came with it. The console ended nothing, so the account was hidden
+// rather than signed out and re-enabling it months later handed every session
+// that had been open at the time straight back. The sweep revoked the session
+// rows in passing but not the refresh tokens and without telling anybody, so
+// relying parties kept the person signed in. Routing all three through one call
+// is what makes the answer to "are they out?" the same wherever it is asked.
+func (s *Store) EndSessionsOfDisabledUsers(ctx context.Context, userIDs []uuid.UUID) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	rows, err := s.Pool.Query(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())
+        WHERE user_id=ANY($1::uuid[]) AND revoked_at IS NULL
+        RETURNING realm_id,id,user_id`, userIDs)
+	if err != nil {
+		return err
+	}
+	revoked, err := scanRevokedSessions(rows)
+	if err != nil {
+		return err
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
+        WHERE user_id=ANY($1::uuid[]) AND revoked_at IS NULL`, userIDs); err != nil {
+		return err
+	}
+	s.notifyRevoked(revoked)
+	return nil
+}
+
+func scanRevokedSessions(rows pgx.Rows) ([]RevokedSession, error) {
+	defer rows.Close()
+	revoked := make([]RevokedSession, 0)
+	for rows.Next() {
+		var session RevokedSession
+		if err := rows.Scan(&session.RealmID, &session.SessionID, &session.UserID); err != nil {
+			return nil, err
+		}
+		revoked = append(revoked, session)
+	}
+	return revoked, rows.Err()
 }
 
 // BackchannelLogoutTargets lists the enabled clients of a Realm that registered

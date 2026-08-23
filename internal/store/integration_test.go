@@ -2517,6 +2517,41 @@ func TestIntegrationFederationSyncImportsThenDisablesOnlyWhatLeft(t *testing.T) 
 		t.Errorf("imported email = %q", email)
 	}
 
+	// The console and the user federation page both describe this policy as
+	// "비활성화 및 세션 종료", so the departing account has something to end.
+	rp, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "rp-of-the-departed", Name: "RP", Type: "confidential",
+		RedirectURIs:         []string{"https://rp.example.com/callback"},
+		BackchannelLogoutURI: "https://rp.example.com/backchannel-logout",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var leavingID, stayingID uuid.UUID
+	if err := data.Pool.QueryRow(ctx, `SELECT id FROM users WHERE realm_id=$1 AND username='leaves'`,
+		bootstrap.RealmID).Scan(&leavingID); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.Pool.QueryRow(ctx, `SELECT id FROM users WHERE realm_id=$1 AND username='stays'`,
+		bootstrap.RealmID).Scan(&stayingID); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []uuid.UUID{leavingID, stayingID} {
+		session, sessionErr := data.CreateSession(ctx, bootstrap.RealmID, id, time.Hour,
+			"127.0.0.1", "integration-test", "password")
+		if sessionErr != nil {
+			t.Fatal(sessionErr)
+		}
+		userID, sessionID := id, session.Session.ID
+		if _, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID,
+			ClientID: rp.Client.ID, UserID: &userID, SessionID: &sessionID,
+			Scope: []string{"openid"}, ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var told []RevokedSession
+	data.OnSessionRevoked = func(revoked RevokedSession) { told = append(told, revoked) }
+
 	// Somebody leaves the directory. Only that account may be deactivated.
 	if err := removeDirectoryEntry(t, "uid=leaves,"+branch); err != nil {
 		t.Fatal(err)
@@ -2533,6 +2568,31 @@ func TestIntegrationFederationSyncImportsThenDisablesOnlyWhatLeft(t *testing.T) 
 	}
 	if isEnabled, _ := enabled("stays"); !isEnabled {
 		t.Error("an account still in the directory was deactivated")
+	}
+	// The sweep revoked the session rows and stopped there: the refresh tokens
+	// went on working and no relying party was told, so the departed employee
+	// stayed signed in at every application that keeps its own session.
+	live := func(id uuid.UUID) (int, int) {
+		t.Helper()
+		var sessions, refresh int
+		if err := data.Pool.QueryRow(ctx,
+			"SELECT count(*) FROM sso_sessions WHERE user_id=$1 AND revoked_at IS NULL", id).Scan(&sessions); err != nil {
+			t.Fatal(err)
+		}
+		if err := data.Pool.QueryRow(ctx,
+			"SELECT count(*) FROM refresh_tokens WHERE user_id=$1 AND revoked_at IS NULL", id).Scan(&refresh); err != nil {
+			t.Fatal(err)
+		}
+		return sessions, refresh
+	}
+	if sessions, refresh := live(leavingID); sessions != 0 || refresh != 0 {
+		t.Errorf("the departed account kept %d sessions and %d refresh tokens", sessions, refresh)
+	}
+	if sessions, refresh := live(stayingID); sessions != 1 || refresh != 1 {
+		t.Errorf("an account still in the directory was signed out: %d sessions, %d refresh tokens", sessions, refresh)
+	}
+	if len(told) != 1 || told[0].UserID != leavingID {
+		t.Errorf("relying parties were told about %+v, want only the departed account", told)
 	}
 }
 
@@ -2966,5 +3026,97 @@ func TestIntegrationDirectoryOutageDoesNotCountAsAFailedPassword(t *testing.T) {
 	}
 	if result, err := data.Authenticate(ctx, realm, "onleave", "onleave-pass-1234"); err != nil || !result.Success {
 		t.Errorf("the account could not sign in after the outage: %+v err=%v", result, err)
+	}
+}
+
+// Disabling an account is the emergency stop, and until now it stopped
+// nothing. The cookie stopped resolving because every session lookup filters
+// on users.enabled, which reads as signed out — but the session row stayed
+// live, the refresh tokens stayed live, and no relying party was told. So the
+// person remained signed in at every application that had its own session, and
+// re-enabling the account later — after an investigation, at the end of a
+// suspension — handed back every session that had been open at the moment it
+// was disabled, including whichever one was the reason for disabling it.
+func TestIntegrationDisablingAnAccountSignsItOutForGood(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	var told []RevokedSession
+	data.OnSessionRevoked = func(revoked RevokedSession) { told = append(told, revoked) }
+
+	client, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "rp-of-the-disabled", Name: "RP", Type: "confidential",
+		RedirectURIs:         []string{"https://rp.example.com/callback"},
+		BackchannelLogoutURI: "https://rp.example.com/backchannel-logout",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "suspended", Password: "suspended-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, user.ID, time.Hour,
+		"127.0.0.1", "integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, sessionID := user.ID, session.Session.ID
+	if _, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID,
+		ClientID: client.Client.ID, UserID: &userID, SessionID: &sessionID,
+		Scope: []string{"openid"}, ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SessionByToken(ctx, session.Token); err != nil {
+		t.Fatalf("the session did not work to begin with: %v", err)
+	}
+
+	if _, err := data.UpdateUser(ctx, userID, UpdateUserInput{
+		DisplayName: user.DisplayName, Email: user.Email, Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+
+	var liveSessions, liveRefresh int
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM sso_sessions WHERE user_id=$1 AND revoked_at IS NULL", userID).Scan(&liveSessions); err != nil {
+		t.Fatal(err)
+	}
+	if liveSessions != 0 {
+		t.Errorf("sessions left unrevoked after disabling = %d", liveSessions)
+	}
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM refresh_tokens WHERE user_id=$1 AND revoked_at IS NULL", userID).Scan(&liveRefresh); err != nil {
+		t.Fatal(err)
+	}
+	if liveRefresh != 0 {
+		t.Errorf("refresh tokens left usable after disabling = %d", liveRefresh)
+	}
+	if len(told) != 1 || told[0].SessionID != sessionID || told[0].UserID != userID {
+		t.Errorf("relying parties were told about %+v, want the one revoked session", told)
+	}
+
+	// The part an administrator cannot see: re-enabling must not undo it.
+	if _, err := data.UpdateUser(ctx, userID, UpdateUserInput{
+		DisplayName: user.DisplayName, Email: user.Email, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SessionByToken(ctx, session.Token); !errors.Is(err, ErrNotFound) {
+		t.Errorf("re-enabling the account brought its old session back: err=%v", err)
+	}
+
+	// Disabling an account that is already disabled has nothing to end, and
+	// must not resend a logout for a session that ended long ago.
+	told = nil
+	if _, err := data.UpdateUser(ctx, userID, UpdateUserInput{
+		DisplayName: user.DisplayName, Email: user.Email, Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.UpdateUser(ctx, userID, UpdateUserInput{
+		DisplayName: user.DisplayName, Email: user.Email, Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if len(told) != 0 {
+		t.Errorf("disabling twice notified relying parties again: %+v", told)
 	}
 }
