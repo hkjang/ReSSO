@@ -665,8 +665,9 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 		redirectTo = requested
 	}
 	if session, sessionErr := s.store.SessionByToken(r.Context(), sessionCookie(r)); sessionErr == nil && session.Session.RealmID == realm.ID {
-		_ = s.store.RevokeSession(r.Context(), session.Session.ID)
-		s.audit(r, &realm.ID, &session.User.ID, session.User.Username, "LOGOUT", "SUCCESS", "session", session.Session.ID.String(), nil)
+		ended, detail := s.endSession(r, session.Session.ID)
+		s.audit(r, &realm.ID, &session.User.ID, session.User.Username, "LOGOUT",
+			partialIfNot(ended), "session", session.Session.ID.String(), detail)
 	}
 	s.clearBrowserCookies(w, r)
 	if redirectTo != "" {

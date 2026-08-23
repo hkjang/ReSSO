@@ -167,7 +167,11 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if authRequest != nil {
 		consumed, err := s.store.ConsumeAuthorizationRequest(r.Context(), input.Request)
 		if err != nil {
-			_ = s.store.RevokeSession(r.Context(), newSession.Session.ID)
+			// The session was created a moment ago and is being taken back.
+			// Failing to do so leaves one live that its owner cannot see,
+			// because the cookies go on the next line, so it is worth a log
+			// line even though the caller is being refused either way.
+			_, _ = s.endSession(r, newSession.Session.ID)
 			s.clearBrowserCookies(w, r)
 			writeError(w, r, http.StatusConflict, "request_already_used", "로그인 요청이 이미 처리되었습니다.")
 			return
@@ -226,9 +230,10 @@ func authorizationRedirect(target, code, state, issuer string, sessionID uuid.UU
 
 func (s *Server) browserLogout(w http.ResponseWriter, r *http.Request) {
 	session, _ := sessionFrom(r.Context())
-	_ = s.store.RevokeSession(r.Context(), session.Session.ID)
+	ended, detail := s.endSession(r, session.Session.ID)
 	s.clearBrowserCookies(w, r)
-	s.audit(r, &session.User.RealmID, &session.User.ID, session.User.Username, "LOGOUT", "SUCCESS", "session", session.Session.ID.String(), nil)
+	s.audit(r, &session.User.RealmID, &session.User.ID, session.User.Username, "LOGOUT",
+		partialIfNot(ended), "session", session.Session.ID.String(), detail)
 	w.WriteHeader(http.StatusNoContent)
 }
 

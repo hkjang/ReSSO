@@ -1834,8 +1834,19 @@ func TestIntegrationPasswordChangeAdmitsWhenSessionsSurvive(t *testing.T) {
 	}
 
 	// A live session for the next change to end. Without one there is nothing
-	// for the revoking UPDATE to touch, so it would succeed by doing nothing.
+	// for the revoking UPDATE to touch, so it would succeed by doing nothing
+	// and the assertions below would read as the fix having failed. Asserted
+	// rather than assumed, so a future failure here names its own cause.
 	_ = otherSession()
+	var liveBeforeChange int
+	if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM sso_sessions
+		WHERE user_id=$1 AND revoked_at IS NULL`, bootstrap.AdminUserID).Scan(&liveBeforeChange); err != nil {
+		t.Fatal(err)
+	}
+	if liveBeforeChange < 2 {
+		t.Fatalf("only %d live sessions before the change; the revocation would touch nothing "+
+			"and the outcome below would say nothing about the fix", liveBeforeChange)
+	}
 
 	// Now let only the revoking UPDATE fail. Reads and last_access touches are
 	// untouched, so the request still authenticates — which is what makes this
@@ -1875,5 +1886,163 @@ func TestIntegrationPasswordChangeAdmitsWhenSessionsSurvive(t *testing.T) {
 	}
 	if detail["other_sessions_ended"] != false || detail["error"] == nil {
 		t.Errorf("the audit entry does not record what failed: %v", detail)
+	}
+}
+
+// Logging out is the one "make it stop" a person has, and both endpoints that
+// offer it dropped the error from the revocation. The browser cookies are
+// cleared either way, so the person sees themselves signed out — while the
+// session stays live, every relying party holding a refresh token bound to it
+// goes on renewing, and no back-channel logout is sent at all, because sending
+// it is what the revocation does. The audit entry said SUCCESS.
+func TestIntegrationLogoutRecordsASessionItCouldNotEnd(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var told []store.RevokedSession
+	data.OnSessionRevoked = func(revoked store.RevokedSession) { told = append(told, revoked) }
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	signIn := func() (*http.Client, string) {
+		t.Helper()
+		jar, jarErr := cookiejar.New(nil)
+		if jarErr != nil {
+			t.Fatal(jarErr)
+		}
+		browser := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+		response := postIntegrationLogin(t, browser, server.URL, "admin", "bootstrap-password-123")
+		var login struct {
+			CSRFToken string `json:"csrf_token"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&login); err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		return browser, login.CSRFToken
+	}
+	liveSessions := func() int {
+		t.Helper()
+		var live int
+		if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM sso_sessions
+			WHERE user_id=$1 AND revoked_at IS NULL`, bootstrap.AdminUserID).Scan(&live); err != nil {
+			t.Fatal(err)
+		}
+		return live
+	}
+	lastLogout := func() (string, map[string]any) {
+		t.Helper()
+		page, auditErr := data.ListAudit(ctx, store.AuditFilter{EventType: "LOGOUT", Limit: 1})
+		if auditErr != nil {
+			t.Fatal(auditErr)
+		}
+		if len(page.Items) == 0 {
+			t.Fatal("the logout was not audited at all")
+		}
+		var detail map[string]any
+		_ = json.Unmarshal(page.Items[0].Detail, &detail)
+		return page.Items[0].Result, detail
+	}
+
+	// An ordinary console logout: the session goes, the relying parties hear
+	// about it, and the entry reads SUCCESS with nothing to add.
+	browser, csrf := signIn()
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/auth/logout", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-CSRF-Token", csrf)
+	response, err := browser.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("an ordinary logout answered %d", response.StatusCode)
+	}
+	if live := liveSessions(); live != 0 {
+		t.Fatalf("an ordinary logout left %d sessions live", live)
+	}
+	if len(told) != 1 {
+		t.Errorf("relying parties heard about %d revocations, want 1", len(told))
+	}
+	if result, detail := lastLogout(); result != "SUCCESS" || len(detail) != 0 {
+		t.Errorf("an ordinary logout audited as %s %v", result, detail)
+	}
+
+	// Now block only the revoking UPDATE, so the request still authenticates.
+	if _, err := data.Pool.Exec(ctx, `CREATE FUNCTION block_revocation() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'revocation blocked for the test'; END $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `CREATE TRIGGER block_revocation BEFORE UPDATE ON sso_sessions
+		FOR EACH ROW WHEN (NEW.revoked_at IS NOT NULL AND OLD.revoked_at IS NULL)
+		EXECUTE FUNCTION block_revocation()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "DROP TRIGGER IF EXISTS block_revocation ON sso_sessions")
+	})
+
+	// Both endpoints that end a session have to record it. The console one
+	// answers the browser; the OpenID Connect one redirects the relying party,
+	// which is why neither can carry the news in a body.
+	for _, logout := range []struct {
+		what string
+		do   func(*http.Client, string) int
+	}{
+		{"console logout", func(browser *http.Client, csrf string) int {
+			request, requestErr := http.NewRequest(http.MethodPost, server.URL+"/api/v1/auth/logout", nil)
+			if requestErr != nil {
+				t.Fatal(requestErr)
+			}
+			request.Header.Set("X-CSRF-Token", csrf)
+			result, doErr := browser.Do(request)
+			if doErr != nil {
+				t.Fatal(doErr)
+			}
+			defer result.Body.Close()
+			return result.StatusCode
+		}},
+		{"RP-initiated logout", func(browser *http.Client, _ string) int {
+			result, getErr := browser.Get(server.URL + "/realms/master/protocol/openid-connect/logout")
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			defer result.Body.Close()
+			return result.StatusCode
+		}},
+	} {
+		told = nil
+		browser, csrf := signIn()
+		before := liveSessions()
+		if before == 0 {
+			t.Fatalf("%s has no live session to end; the outcome below would say nothing "+
+				"about the fix", logout.what)
+		}
+		status := logout.do(browser, csrf)
+		if status >= 400 {
+			t.Errorf("%s answered %d; the person is signed out of the browser either way "+
+				"and has no remedy to offer", logout.what, status)
+		}
+		if liveSessions() != before {
+			t.Errorf("%s revoked something despite the block", logout.what)
+		}
+		if len(told) != 0 {
+			t.Errorf("%s told relying parties about a revocation that did not happen", logout.what)
+		}
+		result, detail := lastLogout()
+		if result != "PARTIAL" {
+			t.Errorf("%s audited as %s, want PARTIAL", logout.what, result)
+		}
+		if detail["session_revoked"] != false || detail["error"] == nil {
+			t.Errorf("%s did not record what failed: %v", logout.what, detail)
+		}
 	}
 }

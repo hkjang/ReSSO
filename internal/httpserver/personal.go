@@ -125,6 +125,30 @@ func (s *Server) endOtherSessions(r *http.Request, userID uuid.UUID, except *uui
 	return true, nil
 }
 
+// endSession revokes one session and reports whether it worked.
+//
+// A logout that fails to revoke is the most misleading failure the service
+// has. The browser cookies are cleared either way, so the person sees
+// themselves signed out — while the session stays live, every relying party
+// holding a refresh token bound to it goes on renewing, and no back-channel
+// logout is sent, because sending it is what the revocation does. Logging out
+// is the one "make it stop" a person has, and it stopped nothing.
+//
+// The response is deliberately not turned into an error. The cookies are gone
+// by then and there is nothing the person could do differently, so refusing
+// would only leave them looking at a failure they cannot act on while being no
+// more signed in than before. The audit entry is the handle that does help: it
+// reads PARTIAL and names the session, so an administrator can end it from the
+// console and knows to look at the relying parties.
+func (s *Server) endSession(r *http.Request, sessionID uuid.UUID) (bool, map[string]any) {
+	if err := s.store.RevokeSession(r.Context(), sessionID); err != nil {
+		s.logger.Error("session could not be revoked on logout",
+			"trace_id", traceIDFrom(r.Context()), "session_id", sessionID, "error", err)
+		return false, map[string]any{"session_revoked": false, "error": err.Error()}
+	}
+	return true, nil
+}
+
 // partialIfNot names an outcome that is neither a clean success nor a failure:
 // the request did what it was asked, and something it carries with it did not.
 func partialIfNot(ok bool) string {
