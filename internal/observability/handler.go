@@ -121,17 +121,45 @@ func (h *DBHandler) WithGroup(name string) slog.Handler {
 	return &clone
 }
 
+// sensitiveLogKeys are the words that mean an attribute must not be written
+// down. The list matches anywhere in the attribute's full path, and it errs
+// towards redacting: this log is kept for thirty days and read from the
+// administration console, so a value withheld by mistake costs an operator one
+// puzzled moment and a value written by mistake cannot be taken back.
+//
+// "credential" and "key" are here because of what this service calls its own
+// secrets — bind_credential is the LDAP password it encrypts at rest, and
+// api_key is what it issues to people. Neither word was covered, so an
+// attribute named after either would have been mirrored in full. Nothing logs
+// one today; the point of a redactor is the line somebody adds tomorrow.
+var sensitiveLogKeys = []string{"password", "secret", "token", "authorization", "credential", "key"}
+
 func (h *DBHandler) addAttr(target map[string]any, attr slog.Attr) {
+	h.addAttrAt(target, h.groups, attr)
+}
+
+// addAttrAt records one attribute under its full path.
+//
+// The path is carried down rather than rebuilt from the handler's groups,
+// which is what a nested attribute needs: a child of slog.Group("a", …) used
+// to be recorded under its own key alone, so two groups with a child of the
+// same name wrote to the same place and the second silently replaced the
+// first. Copying the prefix also keeps two concurrent Handle calls from
+// appending into one shared backing array.
+func (h *DBHandler) addAttrAt(target map[string]any, prefix []string, attr slog.Attr) {
 	attr.Value = attr.Value.Resolve()
-	key := strings.Join(append(h.groups, attr.Key), ".")
+	path := append(append([]string{}, prefix...), attr.Key)
+	key := strings.Join(path, ".")
 	lower := strings.ToLower(key)
-	if strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "authorization") {
-		target[key] = "[REDACTED]"
-		return
+	for _, sensitive := range sensitiveLogKeys {
+		if strings.Contains(lower, sensitive) {
+			target[key] = "[REDACTED]"
+			return
+		}
 	}
 	if attr.Value.Kind() == slog.KindGroup {
 		for _, child := range attr.Value.Group() {
-			h.addAttr(target, child)
+			h.addAttrAt(target, path, child)
 		}
 		return
 	}
