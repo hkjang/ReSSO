@@ -6,7 +6,10 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -3505,5 +3508,108 @@ func TestIntegrationTakenValuesNameTheFieldThatCollided(t *testing.T) {
 	// The value that was free still goes in, so this bounds the refusal.
 	if _, err := data.UpdateRealm(ctx, other.ID, realmPolicy("https://third.example.test/realms/second")); err != nil {
 		t.Errorf("a free issuer URL was refused: %v", err)
+	}
+}
+
+// The Realm policy bounds are written down three times: the CHECK constraints
+// on the table, the validator that mirrors them so an operator gets a sentence
+// instead of a constraint violation, and the operations guide that prints them
+// for whoever is choosing a value. Two of the three had already drifted — the
+// guide gave the idle timeout a maximum of 24 hours where the constraint
+// allows 30 days — so all three are compared here.
+func TestIntegrationRealmPolicyBoundsAgreeEverywhere(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+
+	// The database is the authority: the validator exists to say the same
+	// thing sooner and in words, so a validator that allows what the
+	// constraint rejects produces exactly the violation it was added to avoid.
+	definitions := map[string]string{}
+	rows, err := data.Pool.Query(ctx, `SELECT conname, pg_get_constraintdef(oid)
+		FROM pg_constraint WHERE conrelid = 'realms'::regclass AND contype = 'c'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var name, definition string
+		if err := rows.Scan(&name, &definition); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		definitions[name] = definition
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, bound := range realmPolicyBounds {
+		definition, found := definitions["realms_"+bound.Label+"_check"]
+		if !found {
+			t.Errorf("the table has no CHECK for %s, so the validator is the only thing holding it", bound.Label)
+			continue
+		}
+		numbers := regexp.MustCompile(`\d+`).FindAllString(definition, -1)
+		low, high := strconv.Itoa(bound.Low), strconv.Itoa(bound.High)
+		if !slices.Contains(numbers, low) || !slices.Contains(numbers, high) {
+			t.Errorf("%s: the validator allows %s–%s, the constraint says %q",
+				bound.Label, low, high, definition)
+		}
+	}
+
+	// And the guide has to print the same numbers. Only the range cells of its
+	// policy tables are read: a row names a setting and gives its range in
+	// seconds, which is the form both tables already use.
+	guide, err := os.ReadFile(filepath.Join("..", "..", "docs", "operations.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each row is tied to the setting it describes, because asking only
+	// whether a number is a bound somewhere is not enough: 86400 is a real
+	// bound — of the lockout — so an idle timeout documented as 300–86400
+	// would pass a looser check while being wrong, which is the mistake this
+	// exists to catch.
+	//
+	// Only the rows that state their range as plain seconds are read. The
+	// lockout, password length and attempt count are written in the units
+	// somebody choosing a value thinks in ("30초 ~ 24시간"), and rewriting them
+	// to satisfy a test would make the guide worse to read than the drift is
+	// worth.
+	settings := map[string]string{
+		"Access Token":  "access_token_ttl_seconds",
+		"Refresh Token": "refresh_token_ttl_seconds",
+		"SSO Session":   "session_ttl_seconds",
+		"유휴 만료":         "idle_timeout_seconds",
+	}
+	bounds := map[string][2]int{}
+	for _, bound := range realmPolicyBounds {
+		bounds[bound.Label] = [2]int{bound.Low, bound.High}
+	}
+	rangePattern := regexp.MustCompile(`(\d{2,})[–-](\d{2,})초`)
+	checked := 0
+	for _, line := range strings.Split(string(guide), "\n") {
+		cells := strings.Split(strings.Trim(line, "| "), "|")
+		if len(cells) < 2 {
+			continue
+		}
+		label, found := settings[strings.Trim(cells[0], " `")]
+		if !found {
+			continue
+		}
+		match := rangePattern.FindStringSubmatch(line)
+		if match == nil {
+			t.Errorf("the guide's row for %s states no range in seconds: %q", label, line)
+			continue
+		}
+		low, _ := strconv.Atoi(match[1])
+		high, _ := strconv.Atoi(match[2])
+		if bounds[label] != [2]int{low, high} {
+			t.Errorf("the guide gives %s a range of %d–%d, the service enforces %d–%d",
+				label, low, high, bounds[label][0], bounds[label][1])
+		}
+		checked++
+	}
+	if checked < len(settings) {
+		t.Errorf("only %d of %d documented policy rows were found to check", checked, len(settings))
 	}
 }

@@ -213,31 +213,47 @@ type UpdateRealmInput struct {
 	LockoutSeconds    int `json:"lockout_seconds"`
 }
 
-// realmPolicyBounds mirrors the CHECK constraints in 001_initial.sql so that
+// realmPolicyBounds mirrors the CHECK constraints on the realms table so that
 // an out-of-range value is reported as a readable message instead of a
 // constraint violation.
+//
+// It is a package-level table rather than a literal inside the validator
+// because the same numbers are written down in three places — here, the
+// migrations, and the operations guide an administrator reads — and two of
+// them had already drifted: the guide gave the idle timeout a maximum of 24
+// hours where the constraint allows 30 days. A table can be compared against
+// the other two; a literal in a loop cannot.
+var realmPolicyBounds = []struct {
+	Label     string
+	Low, High int
+	value     func(UpdateRealmInput) int
+}{
+	{"password_min_length", 8, 128, func(i UpdateRealmInput) int { return i.PasswordMinLength }},
+	{"max_login_attempts", 3, 50, func(i UpdateRealmInput) int { return i.MaxLoginAttempts }},
+	{"lockout_seconds", 30, 86400, func(i UpdateRealmInput) int { return i.LockoutSeconds }},
+	{"access_token_ttl_seconds", 60, 3600, func(i UpdateRealmInput) int { return i.AccessTokenTTLSeconds }},
+	{"refresh_token_ttl_seconds", 300, 2592000, func(i UpdateRealmInput) int { return i.RefreshTokenTTLSeconds }},
+	{"session_ttl_seconds", 300, 2592000, func(i UpdateRealmInput) int { return i.SessionTTLSeconds }},
+	// Zero turns the idle check off, so this one is applied only to a value
+	// that is not zero. Its bounds still belong in the table so that the
+	// comparisons above can see them.
+	{"idle_timeout_seconds", 300, 2592000, func(i UpdateRealmInput) int { return i.IdleTimeoutSeconds }},
+}
+
 func validateRealmPolicy(input UpdateRealmInput) error {
-	for _, bound := range []struct {
-		label     string
-		value     int
-		low, high int
-	}{
-		{"password_min_length", input.PasswordMinLength, 8, 128},
-		{"max_login_attempts", input.MaxLoginAttempts, 3, 50},
-		{"lockout_seconds", input.LockoutSeconds, 30, 86400},
-		{"access_token_ttl_seconds", input.AccessTokenTTLSeconds, 60, 3600},
-		{"refresh_token_ttl_seconds", input.RefreshTokenTTLSeconds, 300, 2592000},
-		{"session_ttl_seconds", input.SessionTTLSeconds, 300, 2592000},
-	} {
-		if bound.value < bound.low || bound.value > bound.high {
-			return fmt.Errorf("%w: %s must be between %d and %d", ErrInvalidInput,
-				bound.label, bound.low, bound.high)
+	for _, bound := range realmPolicyBounds {
+		value := bound.value(input)
+		if bound.Label == "idle_timeout_seconds" && value == 0 {
+			continue
 		}
-	}
-	// Zero is the documented way to turn the idle check off, so it is checked
-	// apart from the ranges above.
-	if input.IdleTimeoutSeconds != 0 && (input.IdleTimeoutSeconds < 300 || input.IdleTimeoutSeconds > 2592000) {
-		return fmt.Errorf("%w: idle_timeout_seconds must be 0 or between 300 and 2592000", ErrInvalidInput)
+		if value < bound.Low || value > bound.High {
+			if bound.Label == "idle_timeout_seconds" {
+				return fmt.Errorf("%w: idle_timeout_seconds must be 0 or between %d and %d",
+					ErrInvalidInput, bound.Low, bound.High)
+			}
+			return fmt.Errorf("%w: %s must be between %d and %d", ErrInvalidInput,
+				bound.Label, bound.Low, bound.High)
+		}
 	}
 	if input.IdleTimeoutSeconds != 0 && input.IdleTimeoutSeconds > input.SessionTTLSeconds {
 		return fmt.Errorf("%w: idle_timeout_seconds must not exceed session_ttl_seconds", ErrInvalidInput)
