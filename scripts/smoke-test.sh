@@ -218,4 +218,108 @@ mcp_call "$reader_key" "$tools_list" \
 mcp_call "$reader_key" "$search_call" | jq -e '.result.isError == true' >/dev/null \
   || { echo "an mcp:read-only key read the user directory" >&2; exit 1; }
 
+# Everything below verifies behaviour that is only visible from outside: an
+# account or a Realm being switched off has to stop what it is supposed to
+# stop, in the built image, against a real database. The Go tests cover each
+# of these, but the release runs this script and not those.
+admin_json() {
+  method="$1"
+  path="$2"
+  body="${3:-}"
+  if [ -n "$body" ]; then
+    curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+      -X "$method" -d "$body" "$base_url$path"
+  else
+    curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -X "$method" "$base_url$path"
+  fi
+}
+# Deliberately without -f: these expect a refusal, and the status is the point.
+status_of() {
+  curl -sS -o /dev/null -w '%{http_code}' "$@"
+}
+
+# Disabling an account is the emergency stop. It has to end the sessions that
+# are open, and re-enabling the account must not hand them back — the session
+# rows are revoked, not hidden, and that difference is invisible until somebody
+# is let back in months later along with whoever else was signed in as them.
+disabled_user="disabled-$suffix"
+disabled_id="$(admin_json POST "/api/admin/v1/realms/$realm_id/users" \
+  "$(jq -nc --arg username "$disabled_user" '{username:$username,email:"",display_name:$username,password:"smoke-disable-password-123",enabled:true}')" \
+  | jq -er '.id')"
+disabled_jar="$work_dir/disabled-cookies"
+curl -fsS -c "$disabled_jar" -H 'Content-Type: application/json' \
+  -d "$(jq -nc --arg username "$disabled_user" '{realm:"master",username:$username,password:"smoke-disable-password-123",request:""}')" \
+  "$base_url/api/v1/auth/login" >/dev/null
+[ "$(status_of -b "$disabled_jar" "$base_url/api/v1/me")" = "200" ] || {
+  echo "a new account could not use the session it had just been given" >&2; exit 1; }
+
+set_enabled() {
+  admin_json PUT "/api/admin/v1/realms/$realm_id/users/$disabled_id" \
+    "$(jq -nc --arg name "$disabled_user" --argjson enabled "$1" '{display_name:$name,email:"",enabled:$enabled}')" >/dev/null
+}
+set_enabled false
+[ "$(status_of -b "$disabled_jar" "$base_url/api/v1/me")" = "401" ] || {
+  echo "a disabled account kept its session" >&2; exit 1; }
+set_enabled true
+[ "$(status_of -b "$disabled_jar" "$base_url/api/v1/me")" = "401" ] || {
+  echo "re-enabling an account brought its old session back" >&2; exit 1; }
+
+# Suspending a Realm has to reach the endpoints that speak for tokens already
+# issued, not only the ones that issue them. The token below is minted while
+# the Realm is running and asked about after it stops.
+tenant="tenant-$suffix"
+tenant_id="$(admin_json POST /api/admin/v1/realms \
+  "$(jq -nc --arg name "$tenant" --arg issuer "$base_url/realms/$tenant" '{name:$name,display_name:"Smoke tenant",issuer_url:$issuer}')" \
+  | jq -er '.id')"
+tenant_client="$(admin_json POST "/api/admin/v1/realms/$tenant_id/clients" \
+  '{"client_id":"tenant-rs","name":"Tenant RS","type":"confidential","redirect_uris":["http://localhost:9999/callback"],"grant_types":["client_credentials"],"default_scopes":["openid"]}' \
+  | jq -er '.client.id')"
+tenant_secret="$(admin_json POST "/api/admin/v1/realms/$tenant_id/clients/$tenant_client/rotate-secret" \
+  | jq -er '.client_secret')"
+tenant_token="$(curl -fsS -d "grant_type=client_credentials&client_id=tenant-rs&client_secret=$tenant_secret&scope=openid" \
+  "$base_url/realms/$tenant/protocol/openid-connect/token" | jq -er '.access_token')"
+introspect_tenant() {
+  curl -fsS -d "token=$tenant_token&client_id=tenant-rs&client_secret=$tenant_secret" \
+    "$base_url/realms/$tenant/protocol/openid-connect/token/introspect"
+}
+introspect_tenant | jq -e '.active == true' >/dev/null || {
+  echo "a token could not be introspected while its Realm was running" >&2; exit 1; }
+
+tenant_policy() {
+  admin_json GET "/api/admin/v1/realms/$tenant_id/" \
+    | jq -c --argjson enabled "$1" '{display_name,issuer_url,enabled:$enabled,approval_enabled,
+        access_token_ttl_seconds,refresh_token_ttl_seconds,session_ttl_seconds,idle_timeout_seconds,
+        password_min_length,max_login_attempts,lockout_seconds}'
+}
+admin_json PUT "/api/admin/v1/realms/$tenant_id/" "$(tenant_policy false)" >/dev/null
+[ "$(status_of "$base_url/realms/$tenant/.well-known/openid-configuration")" = "404" ] || {
+  echo "a suspended Realm still published its discovery document" >&2; exit 1; }
+introspect_tenant | jq -e '.active == false' >/dev/null || {
+  echo "a suspended Realm told a resource server its token was still active" >&2; exit 1; }
+[ "$(status_of -H "Authorization: Bearer $tenant_token" "$base_url/realms/$tenant/protocol/openid-connect/userinfo")" = "401" ] || {
+  echo "a suspended Realm still served userinfo" >&2; exit 1; }
+
+# The Realm the administrator is signed in to is the one suspension cannot be
+# applied to, because it would end the request making it and every credential
+# that could undo it.
+self_disable="$(curl -sS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+  -X PUT -d "$(curl -fsS -b "$cookie_jar" "$base_url/api/admin/v1/realms/$realm_id/" \
+    | jq -c '{display_name,issuer_url,enabled:false,approval_enabled,access_token_ttl_seconds,
+        refresh_token_ttl_seconds,session_ttl_seconds,idle_timeout_seconds,password_min_length,
+        max_login_attempts,lockout_seconds}')" "$base_url/api/admin/v1/realms/$realm_id/")"
+echo "$self_disable" | jq -e '.error == "realm_self_disable"' >/dev/null || {
+  echo "suspending one's own Realm was not refused: $self_disable" >&2; exit 1; }
+curl -fsS -b "$cookie_jar" "$base_url/api/admin/v1/realms/$realm_id/" | jq -e '.enabled == true' >/dev/null || {
+  echo "the refused request suspended the Realm anyway" >&2; exit 1; }
+
+# A name that is already taken is the most ordinary mistake there is, and it
+# used to be answered with the constraint that rejected it.
+taken="$(curl -sS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+  -X POST -d "$(jq -nc --arg username "$disabled_user" '{username:$username,password:"another-password-1234",enabled:true}')" \
+  "$base_url/api/admin/v1/realms/$realm_id/users")"
+echo "$taken" | jq -e '.error == "conflict"' >/dev/null || {
+  echo "a taken username was not reported as a conflict: $taken" >&2; exit 1; }
+echo "$taken" | jq -er '.message' | grep -Eqv 'SQLSTATE|constraint|violates' || {
+  echo "a taken username answered with database text: $taken" >&2; exit 1; }
+
 echo "ReSSO smoke test passed"
