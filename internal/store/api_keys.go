@@ -15,6 +15,11 @@ import (
 )
 
 type PersonalAPIKey struct {
+	// Active is whether this key would still be accepted. The console decided
+	// that by comparing expires_at against the browser's clock, and it gates
+	// the rotate and revoke actions — so a machine running fast showed a key
+	// that still worked as expired and offered no way to withdraw it.
+	Active      bool       `json:"active"`
 	ID          uuid.UUID  `json:"id"`
 	Name        string     `json:"name"`
 	Prefix      string     `json:"prefix"`
@@ -48,8 +53,10 @@ func (s *Store) CreatePersonalAPIKey(ctx context.Context, userID uuid.UUID, name
 	// characters provide ample uniqueness while fitting the indexed column.
 	prefix := "rk_" + prefixRandom[:12]
 	secret := prefix + "." + secretPart
+	// A key that has just been issued is usable by construction; the listing
+	// reads the same judgement back from the database.
 	key := PersonalAPIKey{ID: uuid.New(), Name: name, Prefix: prefix, Scopes: scopes,
-		CreatedAt: time.Now().UTC(), ExpiresAt: expiresAt, RotatedFrom: rotatedFrom}
+		CreatedAt: time.Now().UTC(), ExpiresAt: expiresAt, RotatedFrom: rotatedFrom, Active: true}
 	_, err = s.Pool.Exec(ctx, `INSERT INTO personal_api_keys(id,user_id,name,prefix,secret_hash,scopes,created_at,
         expires_at,rotated_from) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, key.ID, userID, key.Name, key.Prefix,
 		s.Sealer.Digest(secret), key.Scopes, key.CreatedAt, key.ExpiresAt, key.RotatedFrom)
@@ -60,7 +67,8 @@ func (s *Store) CreatePersonalAPIKey(ctx context.Context, userID uuid.UUID, name
 }
 
 func (s *Store) ListPersonalAPIKeys(ctx context.Context, userID uuid.UUID) ([]PersonalAPIKey, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id,name,prefix,scopes,created_at,expires_at,last_used_at,revoked_at,rotated_from
+	rows, err := s.Pool.Query(ctx, `SELECT id,name,prefix,scopes,created_at,expires_at,last_used_at,revoked_at,rotated_from,
+        (revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now()))
         FROM personal_api_keys WHERE user_id=$1 ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
@@ -70,7 +78,7 @@ func (s *Store) ListPersonalAPIKeys(ctx context.Context, userID uuid.UUID) ([]Pe
 	for rows.Next() {
 		var key PersonalAPIKey
 		if err := rows.Scan(&key.ID, &key.Name, &key.Prefix, &key.Scopes, &key.CreatedAt,
-			&key.ExpiresAt, &key.LastUsedAt, &key.RevokedAt, &key.RotatedFrom); err != nil {
+			&key.ExpiresAt, &key.LastUsedAt, &key.RevokedAt, &key.RotatedFrom, &key.Active); err != nil {
 			return nil, err
 		}
 		keys = append(keys, key)

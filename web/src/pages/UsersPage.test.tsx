@@ -69,6 +69,9 @@ const lockedUser = {
   email_verified: false,
   failed_attempts: 5,
   locked_until: '2099-01-01T00:00:00Z',
+  // The server decides whether the lockout is in force; the console no longer
+  // works it out from the timestamp, so a fixture has to say so.
+  locked: true,
 }
 
 function renderUsers() {
@@ -79,7 +82,7 @@ function renderUsers() {
 test('a locked account can be released without resetting its password', async () => {
   const user = userEvent.setup()
   mocks.api.mockImplementation((path: string) => {
-    if (path.includes('/unlock')) return Promise.resolve({ ...lockedUser, locked_until: undefined, failed_attempts: 0 })
+    if (path.includes('/unlock')) return Promise.resolve({ ...lockedUser, locked_until: undefined, locked: false, failed_attempts: 0 })
     if (path.includes('/role-mappings')) {
       return Promise.resolve({ available_realm_roles: [], available_client_roles: [], realm_role_ids: [], federation_realm_role_ids: [], client_role_ids: [] })
     }

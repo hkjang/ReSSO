@@ -145,7 +145,7 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 				"PersonalAPIKey": map[string]any{"type": "http", "scheme": "bearer", "bearerFormat": "ReSSO personal API key",
 					"description": "GET 요청은 api:read, 관리자 GET 요청은 추가로 admin:read 범위가 필요합니다."},
 			},
-			"schemas": openAPIUserSchemas(),
+			"schemas": openAPISchemas(),
 		},
 	})
 }
@@ -171,11 +171,44 @@ func openAPIJSONOperation(tag, summary string, secured bool, requestSchema, resp
 			"schema": map[string]any{"$ref": "#/components/schemas/" + responseSchema},
 		}}
 	}
-	operation["responses"] = map[string]any{
-		status: response,
-		"4XX":  map[string]any{"description": "Request error"},
+	responses := map[string]any{status: response}
+	for code, errorResponse := range openAPIErrorResponses() {
+		responses[code] = errorResponse
 	}
+	operation["responses"] = responses
 	return operation
+}
+
+// openAPISchemas collects every component schema the document references.
+func openAPISchemas() map[string]any {
+	schemas := openAPIUserSchemas()
+	schemas["Error"] = openAPIErrorSchema()
+	return schemas
+}
+
+// openAPIErrorSchema names the codes worth branching on. The list is not every
+// code the service can emit — it is the ones where a caller does something
+// other than show the message: wait, re-read, or send the user somewhere.
+func openAPIErrorSchema() map[string]any {
+	return map[string]any{
+		"type":        "object",
+		"description": "모든 오류 응답이 공유하는 형태입니다. trace_id는 서버 로그·감사 이벤트와 대조할 수 있습니다.",
+		"required":    []string{"error", "message"},
+		"properties": map[string]any{
+			"error": map[string]any{
+				"type":        "string",
+				"description": "기계가 분기할 식별자. 아래는 동작이 달라지는 주요 값입니다.",
+				"examples": []string{
+					"authentication_required", "invalid_credentials", "account_locked", "account_disabled",
+					"browser_session_required", "invalid_csrf", "insufficient_permission",
+					"invalid_input", "invalid_manager", "not_found", "conflict",
+					"rate_limited", "internal_error",
+				},
+			},
+			"message":  map[string]any{"type": "string", "description": "사용자에게 보여줄 수 있는 설명."},
+			"trace_id": map[string]any{"type": "string", "format": "uuid", "description": "이 요청의 추적 식별자."},
+		},
+	}
 }
 
 func openAPIUserSchemas() map[string]any {
@@ -284,9 +317,39 @@ func openAPIReadOperation(tag, summary string) map[string]any {
 	return operation
 }
 
+// openAPIErrorResponses describes what every endpoint returns when it refuses.
+//
+// The console offers this document as the API contract, and a contract that
+// says only "Request error" leaves an integrator to discover the shape by
+// provoking one. Every refusal carries the same three fields, and the ones
+// worth retrying carry Retry-After, so both belong here rather than in the
+// caller's guesswork.
+func openAPIErrorResponses() map[string]any {
+	body := map[string]any{
+		"description": "Request error",
+		"content": map[string]any{"application/json": map[string]any{
+			"schema": map[string]any{"$ref": "#/components/schemas/Error"},
+		}},
+	}
+	limited := map[string]any{
+		"description": "Too many requests",
+		"headers": map[string]any{"Retry-After": map[string]any{
+			"description": "다시 시도해도 되는 시점까지의 초. 계정 잠금(401 account_locked)에도 함께 반환됩니다.",
+			"schema":      map[string]any{"type": "integer", "minimum": 1},
+		}},
+		"content": map[string]any{"application/json": map[string]any{
+			"schema": map[string]any{"$ref": "#/components/schemas/Error"},
+		}},
+	}
+	return map[string]any{"4XX": body, "429": limited, "5XX": body}
+}
+
 func openAPIOperation(tag, summary string, secured bool) map[string]any {
-	operation := map[string]any{"tags": []string{tag}, "summary": summary,
-		"responses": map[string]any{"200": map[string]any{"description": "Success"}, "4XX": map[string]any{"description": "Request error"}}}
+	responses := map[string]any{"200": map[string]any{"description": "Success"}}
+	for status, response := range openAPIErrorResponses() {
+		responses[status] = response
+	}
+	operation := map[string]any{"tags": []string{tag}, "summary": summary, "responses": responses}
 	if secured {
 		if tag == "MCP" {
 			operation["security"] = []any{map[string]any{"PersonalAPIKey": []string{}}}

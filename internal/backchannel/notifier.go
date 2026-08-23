@@ -112,8 +112,21 @@ func (n *Notifier) Wait(timeout time.Duration) {
 	}
 }
 
+// deliveryContext bounds one notification.
+//
+// It deliberately outlives cancellation of the base context. Shutdown cancels
+// that the instant the signal arrives, which meant a delivery already under
+// way was abandoned mid-request — the user had logged out, ReSSO had ended the
+// session, and the relying party was never told, leaving them signed in there.
+// Wait exists to give exactly these deliveries a bounded moment to finish, and
+// it was waiting on work that had already given up. The per-attempt timeout
+// still bounds this, and it matches the budget Wait allows.
+func (n *Notifier) deliveryContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(n.base), deliveryTimeout)
+}
+
 func (n *Notifier) deliver(revoked store.RevokedSession) {
-	ctx, cancel := context.WithTimeout(n.base, deliveryTimeout)
+	ctx, cancel := n.deliveryContext()
 	defer cancel()
 	realm, err := n.store.RealmByID(ctx, revoked.RealmID)
 	if err != nil {
@@ -150,30 +163,76 @@ func (n *Notifier) deliver(revoked store.RevokedSession) {
 	group.Wait()
 }
 
+// deliveryAttempts and retryBackoff bound how hard a single notification
+// tries. One attempt lost the notification whenever the relying party happened
+// to be restarting, leaving a session open there that the user had ended here.
+// Retrying is only useful for failures that can clear on their own, so a
+// refusal by the relying party is taken at its word.
+var retryBackoff = []time.Duration{2 * time.Second, 8 * time.Second}
+
 func (n *Notifier) post(ctx context.Context, realmName, clientID, endpoint, token string) {
+	for attempt := 0; ; attempt++ {
+		outcome, retryable := n.attempt(ctx, realmName, clientID, endpoint, token)
+		if !retryable || attempt >= len(retryBackoff) {
+			n.record(outcome)
+			if outcome != "delivered" {
+				n.logger.Warn("back-channel logout was not delivered",
+					"realm", realmName, "client", clientID, "outcome", outcome, "attempts", attempt+1)
+			}
+			return
+		}
+		timer := time.NewTimer(retryBackoff[attempt])
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			n.record(outcome)
+			return
+		case <-n.base.Done():
+			// Shutting down: the attempt in hand was allowed to finish, but
+			// waiting out a backoff would outlast the process.
+			timer.Stop()
+			n.record(outcome)
+			return
+		}
+		timer.Stop()
+	}
+}
+
+// attempt performs one delivery and reports its outcome and whether another
+// try could plausibly succeed.
+func (n *Notifier) attempt(ctx context.Context, realmName, clientID, endpoint, token string) (string, bool) {
 	body := strings.NewReader(url.Values{"logout_token": {token}}.Encode())
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
 		n.logger.Error("back-channel logout request could not be built",
 			"realm", realmName, "client", clientID, "error", err)
-		return
+		return "failed", false
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Cache-Control", "no-store")
 	response, err := n.client.Do(request)
 	if err != nil {
+		// Unreachable, refused or timed out: the relying party may be
+		// restarting, so another attempt is worth making.
 		n.logger.Warn("back-channel logout delivery failed",
 			"realm", realmName, "client", clientID, "error", err)
-		n.record("failed")
-		return
+		return "failed", ctx.Err() == nil
 	}
 	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode < 200 || response.StatusCode > 299 {
+	switch {
+	case response.StatusCode >= 200 && response.StatusCode <= 299:
+		n.logger.Info("back-channel logout delivered", "realm", realmName, "client", clientID)
+		return "delivered", false
+	case response.StatusCode >= 500 || response.StatusCode == http.StatusTooManyRequests:
+		n.logger.Warn("back-channel logout was refused for now",
+			"realm", realmName, "client", clientID, "status", response.StatusCode)
+		return "failed", ctx.Err() == nil
+	default:
+		// The relying party understood and declined; repeating it changes
+		// nothing.
 		n.logger.Warn("back-channel logout was rejected by the relying party",
 			"realm", realmName, "client", clientID, "status", response.StatusCode)
-		n.record("rejected")
-		return
+		return "rejected", false
 	}
-	n.record("delivered")
-	n.logger.Info("back-channel logout delivered", "realm", realmName, "client", clientID)
 }

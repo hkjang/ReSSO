@@ -110,6 +110,8 @@ Client에 Back-Channel Logout URI를 등록하면 Session이 종료될 때(사�
 
 개인 설정 → 개인 API 키에서 `mcp:read` 범위의 키를 만든 후 다음처럼 연결합니다. `api:read`는 개인 REST GET API, 관리자는 추가 `admin:read`로 권한 범위 내 관리 GET API를 호출할 수 있습니다. 변경 API는 CSRF가 적용된 브라우저 세션만 허용합니다.
 
+MCP 도구도 같은 기준을 따릅니다. `mcp:read`만 가진 키는 서비스 상태만 조회할 수 있고, Client·User·Federation 목록을 다루는 도구는 관리자 계정에 `admin:read` 범위가 함께 있어야 `tools/list`에 나타나고 호출할 수 있습니다.
+
 ```json
 {
   "mcpServers": {
@@ -168,10 +170,12 @@ scrape_configs:
 | `resso_http_requests_total` | Route 패턴·Method·Status별 요청 수 |
 | `resso_http_request_duration_seconds` | Route 패턴별 요청 지연 Histogram |
 | `resso_tokens_issued_total` | Grant type별 Token 발급 수 |
-| `resso_login_attempts_total` | 로그인 성공·실패·Rate limit 수 |
+| `resso_token_errors_total` | Grant type별 발급하지 못한 Token 요청 수 |
+| `resso_login_attempts_total` | 로그인 성공·실패·Rate limit·처리 실패 수 |
 | `resso_client_auth_failures_total` | Realm별 OIDC Client 인증 실패 수 |
 | `resso_backchannel_logout_total` | Back-Channel Logout 전달 결과 |
 | `resso_federation_sync_total` | 주기 LDAP 동기화 성공·실패 수 |
+| `resso_system_log_records_total` | 서버 로그의 데이터베이스 기록·유실·실패 수 |
 
 ## 개발 및 검증
 
@@ -195,7 +199,7 @@ RESSO_TEST_POSTGRES_DSN='postgres://resso:testpw@127.0.0.1:55432/resso?sslmode=d
 ./scripts/smoke-test.sh http://127.0.0.1:8080 admin 'your-password'
 ```
 
-Smoke test는 PKCE, Scope 기반 Claim, Refresh Token 재사용 탐지, Web Origin CORS, Realm/Client Role, Realm 관리자 격리, 개인 API Key REST와 MCP를 함께 검증합니다.
+Smoke test는 PKCE, Scope 기반 Claim, Refresh Token 재사용 탐지, Web Origin CORS, Realm/Client Role, Realm 관리자 격리, 개인 API Key REST와 MCP를 함께 검증합니다. MCP는 handshake뿐 아니라 도구 권한 경계까지 확인합니다 — `admin:read`가 있는 키는 Client·User 도구를 쓸 수 있고, `mcp:read`만 있는 키에는 목록에 나타나지도 호출되지도 않아야 합니다.
 
 ## 운영 보안
 

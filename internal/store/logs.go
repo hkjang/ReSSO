@@ -99,8 +99,26 @@ func (s *Store) PruneOperationalData(ctx context.Context) error {
 		"UPDATE signing_keys SET status='RETIRED' WHERE status='PASSIVE' AND retire_at<now()",
 		"DELETE FROM system_logs WHERE occurred_at < now() - interval '30 days'",
 		"DELETE FROM audit_events WHERE occurred_at < now() - interval '365 days'",
-		"DELETE FROM authorization_requests WHERE expires_at < now() - interval '1 day'",
-		"DELETE FROM authorization_codes WHERE expires_at < now() - interval '1 day'",
+		// A pending request is invisible to every reader the moment it
+		// expires, so the extra day bought nothing — and this table fills
+		// from unauthenticated traffic. Reaching the endpoint that writes a
+		// row needs only a client identifier and a redirect URI, both of
+		// which appear in any relying party's sign-in link, so anyone can
+		// drive one insert per request. Keeping those for a day turned a
+		// burst of traffic into storage that outlives it.
+		"DELETE FROM authorization_requests WHERE expires_at < now()",
+		// An authorization code outlives its usefulness as a credential in
+		// ninety seconds, but it is also the only record that a client took
+		// part in a session — back-channel logout reads it to decide who to
+		// notify. Sweeping it on a fixed day left any session longer than
+		// that unable to tell its relying parties the user had signed out.
+		// One row per client is kept while the session is live, which is all
+		// the notification needs, and everything else still goes.
+		`DELETE FROM authorization_codes a WHERE a.expires_at < now() - interval '1 day'
+            AND (NOT EXISTS(SELECT 1 FROM sso_sessions s WHERE s.id=a.session_id
+                    AND s.revoked_at IS NULL AND s.expires_at>now())
+                OR EXISTS(SELECT 1 FROM authorization_codes b WHERE b.session_id=a.session_id
+                    AND b.client_id=a.client_id AND b.expires_at>a.expires_at))`,
 		"DELETE FROM revoked_access_tokens WHERE expires_at < now()",
 		"DELETE FROM login_rate_limits WHERE updated_at < now() - interval '1 day'",
 		// Refresh tokens were only collected through the session cascade, so a

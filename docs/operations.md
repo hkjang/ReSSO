@@ -57,10 +57,22 @@ ReSSO는 확장을 직접 설치하지 않습니다. 확장 설치는 데이터�
 권장 경보:
 
 - `resso_login_attempts_total{result="failure"}` 급증 — 자격증명 대입 시도
+- `resso_token_errors_total` 발생 — Token을 발급하지 못하는 상태. Signing Key를 열 수 없는 경우(Keyring 불일치)가 대표적이며, 모든 RP의 Token 교환이 함께 실패합니다. 발급 성공만 세면 이 상황도 시계열이 조용해질 뿐입니다.
+- `resso_login_attempts_total{result="error"}` 발생 — 로그인 시도를 완료하지 못하는 상태. LDAP 디렉터리 장애가 대표적입니다. 이 경우 성공도 실패도 집계되지 않으므로, `failure` 급증만 보고 있으면 전면 장애가 조용해 보입니다.
 - `resso_client_auth_failures_total` 급증 — Client Secret 오설정 또는 대입 시도
 - `resso_backchannel_logout_total{result!="delivered"}` — RP가 로그아웃 통지를 받지 못하는 상태
 - `resso_federation_sync_total{result="failure"}` — LDAP 동기화 실패
 - `resso_http_request_duration_seconds` 상위 분위 상승 — 커넥션 풀 포화 또는 LDAP 지연
+- `resso_system_log_records_total{result!="written"}` — 서버 로그가 데이터베이스에 남지 않는 상태. 관리 화면의 로그에 구멍이 생깁니다.
+
+지표만으로는 드러나지 않는 신호는 감사 이벤트에 있습니다. 관리 → 운영 → 감사에서 종류로 걸러 확인하세요.
+
+| 이벤트 | 의미 |
+|---|---|
+| `AUTHORIZATION_CODE_REUSED` | 인가 코드가 두 번 제시되었습니다. 코드가 유출된 것이며, 해당 Session·Client의 Refresh Token은 이미 폐기되었습니다. 기록된 계정과 Client를 확인하고 RP의 Redirect 설정과 Referrer 정책을 점검하세요. |
+| `REFRESH_TOKEN_REUSE` | Refresh Token이 회전 이후 다시 제시되어 계열이 폐기되었습니다. |
+| `LDAP_FEDERATION_SYNC` `result=FAILURE` | 동기화 실패. `DISABLE` 정책이면 계정 비활성화가 반영되지 않습니다. |
+| `TOKEN_REVOKED` | RP가 Revocation endpoint를 호출했습니다. 상세의 `revoked`가 실제 결과입니다 — `refresh_token`(계열 폐기, `family_id` 포함), `access_token`(`jti` 포함), `none`(일치하는 Token 없음). RFC 7009은 일치 여부와 무관하게 200을 반환하므로, Token이 실제로 폐기되었는지는 이 값으로만 알 수 있습니다. |
 
 ## Back-Channel Logout
 
@@ -68,9 +80,44 @@ ReSSO는 확장을 직접 설치하지 않습니다. 확장 설치는 데이터�
 
 - 사용자 로그아웃, RP-Initiated Logout, 관리자의 Session 강제 폐기, 계정 복구가 모두 통지를 발생시킵니다.
 - URI는 HTTPS(또는 Loopback HTTP)만 허용하며 Redirect는 따라가지 않습니다.
-- 전달은 Best effort입니다. 재시도하지 않으며 사용자의 로그아웃 응답을 지연시키지 않습니다.
+- 전달은 Best effort이며 사용자의 로그아웃 응답을 지연시키지 않습니다. 저절로 해소될 수 있는 실패(연결 실패, 5xx, 429)만 2초·8초 간격으로 재시도하고, RP가 명시적으로 거절한 4xx는 반복하지 않습니다. 종료 중에는 즉시 중단합니다.
 - RP는 `logout_token`을 Realm JWKS로 검증하고 `iss`, `aud`, `events`, `sid`를 확인해야 합니다.
 - 실패는 서버 로그와 `resso_backchannel_logout_total`에 기록됩니다.
+- 통지 대상은 해당 Session에 실제로 참여한 Client입니다. 참여 기록은 Session이 살아 있는 동안 유지되며 Session이 끝나면 정리됩니다.
+
+## Token과 Session 수명
+
+Realm에는 서로 다른 것을 재는 네 개의 시간이 있습니다. 자주 혼동되므로 관계를 정리합니다.
+
+| 설정 | 재는 대상 | 범위 | 기본값 |
+|---|---|---|---|
+| Access Token | 발급된 Access Token 하나의 수명 | 60–3600초 | 300초 |
+| Refresh Token | **최초 발급 시점부터 Token 계열 전체의 총 수명** | 300–2592000초 | 1800초 |
+| SSO Session | 로그인 후 활동과 무관한 세션 최대 수명 | 300–2592000초 | 28800초 |
+| 유휴 만료 | 마지막 사용 이후 세션이 유지되는 시간 | `0` 또는 300–2592000초 | `0`(사용 안 함) |
+
+Refresh Token은 회전할 때마다 새 값이 발급되지만 **만료 시각은 연장되지 않습니다.** 계속 갱신하는 Client가 자격증명을 무기한 보유하지 못하도록 하는 상한입니다. 이 시간이 지나면 Refresh는 거부되고 RP는 인가 과정을 다시 거칩니다.
+
+SSO Session이 아직 살아 있으면 이 재인가는 사용자에게 보이지 않습니다. 브라우저가 인가 endpoint로 갔다가 즉시 돌아오므로 다시 로그인하라는 화면이 나오지 않습니다. 다만 다음 경우에는 실제 재로그인이 됩니다.
+
+- SSO Session이 이미 만료되었거나 유휴 만료에 걸린 경우
+- 브라우저 Redirect를 쓰기 어려운 Native·Mobile Client
+- 사용자 상호작용 없이 장시간 동작해야 하는 통합
+
+이런 Client가 있다면 Refresh Token 값을 SSO Session에 가깝게 올리세요. 기본값 1800초는 브라우저 기반 RP를 기준으로 한 값입니다.
+
+## 세션 유휴 만료
+
+Realm 상세의 `유휴 만료`는 그 시간 동안 사용되지 않은 세션을 만료시킵니다. 관리 콘솔 요청뿐 아니라 Token 갱신·발급과 MCP·Introspection의 Session 확인도 사용으로 셉니다. 따라서 RP를 통해서만 접속하는 사용자의 Session도 작업 중에는 만료되지 않습니다. `0`이면 사용하지 않으며, 이 경우 세션은 `SSO Session` 절대 수명까지만 유효합니다.
+
+| 항목 | 범위 | 기본값 |
+|---|---|---|
+| 유휴 만료 | 0(사용 안 함) 또는 300초 ~ 24시간 | 0 |
+
+- 요청이 발생할 때마다 활동으로 기록되므로, 콘솔이나 연동 애플리케이션을 사용하는 동안에는 만료되지 않습니다.
+- 브라우저 세션 검증, Token 발급, Refresh Token 회전, MCP 인증에 동일하게 적용됩니다. 유휴로 만료된 세션은 Refresh Token으로도 연장되지 않습니다.
+- `SSO Session`보다 크게 설정할 수 없습니다.
+- 공용 단말이나 정책상 유휴 종료가 요구되는 환경에서 설정하세요. 값을 바꾸면 사용자의 `내 세션` 화면에도 안내가 표시됩니다.
 
 ## 계정 잠금 운영
 

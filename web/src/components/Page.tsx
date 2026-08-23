@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import { Box, Button, Chip, Stack, Typography } from '@mui/material'
 import AddRoundedIcon from '@mui/icons-material/AddRounded'
+import { useDocumentTitle } from '../lib/documentTitle'
 
 export function PageHeader({ title, description, action, badge }: {
   title: string
@@ -8,6 +9,7 @@ export function PageHeader({ title, description, action, badge }: {
   action?: { label: string; onClick: () => void }
   badge?: string
 }) {
+  useDocumentTitle(title)
   return (
     <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'flex-start' }} spacing={2} sx={{ mb: 3 }}>
       <Box>

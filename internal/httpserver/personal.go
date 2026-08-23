@@ -32,9 +32,10 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	// the server reject the request.
 	if realm, realmErr := s.store.RealmByID(r.Context(), user.RealmID); realmErr == nil {
 		response["password_policy"] = map[string]any{
-			"min_length":         realm.PasswordMinLength,
-			"max_login_attempts": realm.MaxLoginAttempts,
-			"lockout_seconds":    realm.LockoutSeconds,
+			"min_length":           realm.PasswordMinLength,
+			"max_login_attempts":   realm.MaxLoginAttempts,
+			"lockout_seconds":      realm.LockoutSeconds,
+			"idle_timeout_seconds": realm.IdleTimeoutSeconds,
 		}
 	}
 	writeJSON(w, http.StatusOK, response)

@@ -51,12 +51,18 @@ type Server struct {
 	metrics            *observability.Registry
 }
 
-func New(data *store.Store, logger *slog.Logger, trustedProxyCIDRs []*net.IPNet) *Server {
+// New builds the HTTP surface. Pass the registry the rest of the process
+// reports to; a nil registry gets a private one, which suits tests.
+func New(data *store.Store, logger *slog.Logger, trustedProxyCIDRs []*net.IPNet, metrics *observability.Registry) *Server {
+	if metrics == nil {
+		metrics = observability.NewRegistry()
+	}
+	registerMetrics(metrics)
 	return &Server{store: data, oidc: &oidc.Service{Store: data}, logger: logger,
 		trustedProxyCIDRs:  trustedProxyCIDRs,
 		clientAuthLimiter:  ratelimit.NewFailureLimiter(clientAuthMaxFailures, clientAuthWindow, clientAuthTrackedKeys),
 		addressAuthLimiter: ratelimit.NewFailureLimiter(addressAuthMaxFailures, clientAuthWindow, clientAuthTrackedKeys),
-		metrics:            newMetrics()}
+		metrics:            metrics}
 }
 
 // Metrics exposes the registry so that background workers outside the HTTP

@@ -217,21 +217,46 @@ func (s *Service) IssueLogoutToken(ctx context.Context, realm domain.Realm, clie
 	return jwt.Signed(signer).Claims(standard).Claims(extra).Serialize()
 }
 
-func (s *Service) Verify(ctx context.Context, realm domain.Realm, raw string, expectedAudience string) (VerifiedToken, error) {
+// SubjectFromIDTokenHint reads the subject an id_token_hint asserts.
+//
+// Expiry is deliberately not checked. A hint is normally presented precisely
+// because the token expired — that is what a relying party is trying to renew
+// — so rejecting expired ones would refuse the case the parameter exists for.
+// The signature and issuer still have to be ours, which is what makes the
+// subject trustworthy enough to compare against the session.
+func (s *Service) SubjectFromIDTokenHint(ctx context.Context, realm domain.Realm, raw string) (string, error) {
+	standard, _, err := s.parseSigned(ctx, realm, raw)
+	if err != nil {
+		return "", err
+	}
+	if standard.Issuer != realm.IssuerURL {
+		return "", errors.New("id_token_hint was issued by another issuer")
+	}
+	if standard.Subject == "" {
+		return "", errors.New("id_token_hint has no subject")
+	}
+	return standard.Subject, nil
+}
+
+// parseSigned resolves the Realm signing key named by the token and returns
+// its claims. No time-based validation is applied; callers add what they need.
+func (s *Service) parseSigned(ctx context.Context, realm domain.Realm, raw string) (jwt.Claims, keycloakClaims, error) {
+	var standard jwt.Claims
+	var extra keycloakClaims
 	parsed, err := jwt.ParseSigned(raw, []jose.SignatureAlgorithm{jose.RS256})
 	if err != nil {
-		return VerifiedToken{}, errors.New("token is not a signed RS256 JWT")
+		return standard, extra, errors.New("token is not a signed RS256 JWT")
 	}
 	if len(parsed.Headers) != 1 {
-		return VerifiedToken{}, errors.New("token has an invalid JOSE header count")
+		return standard, extra, errors.New("token has an invalid JOSE header count")
 	}
 	kid := parsed.Headers[0].KeyID
 	if kid == "" {
-		return VerifiedToken{}, errors.New("token has no kid header")
+		return standard, extra, errors.New("token has no kid header")
 	}
 	keys, err := s.Store.PublishedSigningKeys(ctx, realm.ID)
 	if err != nil {
-		return VerifiedToken{}, err
+		return standard, extra, err
 	}
 	var publicKey *rsa.PublicKey
 	for _, metadata := range keys {
@@ -240,18 +265,24 @@ func (s *Service) Verify(ctx context.Context, realm domain.Realm, raw string, ex
 		}
 		var jwk jose.JSONWebKey
 		if err := json.Unmarshal(metadata.PublicJWK, &jwk); err != nil {
-			return VerifiedToken{}, err
+			return standard, extra, err
 		}
 		publicKey, _ = jwk.Key.(*rsa.PublicKey)
 		break
 	}
 	if publicKey == nil {
-		return VerifiedToken{}, errors.New("token signing key is unavailable")
+		return standard, extra, errors.New("token signing key is unavailable")
 	}
-	var standard jwt.Claims
-	var extra keycloakClaims
 	if err := parsed.Claims(publicKey, &standard, &extra); err != nil {
-		return VerifiedToken{}, errors.New("token signature validation failed")
+		return standard, extra, errors.New("token signature validation failed")
+	}
+	return standard, extra, nil
+}
+
+func (s *Service) Verify(ctx context.Context, realm domain.Realm, raw string, expectedAudience string) (VerifiedToken, error) {
+	standard, extra, err := s.parseSigned(ctx, realm, raw)
+	if err != nil {
+		return VerifiedToken{}, err
 	}
 	expected := jwt.Expected{Issuer: realm.IssuerURL, Time: time.Now().UTC()}
 	if expectedAudience != "" {

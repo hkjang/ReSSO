@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/hkjang/ReSSO/internal/config"
 	"github.com/hkjang/ReSSO/internal/domain"
+	"github.com/hkjang/ReSSO/internal/observability"
 	"github.com/hkjang/ReSSO/internal/store"
 )
 
@@ -55,7 +57,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	ipDecision, rateErr := s.store.ConsumeLoginRateLimit(r.Context(), "login/ip/"+ip, 100, 5*time.Minute)
 	if rateErr != nil {
 		s.logger.Error("login IP rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", rateErr)
-		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
+		writeLoginError(w, r, s.metrics)
 		return
 	}
 	if !ipDecision.Allowed {
@@ -91,7 +93,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	accountDecision, accountErr := s.store.CheckLoginRateLimit(r.Context(), accountBucket, 30, 5*time.Minute)
 	if accountErr != nil {
 		s.logger.Error("login account rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", accountErr)
-		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
+		writeLoginError(w, r, s.metrics)
 		return
 	}
 	if !accountDecision.Allowed {
@@ -101,14 +103,14 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	result, err := s.store.Authenticate(r.Context(), realm, input.Username, input.Password)
 	if err != nil {
 		s.logger.Error("password authentication failed", "trace_id", traceIDFrom(r.Context()), "error", err)
-		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
+		writeLoginError(w, r, s.metrics)
 		return
 	}
 	if !result.Success {
 		failureDecision, rateErr := s.store.RecordLoginFailure(r.Context(), accountBucket, 30, 5*time.Minute)
 		if rateErr != nil {
 			s.logger.Error("record login failure rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", rateErr)
-			writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
+			writeLoginError(w, r, s.metrics)
 			return
 		}
 		s.metrics.Add(metricLogins, 1, "failure")
@@ -119,13 +121,34 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			writeLoginRateLimited(w, r, failureDecision.RetryAfterSeconds)
 			return
 		}
+		// Someone who supplied the right password and is still refused is
+		// locked out, not mistaken about their password. Telling them so —
+		// and when it lifts — is what stops them working through variations,
+		// extending nothing and calling the help desk about the wrong
+		// problem. It reveals the account exists only to a caller who already
+		// proved they know its password.
+		if result.CredentialsValid && result.FailureReason == "ACCOUNT_LOCKED" && result.User.LockedUntil != nil {
+			remaining := int(time.Until(*result.User.LockedUntil).Round(time.Minute) / time.Minute)
+			if remaining < 1 {
+				remaining = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(int(time.Until(*result.User.LockedUntil).Seconds())+1))
+			writeError(w, r, http.StatusUnauthorized, "account_locked",
+				fmt.Sprintf("연속된 로그인 실패로 계정이 잠겼습니다. 약 %d분 뒤에 다시 시도하거나 관리자에게 잠금 해제를 요청하세요.", remaining))
+			return
+		}
+		if result.CredentialsValid && result.FailureReason == "ACCOUNT_DISABLED" {
+			writeError(w, r, http.StatusUnauthorized, "account_disabled",
+				"계정이 비활성화되어 있습니다. 관리자에게 문의하세요.")
+			return
+		}
 		message := "아이디 또는 비밀번호가 올바르지 않습니다."
 		writeError(w, r, http.StatusUnauthorized, "invalid_credentials", message)
 		return
 	}
 	if err := s.store.ResetLoginRateLimit(r.Context(), accountBucket); err != nil {
 		s.logger.Error("reset login failure rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", err)
-		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
+		writeLoginError(w, r, s.metrics)
 		return
 	}
 	authMethod := result.AuthMethod
@@ -136,7 +159,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		time.Duration(result.SessionSeconds)*time.Second, s.clientIP(r), r.UserAgent(), authMethod)
 	if err != nil {
 		s.logger.Error("create browser session failed", "trace_id", traceIDFrom(r.Context()), "error", err)
-		writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
+		writeLoginError(w, r, s.metrics)
 		return
 	}
 	s.setBrowserCookies(w, r, newSession.Token, newSession.CSRFToken, newSession.Session.ExpiresAt)
@@ -207,6 +230,18 @@ func (s *Server) browserLogout(w http.ResponseWriter, r *http.Request) {
 	s.clearBrowserCookies(w, r)
 	s.audit(r, &session.User.RealmID, &session.User.ID, session.User.Username, "LOGOUT", "SUCCESS", "session", session.Session.ID.String(), nil)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeLoginError answers an attempt that could not be completed and counts it.
+//
+// The login counter had outcomes for success, a rejected credential and a rate
+// limit, so a directory outage — every attempt failing before any of those —
+// showed up as the series going quiet. Operators are told to watch this metric
+// for a spike in failures; silence is what a working night looks like, so the
+// worst case read as the calmest.
+func writeLoginError(w http.ResponseWriter, r *http.Request, metrics *observability.Registry) {
+	metrics.Add(metricLogins, 1, "error")
+	writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인을 처리하지 못했습니다.")
 }
 
 func (s *Server) audit(r *http.Request, realmID, actorID *uuid.UUID, actorName, eventType, result, targetType, targetID string, detail map[string]any) {

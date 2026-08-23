@@ -107,3 +107,20 @@ func TestRegistryIsSafeForConcurrentUse(t *testing.T) {
 		}
 	}
 }
+
+func TestRegistryCountersAreAdditive(t *testing.T) {
+	registry := NewRegistry()
+	registry.Counter("resso_additive_total", "Additive.", "result")
+	registry.Add("resso_additive_total", 5, "written")
+	registry.Add("resso_additive_total", 3, "written")
+	registry.Add("resso_additive_total", 1, "dropped")
+	output := render(t, registry)
+	for _, want := range []string{
+		`resso_additive_total{result="written"} 8`,
+		`resso_additive_total{result="dropped"} 1`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q:\n%s", want, output)
+		}
+	}
+}

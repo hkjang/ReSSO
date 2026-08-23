@@ -3,6 +3,8 @@ package httpserver
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +27,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hkjang/ReSSO/internal/cryptoutil"
+	"github.com/hkjang/ReSSO/internal/domain"
+	"github.com/hkjang/ReSSO/internal/observability"
 	ressooidc "github.com/hkjang/ReSSO/internal/oidc"
 	"github.com/hkjang/ReSSO/internal/store"
 )
@@ -40,7 +44,7 @@ func TestIntegrationLoginCountsFailuresAndResetsOnSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil).Handler())
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
 	t.Cleanup(server.Close)
 	client := server.Client()
 
@@ -115,7 +119,7 @@ func TestIntegrationMCPUserTokenRequiresExactActiveSessionBinding(t *testing.T) 
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil).Handler())
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
 	t.Cleanup(server.Close)
 	client := server.Client()
 	clientToken := requestIntegrationClientCredentialsToken(t, client, server.URL,
@@ -378,7 +382,7 @@ func TestIntegrationMetricsRequireAdminAuthorizationAndRecordRequests(t *testing
 		t.Fatal(bootstrapErr)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil).Handler())
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
 	t.Cleanup(server.Close)
 	client := server.Client()
 	jar, err := cookiejar.New(nil)
@@ -456,7 +460,7 @@ func TestIntegrationClientSecretBruteForceIsLimitedWithoutBlockingNeighbours(t *
 	neighbour := newClient("neighbour-client")
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil).Handler())
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
 	t.Cleanup(server.Close)
 	client := server.Client()
 
@@ -517,7 +521,7 @@ func TestIntegrationQuickSearchPointsAtRoutesTheConsoleHas(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil).Handler())
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
 	t.Cleanup(server.Close)
 	client := server.Client()
 	jar, err := cookiejar.New(nil)
@@ -563,5 +567,672 @@ func TestIntegrationQuickSearchPointsAtRoutesTheConsoleHas(t *testing.T) {
 				t.Fatalf("%s %q does not carry the search term: %q", item.Kind, item.Label, item.Path)
 			}
 		}
+	}
+}
+
+// A personal API key carrying only mcp:read belongs to whoever asked for one —
+// every user may mint one. The directory tools must still refuse it: the REST
+// routes that return the same records sit behind requireAdmin, and reading the
+// member list of a realm is what turns one compromised account into a target
+// list for the rest.
+func TestIntegrationMCPDirectoryToolsRefuseNonAdminKeys(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intern, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "intern", Password: "intern-password-123", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	internKey, err := data.CreatePersonalAPIKey(ctx, intern.ID, "agent", []string{"mcp:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminKey, err := data.CreatePersonalAPIKey(ctx, bootstrap.AdminUserID, "agent",
+		[]string{"mcp:read", "admin:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+
+	listed := callIntegrationMCP(t, client, server.URL, internKey.Secret,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
+	for _, name := range []string{"resso_search_users", "resso_list_clients"} {
+		if strings.Contains(listed, name) {
+			t.Errorf("tools/list offered %s to a non-admin key: %s", name, listed)
+		}
+	}
+
+	for _, call := range []string{
+		`{"name":"resso_search_users","arguments":{"query":"ad"}}`,
+		`{"name":"resso_list_clients","arguments":{}}`,
+	} {
+		body := callIntegrationMCP(t, client, server.URL, internKey.Secret,
+			`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":`+call+`}`)
+		if !strings.Contains(body, `"isError":true`) {
+			t.Errorf("non-admin key ran %s: %s", call, body)
+		}
+		if strings.Contains(body, "admin") && !strings.Contains(body, `"isError":true`) {
+			t.Errorf("non-admin key read directory records: %s", body)
+		}
+	}
+
+	// The same tools must keep working for a key that does carry admin:read,
+	// so the fix bounds the audience rather than removing the capability.
+	body := callIntegrationMCP(t, client, server.URL, adminKey.Secret,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"resso_search_users","arguments":{"query":"ad"}}}`)
+	if strings.Contains(body, `"isError":true`) || !strings.Contains(body, `"username":"admin"`) {
+		t.Fatalf("admin key could not search users: %s", body)
+	}
+}
+
+func callIntegrationMCP(t *testing.T, client *http.Client, baseURL, token, payload string) string {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/mcp", strings.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("MCP status = %d, body=%s", response.StatusCode, body)
+	}
+	return string(body)
+}
+
+// The refresh exchange rotates before it issues. A rejection that happens
+// after the rotation costs the relying party the only token it holds: it works
+// for the length of the grace window and then reads as a replay, revoking the
+// family and reporting a theft that never happened. Rejecting before the
+// rotation is what keeps the caller whole.
+func TestIntegrationRefreshFailureLeavesTheClientsTokenUsable(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "refresh-probe", Name: "Refresh Probe", Type: "public",
+		RedirectURIs: []string{"https://probe.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "refresh-integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: created.Client.ID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	// A disabled account is the common way this exchange fails, and the
+	// rejection must not cost the caller its token.
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET enabled=false WHERE id=$1`, userID); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {raw}, "client_id": {"refresh-probe"}}
+	response, err := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("refresh for a disabled account status = %d", response.StatusCode)
+	}
+
+	var rotatedAt *time.Time
+	var children int
+	if err := data.Pool.QueryRow(ctx, `SELECT rotated_at,
+		(SELECT count(*) FROM refresh_tokens c WHERE c.parent_id=t.id) FROM refresh_tokens t
+		WHERE t.session_id=$1 AND t.parent_id IS NULL`, sessionID).Scan(&rotatedAt, &children); err != nil {
+		t.Fatal(err)
+	}
+	if rotatedAt != nil {
+		t.Error("the client's token was left marked rotated after a failed exchange")
+	}
+	if children != 0 {
+		t.Errorf("an undelivered successor token was left behind: %d", children)
+	}
+}
+
+// Revocation answers 200 whether or not the token matched, which is what the
+// specification requires but leaves the audit trail unable to say whether a
+// token is actually dead. The entry has to distinguish the three outcomes.
+func TestIntegrationRevocationAuditRecordsWhatWasRevoked(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "revoke-probe", Name: "Revoke Probe", Type: "confidential",
+		RedirectURIs: []string{"https://probe.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "revoke-integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: created.Client.ID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	revoke := func(token string) {
+		t.Helper()
+		form := url.Values{"token": {token}, "client_id": {"revoke-probe"},
+			"client_secret": {created.ClientSecret}}
+		response, postErr := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/revoke", form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("revoke status = %d", response.StatusCode)
+		}
+	}
+
+	revoke("not-a-token-anyone-issued")
+	revoke(raw)
+
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "TOKEN_REVOKED", Ascending: true, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("audit entries = %d, want 2", len(page.Items))
+	}
+	detailOf := func(index int) map[string]any {
+		t.Helper()
+		var decoded map[string]any
+		if err := json.Unmarshal(page.Items[index].Detail, &decoded); err != nil {
+			t.Fatalf("decode audit detail: %v", err)
+		}
+		return decoded
+	}
+	if got := detailOf(0)["revoked"]; got != "none" {
+		t.Errorf("an unmatched token recorded revoked=%v, want none", got)
+	}
+	matched := detailOf(1)
+	if got := matched["revoked"]; got != "refresh_token" {
+		t.Errorf("a revoked refresh token recorded revoked=%v", got)
+	}
+	if matched["family_id"] == nil {
+		t.Error("the revoked family was not recorded")
+	}
+}
+
+// max_age is how a relying party demands a fresh proof of identity before
+// something sensitive. It was accepted and ignored, so the request came back
+// with a code minted from whatever session already existed — indistinguishable,
+// from the relying party's side, from a reauthentication that never happened.
+func TestIntegrationMaxAgeForcesReauthentication(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "step-up", Name: "Step Up", Type: "public",
+		RedirectURIs: []string{"https://step-up.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "max-age-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	// Public clients must use PKCE, so every probe carries a valid challenge.
+	verifier := strings.Repeat("step-up-verifier", 4)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	authorize := func(extra string) *url.URL {
+		t.Helper()
+		target := server.URL + "/realms/master/protocol/openid-connect/auth?response_type=code&client_id=step-up" +
+			"&redirect_uri=" + url.QueryEscape("https://step-up.example.test/cb") + "&scope=openid&state=s" +
+			"&code_challenge=" + challenge + "&code_challenge_method=S256" + extra
+		request, reqErr := http.NewRequest(http.MethodGet, target, nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		location, parseErr := url.Parse(response.Header.Get("Location"))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		return location
+	}
+
+	// A generous max_age is satisfied by the session that already exists.
+	if got := authorize("&max_age=3600"); got.Query().Get("code") == "" {
+		t.Fatalf("a fresh session did not satisfy max_age=3600: %s", got)
+	}
+
+	// Age the authentication past what the relying party will accept.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE sso_sessions SET created_at=now()-interval '20 minutes' WHERE id=$1`, session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	stale := authorize("&max_age=300")
+	if stale.Query().Get("code") != "" {
+		t.Errorf("max_age=300 was satisfied by a 20-minute-old authentication: %s", stale)
+	}
+	if stale.Path != "/login" || stale.Query().Get("request") == "" {
+		t.Errorf("a stale authentication did not send the user to sign in again: %s", stale)
+	}
+
+	// With prompt=none there is nobody to ask, so the relying party has to be
+	// told rather than handed a code it asked not to receive.
+	silent := authorize("&max_age=300&prompt=none")
+	if silent.Query().Get("error") != "login_required" {
+		t.Errorf("prompt=none with a stale authentication returned %q", silent.Query().Get("error"))
+	}
+
+	// A value that is not a number is refused, not quietly dropped.
+	malformed := authorize("&max_age=soon")
+	if malformed.Query().Get("error") != "invalid_request" {
+		t.Errorf("malformed max_age returned %q", malformed.Query().Get("error"))
+	}
+}
+
+// A relying party sends request objects to protect the parameters inside them,
+// and id_token_hint to name the account it believes it is renewing. Accepting
+// either and acting on neither is a silent downgrade: the first honours the
+// unsigned query string instead, the second can hand back a code for whoever
+// happens to be signed in now.
+func TestIntegrationAuthorizationRefusesUnsupportedAndMismatchedHints(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "hint-probe", Name: "Hint Probe", Type: "public",
+		RedirectURIs: []string{"https://hint.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "hint-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ID tokens are signed, and the key is created lazily on first use.
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	verifier := strings.Repeat("hint-probe-verifier", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	authorize := func(extra string) *url.URL {
+		t.Helper()
+		target := server.URL + "/realms/master/protocol/openid-connect/auth?response_type=code&client_id=hint-probe" +
+			"&redirect_uri=" + url.QueryEscape("https://hint.example.test/cb") + "&scope=openid&state=s" +
+			"&code_challenge=" + challenge + "&code_challenge_method=S256" + extra
+		request, reqErr := http.NewRequest(http.MethodGet, target, nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		location, parseErr := url.Parse(response.Header.Get("Location"))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		return location
+	}
+
+	for parameter, expected := range map[string]string{
+		"&request=eyJhbGciOiJub25lIn0.e30.":               "request_not_supported",
+		"&request_uri=https%3A%2F%2Fattacker.example%2Fr": "request_uri_not_supported",
+	} {
+		if got := authorize(parameter).Query().Get("error"); got != expected {
+			t.Errorf("%s returned %q, want %q", parameter, got, expected)
+		}
+	}
+
+	// A hint naming somebody else must not be answered with a code for the
+	// person who is actually signed in.
+	hint := issueIntegrationIDToken(t, data, realm, "hint-probe", "someone-else")
+	mismatch := authorize("&prompt=none&id_token_hint=" + url.QueryEscape(hint))
+	if got := mismatch.Query().Get("error"); got != "login_required" {
+		t.Errorf("a mismatched id_token_hint returned %q, want login_required", got)
+	}
+	if mismatch.Query().Get("code") != "" {
+		t.Error("a mismatched id_token_hint was answered with a code")
+	}
+
+	// The hint for the account that is signed in is satisfied silently.
+	admin, err := data.UserByID(ctx, bootstrap.AdminUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matching := issueIntegrationIDTokenFor(t, data, realm, "hint-probe", admin, session.Session.ID)
+	if got := authorize("&prompt=none&id_token_hint=" + url.QueryEscape(matching)); got.Query().Get("code") == "" {
+		t.Errorf("a matching id_token_hint was refused: %s", got)
+	}
+
+	// Something that is not a token this issuer signed is refused outright.
+	if got := authorize("&id_token_hint=not-a-jwt").Query().Get("error"); got != "invalid_request" {
+		t.Errorf("a malformed id_token_hint returned %q", got)
+	}
+}
+
+// issueIntegrationIDToken mints a real ID token for a freshly created account,
+// which is how a hint naming a different person is produced without forging
+// anything the server would refuse for the wrong reason.
+func issueIntegrationIDToken(t *testing.T, data *store.Store, realm domain.Realm, clientID, username string) string {
+	t.Helper()
+	ctx := context.Background()
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: username, Password: username + "-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatalf("create hint user: %v", err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "hint-test", "password")
+	if err != nil {
+		t.Fatalf("create hint session: %v", err)
+	}
+	return issueIntegrationIDTokenFor(t, data, realm, clientID, user, session.Session.ID)
+}
+
+func issueIntegrationIDTokenFor(t *testing.T, data *store.Store, realm domain.Realm,
+	clientID string, user domain.User, sessionID uuid.UUID) string {
+	t.Helper()
+	ctx := context.Background()
+	client, err := data.ClientByIdentifier(ctx, realm.ID, clientID)
+	if err != nil {
+		t.Fatalf("load hint client %q: %v", clientID, err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, client, user, sessionID, []string{"openid"}, "", false)
+	if err != nil {
+		t.Fatalf("issue hint tokens: %v", err)
+	}
+	if tokens.IDToken == "" {
+		t.Fatal("no ID token was issued")
+	}
+	return tokens.IDToken
+}
+
+// Shutdown has to write out what is buffered. The last seconds before a
+// restart are exactly the ones an operator goes looking for afterwards, and
+// the mirror batches on a timer, so without a flush they are simply gone.
+func TestIntegrationLogMirrorFlushesOnShutdown(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	metrics := observability.NewRegistry()
+	handler := observability.NewDBHandler(slog.NewTextHandler(io.Discard, nil), data, "shutdown-test", metrics)
+	logger := slog.New(handler)
+	for index := range 5 {
+		logger.Info("buffered before shutdown", "index", index)
+	}
+
+	// Close returns only once the writer has drained, so no sleep is needed.
+	handler.Close(5 * time.Second)
+
+	var written int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM system_logs WHERE component='shutdown-test'`).Scan(&written); err != nil {
+		t.Fatal(err)
+	}
+	if written != 5 {
+		t.Errorf("records written on shutdown = %d, want 5", written)
+	}
+	var exported strings.Builder
+	metrics.WritePrometheus(&exported)
+	if !strings.Contains(exported.String(), `result="written"`) {
+		t.Errorf("the written outcome was not reported: %s", exported.String())
+	}
+}
+
+// The keys screen and the dashboard both decide whether a signing key has aged
+// past the advisory. The console kept its own copy of the threshold with a
+// comment promising it matched the server's — a promise nothing enforced — so
+// the number now travels with the keys and the screen has nothing to copy.
+func TestIntegrationSigningKeyListCarriesTheAdvisoryThreshold(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Jar = jar
+	login := postIntegrationLogin(t, client, server.URL, "admin", "bootstrap-password-123")
+	_ = login.Body.Close()
+	if login.StatusCode != http.StatusOK {
+		t.Fatalf("login status = %d", login.StatusCode)
+	}
+
+	response, err := client.Get(server.URL + "/api/admin/v1/realms/" + realm.ID.String() + "/keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("keys status = %d", response.StatusCode)
+	}
+	var payload struct {
+		Items        []map[string]any `json:"items"`
+		AdvisoryDays int              `json:"advisory_days"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) == 0 {
+		t.Fatal("no signing keys were listed")
+	}
+	if payload.AdvisoryDays != signingKeyAdvisoryDays {
+		t.Errorf("advisory_days = %d, want %d — the screen would fall back to its own number",
+			payload.AdvisoryDays, signingKeyAdvisoryDays)
+	}
+}
+
+// An attempt that cannot be completed is neither a success nor a rejected
+// credential. Counting it as neither meant a directory outage — where every
+// attempt fails before either outcome — showed up as the login series going
+// quiet, and quiet is what a working night looks like.
+func TestIntegrationLoginErrorsAreCounted(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A linked account whose directory does not answer: the attempt cannot be
+	// completed, rather than being right or wrong.
+	provider, err := data.CreateLDAPFederation(ctx, realm.ID, store.LDAPFederationInput{
+		Name: "gone", Vendor: "OTHER", ConnectionURL: "ldap://127.0.0.1:1",
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "linked", Password: "linked-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dn := "uid=linked,ou=people,dc=example,dc=test"
+	external := "linked-external"
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE users SET federation_id=$2,external_id=$3,external_dn=$4 WHERE id=$1`,
+		linked.ID, provider.ID, external, dn); err != nil {
+		t.Fatal(err)
+	}
+
+	metrics := observability.NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	response := postIntegrationLogin(t, server.Client(), server.URL, "linked", "linked-password-1234")
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("an unreachable directory answered %d", response.StatusCode)
+	}
+	var exported strings.Builder
+	metrics.WritePrometheus(&exported)
+	if !strings.Contains(exported.String(), `resso_login_attempts_total{result="error"} 1`) {
+		t.Errorf("the attempt was not counted as an error:\n%s", exported.String())
+	}
+}
+
+// A signing key the service cannot open takes every token request with it.
+// Counting only successes meant that showed up as the issuance series going
+// flat — indistinguishable from a quiet hour, and the only other signal was a
+// line in the log.
+func TestIntegrationTokenIssuanceFailuresAreCounted(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "issue-probe", Name: "Issue Probe", Type: "confidential",
+		RedirectURIs: []string{"https://probe.example.test/cb"},
+		GrantTypes:   []string{"client_credentials"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The key is there but its envelope no longer opens, which is what a
+	// keyring that does not match the database looks like.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE signing_keys SET private_key_cipher=decode('00', 'hex') WHERE realm_id=$1 AND status='ACTIVE'`,
+		realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	data.InvalidateAllSigningKeys()
+
+	metrics := observability.NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {"issue-probe"},
+		"client_secret": {created.ClientSecret}, "scope": {"openid"}}
+	response, err := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("an unopenable signing key answered %d", response.StatusCode)
+	}
+	var exported strings.Builder
+	metrics.WritePrometheus(&exported)
+	if !strings.Contains(exported.String(), `resso_token_errors_total{grant_type="client_credentials"} 1`) {
+		t.Errorf("the failure was not counted:\n%s", exported.String())
+	}
+	// And it is not passed off as an issuance, which is what the other counter
+	// is for.
+	if strings.Contains(exported.String(), `resso_tokens_issued_total{grant_type="client_credentials"}`) {
+		t.Error("a failed request was counted as an issued token")
 	}
 }

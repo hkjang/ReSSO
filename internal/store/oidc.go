@@ -109,27 +109,70 @@ func (s *Store) CreateAuthorizationCode(ctx context.Context, code AuthorizationC
 	return raw, nil
 }
 
-func scanAuthorizationCode(row pgx.Row) (AuthorizationCode, error) {
+func scanAuthorizationCodeWithState(row pgx.Row, consumed, live *bool) (AuthorizationCode, error) {
 	var code AuthorizationCode
 	err := row.Scan(&code.ID, &code.RealmID, &code.ClientID, &code.UserID, &code.SessionID,
-		&code.RedirectURI, &code.Scope, &code.Nonce, &code.CodeChallenge, &code.CodeChallengeMethod, &code.ExpiresAt)
+		&code.RedirectURI, &code.Scope, &code.Nonce, &code.CodeChallenge, &code.CodeChallengeMethod,
+		&code.ExpiresAt, consumed, live)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuthorizationCode{}, ErrNotFound
 	}
 	return code, err
 }
 
+// ErrCodeReuse reports that an authorization code was presented twice. Only
+// one of the two callers can have been the relying party, and the server has
+// no way to tell which, so the caller should treat it as a leaked code.
+var ErrCodeReuse = errors.New("authorization code reuse detected")
+
+// RedeemAuthorizationCode consumes a code exactly once.
+//
+// A second presentation is not merely rejected. Redeeming a code is the step
+// that turns a value carried through a browser redirect into tokens, so a code
+// arriving twice means it leaked — through a referrer header, a shared device,
+// or a mis-registered redirect target — and one of the two callers holds
+// tokens it should not. Because the legitimate relying party cannot be
+// identified after the fact, every refresh token this code could have produced
+// is revoked, mirroring how a replayed refresh token takes down its family.
+// Access tokens already minted stay valid until they expire; the refresh
+// tokens are what would have made the compromise durable.
 func (s *Store) RedeemAuthorizationCode(ctx context.Context, raw string, validate func(AuthorizationCode) error) (AuthorizationCode, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return AuthorizationCode{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	code, err := scanAuthorizationCode(tx.QueryRow(ctx, `SELECT id,realm_id,client_id,user_id,session_id,
-		redirect_uri,scope,nonce,code_challenge,code_challenge_method,expires_at FROM authorization_codes
-		WHERE code_hash=ANY($1::bytea[]) AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`, s.Sealer.Digests(raw)))
+	// Both judgements are the database's. Reuse detection needs the row even
+	// when it is spent, which the previous WHERE clause excluded, but moving
+	// the expiry comparison into this process would make a ninety-second
+	// window depend on the app and database clocks agreeing — early rejection
+	// looks to a relying party like an intermittently broken login, and late
+	// acceptance keeps a leaked code usable. Every other lifetime in the
+	// schema is decided by now() for the same reason.
+	var consumed, live bool
+	code, err := scanAuthorizationCodeWithState(tx.QueryRow(ctx, `SELECT id,realm_id,client_id,user_id,session_id,
+		redirect_uri,scope,nonce,code_challenge,code_challenge_method,expires_at,
+		consumed_at IS NOT NULL, expires_at>now()
+		FROM authorization_codes WHERE code_hash=ANY($1::bytea[]) FOR UPDATE`, s.Sealer.Digests(raw)), &consumed, &live)
 	if err != nil {
 		return AuthorizationCode{}, err
+	}
+	if consumed {
+		// Scoped to the session and client this code was issued for, so one
+		// relying party's incident does not sign the user out of the others.
+		if _, err := tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
+			WHERE session_id=$1 AND client_id=$2 AND revoked_at IS NULL`, code.SessionID, code.ClientID); err != nil {
+			return AuthorizationCode{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return AuthorizationCode{}, err
+		}
+		return code, ErrCodeReuse
+	}
+	// An expired code produced nothing, so there is nothing to revoke and it
+	// is indistinguishable from a code that never existed.
+	if !live {
+		return AuthorizationCode{}, ErrNotFound
 	}
 	if err := validate(code); err != nil {
 		return AuthorizationCode{}, err
@@ -220,9 +263,17 @@ func (s *Store) RotateRefreshToken(ctx context.Context, raw string, reducedScope
 	}
 	if old.SessionID != nil {
 		var sessionActive bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sso_sessions WHERE id=$1 AND
-            revoked_at IS NULL AND expires_at>now())`, old.SessionID).Scan(&sessionActive); err != nil || !sessionActive {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sso_sessions s
+            JOIN realms r ON r.id=s.realm_id WHERE s.id=$1 AND `+sessionIsLive+`)`,
+			old.SessionID).Scan(&sessionActive); err != nil || !sessionActive {
 			return RefreshToken{}, "", ErrNotFound
+		}
+		// Refreshing a token is somebody working in a relying party, which is
+		// the clearest possible evidence the session is not idle. Done in the
+		// transaction so it lands with the rotation or not at all.
+		if _, err := tx.Exec(ctx, `UPDATE sso_sessions SET last_access=now()
+            WHERE id=$1 AND last_access < now()-interval '1 minute'`, old.SessionID); err != nil {
+			return RefreshToken{}, "", err
 		}
 	}
 	// COALESCE keeps the first rotation timestamp so the grace window is fixed
@@ -263,6 +314,43 @@ func (s *Store) InspectRefreshToken(ctx context.Context, raw string) (RefreshTok
 		return RefreshToken{}, false, ErrNotFound
 	}
 	return token, active, err
+}
+
+// RollbackRefreshRotation undoes a rotation whose exchange never completed.
+//
+// Refreshing is two steps: rotate the token, then mint the tokens that go back
+// to the caller. If the second step fails — the signing key cannot be opened,
+// the session ended between the two, the database stumbled — the caller is
+// left holding a token the server has already marked rotated. It works for the
+// length of the grace window and then, on the next attempt, looks exactly like
+// a replayed token: the family is revoked, the user is signed out of that
+// relying party, and an incident that never happened is written to the audit
+// log. Undoing the rotation is what makes the caller's retry ordinary.
+//
+// Only an untouched successor is removed. If a concurrent refresh has already
+// built on it, that exchange succeeded and its tokens are somebody's now.
+func (s *Store) RollbackRefreshRotation(ctx context.Context, oldID, newID uuid.UUID) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, `DELETE FROM refresh_tokens
+        WHERE id=$1 AND rotated_at IS NULL AND revoked_at IS NULL`, newID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 0 {
+		return nil
+	}
+	// The predecessor is restored only while it is still the live token, so a
+	// family revoked in the meantime stays revoked.
+	if _, err := tx.Exec(ctx, `UPDATE refresh_tokens SET rotated_at=NULL
+        WHERE id=$1 AND revoked_at IS NULL
+        AND NOT EXISTS(SELECT 1 FROM refresh_tokens c WHERE c.parent_id=$1)`, oldID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) RevokeRefreshToken(ctx context.Context, raw string) error {

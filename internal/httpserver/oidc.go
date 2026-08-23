@@ -106,6 +106,19 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "unsupported_response_mode", "only query response mode is supported")
 		return
 	}
+	// Discovery says these are unsupported, and saying so again here is what
+	// makes that true. A signed request object exists to protect the
+	// parameters inside it; ignoring one and honouring the plain query string
+	// instead is a silent downgrade of exactly the protection the relying
+	// party asked for. The specification names both errors for this case.
+	if query.Get("request") != "" {
+		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "request_not_supported", "request objects are not supported")
+		return
+	}
+	if query.Get("request_uri") != "" {
+		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "request_uri_not_supported", "request_uri is not supported")
+		return
+	}
 	scopes, err := validatedScopes(query.Get("scope"), client.DefaultScopes, true)
 	if err != nil {
 		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "invalid_scope", err.Error())
@@ -118,20 +131,62 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// max_age caps how long ago the user may have proved who they are. A
+	// relying party sending a small value is gating something on a fresh
+	// proof — a payment, a change of credentials — so reusing an older SSO
+	// session silently would answer a question it did not ask. A malformed
+	// value is refused rather than ignored, because ignoring it looks to the
+	// relying party exactly like a reauthentication that happened.
+	maxAge := -1
+	if raw := strings.TrimSpace(query.Get("max_age")); raw != "" {
+		parsed, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || parsed < 0 {
+			redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "invalid_request", "max_age must be a non-negative number of seconds")
+			return
+		}
+		maxAge = parsed
+	}
+	// id_token_hint names the account the relying party believes it is
+	// renewing. Ignoring it meant a silent renewal could come back with a code
+	// for whoever happens to be signed in now — a different person than the
+	// one the relying party asked about, handed over without a word.
+	hintedSubject := ""
+	if hint := query.Get("id_token_hint"); hint != "" {
+		subject, hintErr := s.oidc.SubjectFromIDTokenHint(r.Context(), realm, hint)
+		if hintErr != nil {
+			redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "invalid_request", "id_token_hint is not a token this issuer signed")
+			return
+		}
+		hintedSubject = subject
+	}
 	prompt := query.Get("prompt")
 	if prompt != "login" {
 		if authenticated, sessionErr := s.store.SessionByToken(r.Context(), sessionCookie(r)); sessionErr == nil && authenticated.User.RealmID == realm.ID {
-			code, codeErr := s.store.CreateAuthorizationCode(r.Context(), store.AuthorizationCode{
-				RealmID: realm.ID, ClientID: client.ID, UserID: authenticated.User.ID, SessionID: authenticated.Session.ID,
-				RedirectURI: redirectURI, Scope: scopes, Nonce: query.Get("nonce"), CodeChallenge: challenge,
-				CodeChallengeMethod: method,
-			})
-			if codeErr != nil {
-				redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authorization code could not be created")
+			// The existing session may be reused only if it belongs to the
+			// account the relying party named and authenticated recently
+			// enough for what it asked.
+			reusable := hintedSubject == "" || hintedSubject == authenticated.User.ID.String()
+			if reusable && maxAge >= 0 {
+				recent, authErr := s.store.SessionAuthenticatedRecently(r.Context(), authenticated.Session.ID, maxAge)
+				if authErr != nil {
+					redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authentication time is unavailable")
+					return
+				}
+				reusable = recent
+			}
+			if reusable {
+				code, codeErr := s.store.CreateAuthorizationCode(r.Context(), store.AuthorizationCode{
+					RealmID: realm.ID, ClientID: client.ID, UserID: authenticated.User.ID, SessionID: authenticated.Session.ID,
+					RedirectURI: redirectURI, Scope: scopes, Nonce: query.Get("nonce"), CodeChallenge: challenge,
+					CodeChallengeMethod: method,
+				})
+				if codeErr != nil {
+					redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authorization code could not be created")
+					return
+				}
+				http.Redirect(w, r, authorizationRedirect(redirectURI, code, query.Get("state"), realm.IssuerURL, authenticated.Session.ID), http.StatusFound)
 				return
 			}
-			http.Redirect(w, r, authorizationRedirect(redirectURI, code, query.Get("state"), realm.IssuerURL, authenticated.Session.ID), http.StatusFound)
-			return
 		}
 	}
 	if prompt == "none" {
@@ -194,6 +249,18 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		return nil
 	})
 	if err != nil {
+		// A replayed code is an incident, not a routine bad request: the
+		// store has already revoked what it could, and this is the only
+		// place an operator can learn it happened.
+		if errors.Is(err, store.ErrCodeReuse) {
+			// Whose code leaked is the first thing an operator needs, so the
+			// name is resolved here even though the grant is already lost.
+			affected, _ := s.store.UserByID(r.Context(), code.UserID)
+			s.audit(r, &realm.ID, &code.UserID, affected.Username, "AUTHORIZATION_CODE_REUSED", "FAILURE",
+				"client", client.ClientID, map[string]any{"session_id": code.SessionID.String()})
+			s.logger.Warn("authorization code replayed", "trace_id", traceIDFrom(r.Context()),
+				"realm", realm.Name, "client", client.ClientID)
+		}
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code is invalid or expired")
 		return
 	}
@@ -210,6 +277,7 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 			return
 		}
 		s.logger.Error("token issue failed", "trace_id", traceIDFrom(r.Context()), "error", err)
+		s.metrics.Add(metricTokenErrors, 1, "authorization_code")
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}
@@ -237,6 +305,14 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 		}
 		inspected.Scope = reducedScopes
 	}
+	// Checked before the rotation, not after: a disabled account is the
+	// likeliest reason for this exchange to fail, and rotating first would
+	// spend the caller's token to reject it.
+	user, err := s.store.UserByID(r.Context(), *inspected.UserID)
+	if err != nil || !user.Enabled {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "user is unavailable")
+		return
+	}
 	rotated, rawNew, err := s.store.RotateRefreshToken(r.Context(), raw, reducedScopes)
 	if err != nil {
 		if errors.Is(err, store.ErrTokenReuse) {
@@ -246,17 +322,20 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 		return
 	}
 	rotated.Scope = inspected.Scope
-	user, err := s.store.UserByID(r.Context(), *rotated.UserID)
-	if err != nil || !user.Enabled {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "user is unavailable")
-		return
-	}
 	response, err := s.oidc.IssueRefreshedUserTokens(r.Context(), realm, client, user, rotated, rawNew)
 	if err != nil {
+		// The caller never received rawNew, so leaving the old token rotated
+		// would turn this failure into a revoked family on the next attempt.
+		if rollbackErr := s.store.RollbackRefreshRotation(r.Context(), inspected.ID, rotated.ID); rollbackErr != nil {
+			s.logger.Error("refresh rotation could not be undone", "trace_id", traceIDFrom(r.Context()),
+				"client", client.ClientID, "error", rollbackErr)
+		}
 		if errors.Is(err, store.ErrNotFound) {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization session is no longer active")
 			return
 		}
+		s.logger.Error("refresh token issue failed", "trace_id", traceIDFrom(r.Context()), "error", err)
+		s.metrics.Add(metricTokenErrors, 1, "refresh_token")
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}
@@ -277,6 +356,8 @@ func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Req
 	}
 	response, err := s.oidc.IssueClientToken(r.Context(), realm, client, scopes)
 	if err != nil {
+		s.logger.Error("client token issue failed", "trace_id", traceIDFrom(r.Context()), "error", err)
+		s.metrics.Add(metricTokenErrors, 1, "client_credentials")
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}
@@ -478,14 +559,25 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	raw := r.Form.Get("token")
+	// RFC 7009 answers 200 whether or not the token matched, so the audit
+	// entry has to carry what actually happened. Recording only that revoke
+	// was called leaves the one question an incident asks — is that token
+	// dead? — answered by implication rather than by the trail.
+	detail := map[string]any{"revoked": "none"}
 	if refresh, _, inspectErr := s.store.InspectRefreshToken(r.Context(), raw); inspectErr == nil && refresh.ClientID == client.ID {
-		_ = s.store.RevokeRefreshToken(r.Context(), raw)
+		if revokeErr := s.store.RevokeRefreshToken(r.Context(), raw); revokeErr == nil {
+			detail["revoked"] = "refresh_token"
+			detail["family_id"] = refresh.FamilyID.String()
+		}
 	} else if verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, client.ClientID); verifyErr == nil {
 		if jti, parseErr := uuid.Parse(verified.Claims.ID); parseErr == nil && verified.Claims.Expiry != nil {
-			_ = s.store.RevokeAccessJTI(r.Context(), jti, verified.Claims.Expiry.Time())
+			if revokeErr := s.store.RevokeAccessJTI(r.Context(), jti, verified.Claims.Expiry.Time()); revokeErr == nil {
+				detail["revoked"] = "access_token"
+				detail["jti"] = jti.String()
+			}
 		}
 	}
-	s.audit(r, &realm.ID, nil, client.ClientID, "TOKEN_REVOKED", "SUCCESS", "client", client.ClientID, nil)
+	s.audit(r, &realm.ID, nil, client.ClientID, "TOKEN_REVOKED", "SUCCESS", "client", client.ClientID, detail)
 	w.WriteHeader(http.StatusOK)
 }
 

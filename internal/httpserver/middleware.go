@@ -71,7 +71,7 @@ func (s *Server) commonMiddleware(next http.Handler) http.Handler {
 			}
 			elapsed := time.Since(start)
 			route := routePattern(r)
-			s.metrics.Add(metricRequests, 1, route, r.Method, statusLabel(recorder.status))
+			s.metrics.Add(metricRequests, 1, route, methodLabel(r.Method), statusLabel(recorder.status))
 			s.metrics.Observe(metricRequestTime, elapsed.Seconds(), route)
 			s.logger.Log(ctx, level, "http request", "trace_id", traceID, "method", r.Method,
 				"path", r.URL.Path, "status", recorder.status, "bytes", recorder.bytes,

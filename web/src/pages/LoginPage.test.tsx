@@ -72,3 +72,26 @@ test('repeated failures explain the lockout policy before the account is locked'
   expect(await screen.findByText(/반복 실패하면 계정이 일정 시간 잠기며/)).toBeInTheDocument()
   vi.unstubAllGlobals()
 })
+
+test('a locked account is told it is locked, not that its password is wrong', async () => {
+  const user = userEvent.setup()
+  // The server answers 401 here, not 429, so the countdown that already
+  // existed for rate limiting did nothing: someone who had simply been locked
+  // out saw "wrong username or password" and went on trying variations.
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    error: 'account_locked',
+    message: '연속된 로그인 실패로 계정이 잠겼습니다. 약 10분 뒤에 다시 시도하거나 관리자에게 잠금 해제를 요청하세요.',
+  }), { status: 401, headers: { 'Content-Type': 'application/json', 'Retry-After': '600' } }))
+  vi.stubGlobal('fetch', fetchMock)
+
+  renderLogin()
+  await user.type(screen.getByRole('textbox', { name: '아이디' }), 'victim')
+  await user.type(screen.getByLabelText(/비밀번호/, { selector: 'input' }), 'the-right-password')
+  await user.click(screen.getByRole('button', { name: /로그인/ }))
+
+  const notice = await screen.findByText(/계정이 잠겼습니다/)
+  expect(notice.textContent).toContain('약 10분')
+  expect(notice.textContent).toContain('잠금 해제')
+  expect(screen.getByRole('button', { name: /후 재시도/ })).toBeDisabled()
+  vi.unstubAllGlobals()
+})

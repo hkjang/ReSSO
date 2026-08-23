@@ -377,9 +377,29 @@ func (s *Store) DecideApprovalRequest(ctx context.Context, requestID, reviewerID
 	if request.Status != "PENDING" {
 		return domain.ApprovalRequest{}, ErrConflict
 	}
+	// Nobody signs off on their own request. Administrators are exempt only
+	// because they can assign the role outright, so requiring a second party
+	// there would protect nothing; for everyone else this is the whole point
+	// of the workflow, and it is checked here rather than only where
+	// manager_id is written so that a pairing already sitting in an upgraded
+	// database cannot be cashed in.
+	if request.RequesterID == reviewerID && !platformAdmin && !realmAdmin {
+		return domain.ApprovalRequest{}, errors.New("a request cannot be decided by its requester")
+	}
 	adminForRealm := realmAdmin && request.RealmID == adminRealmID
 	if !platformAdmin && !adminForRealm && (request.ReviewerID == nil || *request.ReviewerID != reviewerID) {
 		return domain.ApprovalRequest{}, errors.New("reviewer is not authorized for this request")
+	}
+	// A designated reviewer still has to belong to the realm the request was
+	// raised in; the check above compares identifiers, not standing.
+	if !platformAdmin && !adminForRealm {
+		var reviewerRealm uuid.UUID
+		if err := tx.QueryRow(ctx, "SELECT realm_id FROM users WHERE id=$1", reviewerID).Scan(&reviewerRealm); err != nil {
+			return domain.ApprovalRequest{}, err
+		}
+		if reviewerRealm != request.RealmID {
+			return domain.ApprovalRequest{}, errors.New("reviewer belongs to a different realm")
+		}
 	}
 	status := "REJECTED"
 	if approve {

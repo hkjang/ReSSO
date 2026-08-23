@@ -193,4 +193,29 @@ curl -fsS -H "Authorization: Bearer $api_key" -H 'Content-Type: application/json
 curl -fsS -H "Authorization: Bearer $api_key" "$base_url/api/v1/me" | jq -e --arg admin "$admin" '.user.username == $admin' >/dev/null
 curl -fsS -H "Authorization: Bearer $api_key" "$base_url/api/admin/v1/realms" | jq -e '.items | length > 0' >/dev/null
 
+# The MCP tools that read people and relying parties are gated on admin:read.
+# Checking only the handshake left that boundary unverified end to end, which
+# is where it last went wrong: any account may mint an mcp:read key.
+mcp_call() {
+  curl -fsS -H "Authorization: Bearer $1" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d "$2" "$base_url/mcp"
+}
+tools_list='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+search_call='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"resso_search_users","arguments":{"query":"ad"}}}'
+
+mcp_call "$api_key" "$tools_list" \
+  | jq -e '[.result.tools[].name] | index("resso_search_users") and index("resso_list_clients")' >/dev/null \
+  || { echo "an admin:read key was not offered the directory tools" >&2; exit 1; }
+mcp_call "$api_key" "$search_call" | jq -e '.result.isError == false and (.result.structuredContent | length > 0)' >/dev/null \
+  || { echo "an admin:read key could not search users over MCP" >&2; exit 1; }
+
+reader_key_payload='{"name":"Smoke MCP reader","scopes":["mcp:read"],"expires_days":1}'
+reader_key="$(curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+  -d "$reader_key_payload" "$base_url/api/v1/me/api-keys" | jq -er '.secret')"
+mcp_call "$reader_key" "$tools_list" \
+  | jq -e '[.result.tools[].name] | (index("resso_search_users") | not) and (index("resso_list_clients") | not)' >/dev/null \
+  || { echo "an mcp:read-only key was offered the directory tools" >&2; exit 1; }
+mcp_call "$reader_key" "$search_call" | jq -e '.result.isError == true' >/dev/null \
+  || { echo "an mcp:read-only key read the user directory" >&2; exit 1; }
+
 echo "ReSSO smoke test passed"

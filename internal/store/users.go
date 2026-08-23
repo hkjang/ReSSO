@@ -18,14 +18,14 @@ const maxEmailLength = 320
 
 const userColumns = `id,realm_id,username,email,email_verified,display_name,enabled,platform_admin,manager_id,
     federation_id,external_id,external_dn,federation_synced_at,failed_attempts,locked_until,
-    password_changed_at,created_at,updated_at`
+    password_changed_at,(locked_until IS NOT NULL AND locked_until > now()),created_at,updated_at`
 
 func scanUser(row pgx.Row) (domain.User, error) {
 	var user domain.User
 	err := row.Scan(&user.ID, &user.RealmID, &user.Username, &user.Email, &user.EmailVerified, &user.DisplayName, &user.Enabled,
 		&user.PlatformAdmin, &user.ManagerID, &user.FederationID, &user.ExternalID, &user.ExternalDN,
 		&user.FederationSyncedAt, &user.FailedAttempts, &user.LockedUntil,
-		&user.PasswordChanged, &user.CreatedAt, &user.UpdatedAt)
+		&user.PasswordChanged, &user.Locked, &user.CreatedAt, &user.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.User{}, ErrNotFound
 	}
@@ -108,6 +108,36 @@ type CreateUserInput struct {
 	ManagerID     *uuid.UUID `json:"manager_id,omitempty"`
 }
 
+// validateManagerID rejects a manager assignment that would hollow out the
+// approval workflow.
+//
+// A request's reviewer is the requester's manager, and that is the only thing
+// standing between asking for a role and holding it. Pointing manager_id at
+// the user themselves makes the requester their own approver; pointing it into
+// another realm hands the decision to somebody with no standing there, since
+// the reviewer check compares identifiers and not realms. Neither is a
+// meaningful reporting line, so both are refused where they are written.
+func (s *Store) validateManagerID(ctx context.Context, userID, realmID uuid.UUID, managerID *uuid.UUID) error {
+	if managerID == nil {
+		return nil
+	}
+	if *managerID == userID {
+		return fmt.Errorf("%w: a user cannot be their own manager", ErrInvalidManager)
+	}
+	var managerRealm uuid.UUID
+	err := s.Pool.QueryRow(ctx, "SELECT realm_id FROM users WHERE id=$1", *managerID).Scan(&managerRealm)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: manager does not exist", ErrInvalidManager)
+	}
+	if err != nil {
+		return err
+	}
+	if managerRealm != realmID {
+		return fmt.Errorf("%w: manager must belong to the same realm", ErrInvalidManager)
+	}
+	return nil
+}
+
 func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateUserInput) (domain.User, error) {
 	input.Username = strings.TrimSpace(input.Username)
 	var err error
@@ -134,7 +164,11 @@ func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateU
 		return domain.User{}, err
 	}
 	now := time.Now().UTC()
-	user := domain.User{ID: uuid.New(), RealmID: realmID, Username: input.Username, Email: input.Email,
+	userID := uuid.New()
+	if err := s.validateManagerID(ctx, userID, realmID, input.ManagerID); err != nil {
+		return domain.User{}, err
+	}
+	user := domain.User{ID: userID, RealmID: realmID, Username: input.Username, Email: input.Email,
 		EmailVerified: input.Email != "" && input.EmailVerified,
 		DisplayName:   input.DisplayName, Enabled: input.Enabled, ManagerID: input.ManagerID,
 		PasswordChanged: now, CreatedAt: now, UpdatedAt: now}
@@ -172,6 +206,9 @@ func (s *Store) UpdateUser(ctx context.Context, userID uuid.UUID, input UpdateUs
 		return domain.User{}, err
 	}
 	displayName := strings.TrimSpace(input.DisplayName)
+	if err := s.validateManagerID(ctx, userID, current.RealmID, input.ManagerID); err != nil {
+		return domain.User{}, err
+	}
 	emailChanged := !strings.EqualFold(strings.TrimSpace(current.Email), email)
 	if emailChanged || current.DisplayName != displayName {
 		if err := s.updateFederatedAttributes(ctx, current, email, displayName); err != nil {
@@ -315,11 +352,16 @@ func (s *Store) ChangePassword(ctx context.Context, userID uuid.UUID, current, r
 }
 
 type AuthenticationResult struct {
-	User           domain.User
-	Success        bool
-	FailureReason  string
-	SessionSeconds int
-	AuthMethod     string
+	User          domain.User
+	Success       bool
+	FailureReason string
+	// CredentialsValid reports that the password was right even though the
+	// attempt failed, which happens when the account is locked or disabled.
+	// It is what lets the caller name the real obstacle without telling an
+	// anonymous guesser that the account exists.
+	CredentialsValid bool
+	SessionSeconds   int
+	AuthMethod       string
 }
 
 // AuthenticatePassword verifies a local password without holding a database
@@ -337,7 +379,7 @@ func (s *Store) AuthenticatePassword(ctx context.Context, realm domain.Realm, us
 		&user.ID, &user.RealmID, &user.Username, &user.Email, &user.EmailVerified, &user.DisplayName,
 		&user.Enabled, &user.PlatformAdmin, &user.ManagerID, &user.FederationID, &user.ExternalID,
 		&user.ExternalDN, &user.FederationSyncedAt, &user.FailedAttempts, &user.LockedUntil,
-		&user.PasswordChanged, &user.CreatedAt, &user.UpdatedAt, &passwordHash)
+		&user.PasswordChanged, &user.Locked, &user.CreatedAt, &user.UpdatedAt, &passwordHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Equalize the dominant Argon2 work factor for unknown users.
 		_, _ = s.dummyPasswordVerification(ctx, suppliedPassword)
@@ -346,12 +388,24 @@ func (s *Store) AuthenticatePassword(ctx context.Context, realm domain.Realm, us
 	if err != nil {
 		return AuthenticationResult{}, err
 	}
-	if reason := accountFailureReason(realm, user, time.Now().UTC()); reason != "" {
-		return AuthenticationResult{User: user, FailureReason: reason}, nil
-	}
+	// The password is checked even when the account is already barred, for two
+	// reasons. Skipping the hash answered a locked account in a fraction of
+	// the time an ordinary rejection takes, which told an attacker the account
+	// exists and is locked — exactly what the identical error message is there
+	// to withhold, and the same leak the dummy verification above exists to
+	// close for unknown users. And knowing the credentials were right is what
+	// makes it safe to tell the person that their account is locked rather
+	// than that they have forgotten their password: whoever supplies the
+	// correct password already knows more than enumeration would reveal.
+	barred := accountFailureReason(realm, user, time.Now().UTC())
 	ok, verifyErr := password.VerifyContext(ctx, suppliedPassword, passwordHash)
 	if verifyErr != nil {
 		return AuthenticationResult{}, verifyErr
+	}
+	if barred != "" {
+		// No failure is recorded: the account is already barred, and counting
+		// these would let an attacker keep extending someone's lockout.
+		return AuthenticationResult{User: user, FailureReason: barred, CredentialsValid: ok}, nil
 	}
 	if !ok {
 		locked, err := s.recordFailedLogin(ctx, user.ID)

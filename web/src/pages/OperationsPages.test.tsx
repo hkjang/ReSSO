@@ -43,3 +43,15 @@ test('a trace handed over from the audit screen seeds the search', async () => {
   })
   expect(screen.getByLabelText('로그 검색')).toHaveValue('handed-over-trace')
 })
+
+// A table with no accessible name is announced as just "table". The console
+// puts several on a page — audit events beside server logs, API keys beside
+// sessions — so someone navigating by table had a list of anonymous ones to
+// guess between. MUI adds no name of its own; it has to be given.
+test('the log table says what it lists', async () => {
+  mocks.api.mockResolvedValue({ items: [{ id: 1, occurred_at: '2026-01-01T00:00:00Z', level: 'INFO',
+    component: 'resso', message: 'started', trace_id: '', attributes: {} }] })
+  renderLogs()
+  const table = await screen.findByRole('table', { name: '서버 로그 목록' })
+  expect(table).toBeInTheDocument()
+})

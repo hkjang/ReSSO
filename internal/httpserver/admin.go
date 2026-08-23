@@ -277,6 +277,11 @@ func (s *Server) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, err := s.store.UpdateUser(r.Context(), userID, input)
+	if errors.Is(err, store.ErrInvalidManager) {
+		writeError(w, r, http.StatusBadRequest, "invalid_manager",
+			"승인자는 본인이 아닌, 같은 Realm에 속한 다른 사용자여야 합니다.")
+		return
+	}
 	if errors.Is(err, store.ErrFederationReadOnly) {
 		writeError(w, r, http.StatusConflict, "federation_read_only", "READ_ONLY LDAP 계정은 원본 디렉터리에서 수정하세요.")
 		return
@@ -701,7 +706,11 @@ func (s *Server) adminListKeys(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	// The threshold travels with the keys so the screen showing them and the
+	// dashboard counting them cannot disagree about the same key. The console
+	// used to carry its own copy of the number with a comment promising it
+	// matched, which is the kind of promise nothing enforces.
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "advisory_days": signingKeyAdvisoryDays})
 }
 
 func (s *Server) adminRotateKey(w http.ResponseWriter, r *http.Request) {

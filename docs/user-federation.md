@@ -2,6 +2,18 @@
 
 ReSSO의 User Federation은 Realm별로 여러 LDAP/Active Directory 공급자를 등록하고 우선순위 순서로 사용자를 인증합니다. 로컬 계정은 기존 방식으로 인증되며, LDAP에 연결된 사용자는 로컬 비밀번호로 우회하지 않습니다.
 
+## 개발 중 디렉터리 연동 테스트
+
+통합 테스트는 PostgreSQL과 디렉터리 두 개(평문, TLS)를 필요로 합니다. 없으면 60여 개가 건너뛰어지는데, 건너뛴 테스트도 `go test`는 `ok`로 보고하므로 로컬에서는 초록이고 CI에서 실패하는 일이 생깁니다. `make test`가 건너뛴 개수를 알려줍니다.
+
+```bash
+eval "$(scripts/test-services.sh)"   # 서비스 기동 + 환경변수 설정
+go test ./internal/...
+scripts/test-services.sh --stop      # 정리
+```
+
+CI도 같은 스크립트를 실행하므로, 로컬에서 통과한 것과 CI가 검증하는 것이 갈라지지 않습니다.
+
 ## 권장 구성 순서
 
 1. 관리 → User Federation에서 Realm을 선택합니다.
@@ -26,7 +38,7 @@ Bind Credential은 Data Encryption Keyring을 이용한 AES-256-GCM envelope로 
 | User object classes/filter | 객체 클래스는 AND 조건으로, 추가 필터는 RFC 4515 필터로 결합됩니다. 로그인 입력은 Escape 후 결합됩니다. |
 | Import users | 전체/주기 동기화를 허용합니다. 끄면 전체 동기화는 거부되고 JIT shadow 등록만 사용할 수 있습니다. |
 | Sync registrations | 아직 가져오지 않은 LDAP 사용자를 첫 로그인 때 ReSSO shadow 사용자로 등록합니다. |
-| Missing user action | `KEEP`은 유지하고 `DISABLE`은 성공한 전체 동기화에서 사라진 사용자를 비활성화하고 세션을 종료합니다. 일부 사용자 동기화가 실패하면 안전을 위해 비활성화를 실행하지 않습니다. |
+| Missing user action | `KEEP`은 유지하고 `DISABLE`은 성공한 전체 동기화에서 사라진 사용자를 비활성화하고 세션을 종료합니다. 일부 사용자 동기화가 실패하면 안전을 위해 비활성화를 실행하지 않습니다. 디렉터리가 사용자를 하나도 반환하지 않은 경우에도 실행하지 않습니다. |
 | Batch size | LDAP paged search 크기입니다. 50~5000 범위입니다. |
 | Sync period | 0은 끔, 그 외에는 300~604800초입니다. |
 
@@ -71,6 +83,7 @@ REST API로 실행할 때는 `POST /api/admin/v1/realms/{realmID}/user-federatio
 - 연결·인증 테스트, 설정 변경, 동기화는 감사 이벤트에 기록되지만 비밀번호는 기록하지 않습니다.
 - LDAP 작업은 TLS 1.2 이상, 인증서 검증, 연결/작업 제한시간을 사용합니다.
 - `DISABLE`은 LDAP 조회 전체가 성공하고 사용자별 실패가 0건일 때만 적용됩니다.
+- 디렉터리가 사용자를 **하나도** 반환하지 않았는데 ReSSO에는 해당 Provider의 활성 계정이 있으면 비활성화를 실행하지 않고 동기화를 실패로 기록합니다. 결과가 비어 있는 것은 실제로 전원이 디렉터리를 떠난 경우와, `Users DN` 오타·이름이 바뀐 Base·Bind 계정이 해당 하위 트리를 읽을 권한을 잃은 경우가 구분되지 않기 때문입니다. 후자에서 비활성화를 실행하면 다음 예약 동기화 한 번으로 조직 전체가 로그인할 수 없게 됩니다. `last_sync_error`와 `LDAP_FEDERATION_SYNC` 감사 이벤트에서 확인하고 검색 설정을 점검하세요.
 - 공급자 삭제는 연결 사용자가 있으면 기본 거부됩니다. 명시적 연결 해제를 선택하면 사용자를 비활성화하고 세션과 Federation Role을 정리한 뒤 비활성 Local 계정으로 보존합니다.
 
 현재 버전은 direct `memberOf`만 처리합니다. 중첩 Group 탐색, Kerberos/SPNEGO, Changed Users Sync, LDAP 연결 Pool은 후속 확장 범위입니다.

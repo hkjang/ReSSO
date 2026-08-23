@@ -19,11 +19,14 @@ type Realm struct {
 	AccessTokenTTLSeconds  int       `json:"access_token_ttl_seconds"`
 	RefreshTokenTTLSeconds int       `json:"refresh_token_ttl_seconds"`
 	SessionTTLSeconds      int       `json:"session_ttl_seconds"`
-	PasswordMinLength      int       `json:"password_min_length"`
-	MaxLoginAttempts       int       `json:"max_login_attempts"`
-	LockoutSeconds         int       `json:"lockout_seconds"`
-	CreatedAt              time.Time `json:"created_at"`
-	UpdatedAt              time.Time `json:"updated_at"`
+	// IdleTimeoutSeconds ends a session that has gone unused for this long.
+	// Zero disables the check and keeps only the absolute lifetime.
+	IdleTimeoutSeconds int       `json:"idle_timeout_seconds"`
+	PasswordMinLength  int       `json:"password_min_length"`
+	MaxLoginAttempts   int       `json:"max_login_attempts"`
+	LockoutSeconds     int       `json:"lockout_seconds"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type User struct {
@@ -43,8 +46,14 @@ type User struct {
 	FailedAttempts     int        `json:"failed_attempts"`
 	LockedUntil        *time.Time `json:"locked_until,omitempty"`
 	PasswordChanged    time.Time  `json:"password_changed_at"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	// Locked is whether the lockout is in force now, decided by the same
+	// clock that wrote locked_until. The console used to compare that
+	// timestamp against the browser's clock, and it is what decides whether
+	// the unlock action is offered at all — so an administrator whose machine
+	// ran fast saw a locked account as normal, with no way to release it.
+	Locked    bool      `json:"locked"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type LDAPFederation struct {
@@ -85,8 +94,14 @@ type LDAPFederation struct {
 	LastSyncAdded            int               `json:"last_sync_added"`
 	LastSyncUpdated          int               `json:"last_sync_updated"`
 	LastSyncFailed           int               `json:"last_sync_failed"`
-	CreatedAt                time.Time         `json:"created_at"`
-	UpdatedAt                time.Time         `json:"updated_at"`
+	// SyncRunning is the reconciled answer to "is a run happening now", not
+	// the raw status column. A run whose process died leaves that column
+	// saying RUNNING for ever, and the console used to believe it: the sync
+	// button stayed disabled and the page polled every few seconds, with no
+	// way back, while the server would have accepted a new run.
+	SyncRunning bool      `json:"sync_running"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type Client struct {
@@ -121,6 +136,12 @@ type Session struct {
 	LastAccess time.Time  `json:"last_access"`
 	ExpiresAt  time.Time  `json:"expires_at"`
 	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+	// Active is whether this session would still be accepted, which is not
+	// something a reader can work out from the other fields: a Realm may
+	// expire sessions that go unused, and such a session is refused long
+	// before expires_at arrives. The console listed those as active because
+	// that was all it could see.
+	Active bool `json:"active"`
 }
 
 type SigningKey struct {

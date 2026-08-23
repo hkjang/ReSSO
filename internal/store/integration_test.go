@@ -12,11 +12,13 @@ import (
 	"testing"
 	"time"
 
+	ldap "github.com/go-ldap/ldap/v3"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hkjang/ReSSO/internal/cryptoutil"
+	"github.com/hkjang/ReSSO/internal/domain"
 	"github.com/hkjang/ReSSO/internal/password"
 )
 
@@ -120,7 +122,9 @@ func TestIntegrationAuthorizationCodeCanBeRedeemedOnlyOnce(t *testing.T) {
 		switch {
 		case redeemErr == nil:
 			successes++
-		case errors.Is(redeemErr, ErrNotFound):
+		// Losers of the race see the code already consumed, which is the
+		// same signal a replay attempt produces.
+		case errors.Is(redeemErr, ErrNotFound), errors.Is(redeemErr, ErrCodeReuse):
 		default:
 			t.Fatalf("unexpected redemption error: %v", redeemErr)
 		}
@@ -449,6 +453,18 @@ func TestIntegrationOptionalEmailLifecycleAndAdminRecovery(t *testing.T) {
 
 func openIntegrationStore(t *testing.T, sealer *cryptoutil.Sealer) *Store {
 	t.Helper()
+	return openIntegrationStoreOptions(t, sealer, true)
+}
+
+// openIntegrationStoreWithoutMigrating leaves the schema empty so a test can
+// apply an older set of migrations itself.
+func openIntegrationStoreWithoutMigrating(t *testing.T, sealer *cryptoutil.Sealer) *Store {
+	t.Helper()
+	return openIntegrationStoreOptions(t, sealer, false)
+}
+
+func openIntegrationStoreOptions(t *testing.T, sealer *cryptoutil.Sealer, migrate bool) *Store {
+	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv(integrationDSNEnvironment))
 	if dsn == "" {
 		t.Skipf("set %s to run PostgreSQL integration tests", integrationDSNEnvironment)
@@ -492,10 +508,12 @@ func openIntegrationStore(t *testing.T, sealer *cryptoutil.Sealer) *Store {
 		t.Fatal(err)
 	}
 	data := &Store{Pool: pool, Sealer: sealer, dummyPasswordHash: dummyHash}
-	if err := Migrate(ctx, pool); err != nil {
-		pool.Close()
-		admin.Close()
-		t.Fatal(err)
+	if migrate {
+		if err := Migrate(ctx, pool); err != nil {
+			pool.Close()
+			admin.Close()
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(func() {
 		pool.Close()
@@ -1291,5 +1309,1662 @@ func TestIntegrationLDAPSyncOutcomeReachesTheAuditTrail(t *testing.T) {
 		if !strings.Contains(string(event.Detail), `"`+key+`"`) {
 			t.Fatalf("audit detail is missing %q: %s", key, event.Detail)
 		}
+	}
+}
+
+func TestIntegrationIdleTimeoutEndsUnusedSessionsEverywhere(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Zero is the default and must preserve the previous behaviour.
+	if realm.IdleTimeoutSeconds != 0 {
+		t.Fatalf("default idle timeout = %d, want 0", realm.IdleTimeoutSeconds)
+	}
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+
+	newSession := func() (NewSession, string) {
+		session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+			time.Hour, "127.0.0.1", "integration-test", "password")
+		if err != nil {
+			t.Fatal(err)
+		}
+		userID, sid := bootstrap.AdminUserID, session.Session.ID
+		refresh, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+			UserID: &userID, SessionID: &sid, Scope: []string{"openid"}, ExpiresAt: time.Now().UTC().Add(time.Hour)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return session, refresh
+	}
+	idle := func(session NewSession, seconds int) {
+		if _, err := data.Pool.Exec(ctx, `UPDATE sso_sessions SET last_access=now()-make_interval(secs => $2) WHERE id=$1`,
+			session.Session.ID, seconds); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// With the check off, an old last_access changes nothing.
+	session, refresh := newSession()
+	idle(session, 7200)
+	if _, err := data.SessionByToken(ctx, session.Token); err != nil {
+		t.Fatalf("idle session rejected while the timeout is disabled: %v", err)
+	}
+
+	base := UpdateRealmInput{DisplayName: realm.DisplayName, IssuerURL: realm.IssuerURL, Enabled: true,
+		AccessTokenTTLSeconds: realm.AccessTokenTTLSeconds, RefreshTokenTTLSeconds: realm.RefreshTokenTTLSeconds,
+		SessionTTLSeconds: realm.SessionTTLSeconds, PasswordMinLength: realm.PasswordMinLength,
+		MaxLoginAttempts: realm.MaxLoginAttempts, LockoutSeconds: realm.LockoutSeconds, IdleTimeoutSeconds: 900}
+	if _, err := data.UpdateRealm(ctx, realm.ID, base); err != nil {
+		t.Fatal(err)
+	}
+	// A successful validation counts as activity and refreshes last_access, so
+	// the session is put back into an idle state after the check above.
+	idle(session, 7200)
+
+	// Every path that accepts a session must apply the same rule; enforcing it
+	// in some but not others would leave a stale session issuing tokens.
+	if _, err := data.SessionByToken(ctx, session.Token); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SessionByToken accepted an idle session: %v", err)
+	}
+	if _, err := data.SessionAuthTime(ctx, session.Session.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SessionAuthTime accepted an idle session: %v", err)
+	}
+	if err := data.ValidateActiveSessionBinding(ctx, session.Session.ID, bootstrap.AdminUserID, realm.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ValidateActiveSessionBinding accepted an idle session: %v", err)
+	}
+	if _, _, err := data.RotateRefreshToken(ctx, refresh, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RotateRefreshToken accepted an idle session: %v", err)
+	}
+
+	// A session still in use is unaffected.
+	active, activeRefresh := newSession()
+	idle(active, 60)
+	if _, err := data.SessionByToken(ctx, active.Token); err != nil {
+		t.Fatalf("an active session was rejected: %v", err)
+	}
+	if _, _, err := data.RotateRefreshToken(ctx, activeRefresh, nil); err != nil {
+		t.Fatalf("refresh on an active session was rejected: %v", err)
+	}
+
+	for _, invalid := range []int{100, 2592001, realm.SessionTTLSeconds + 1} {
+		out := base
+		out.IdleTimeoutSeconds = invalid
+		if _, err := data.UpdateRealm(ctx, realm.ID, out); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("idle timeout %d was accepted: %v", invalid, err)
+		}
+	}
+}
+
+// TestIntegrationUpgradeFromAnEarlierSchemaKeepsData applies the migrations an
+// older release shipped, writes records directly into that schema, then applies
+// the rest. Every migration has only ever been exercised against an empty
+// database, which is the case that cannot fail; upgrading a populated one is
+// the case that can. The seed data is written with plain SQL because the
+// current store selects columns the older schema does not have — the server
+// never reads a database it has not migrated, since Migrate runs before it
+// starts serving.
+func TestIntegrationUpgradeFromAnEarlierSchemaKeepsData(t *testing.T) {
+	data := openIntegrationStoreWithoutMigrating(t, integrationSealer(t))
+	ctx := context.Background()
+
+	entries, err := fs.ReadDir(migrationFiles, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			names = append(names, entry.Name())
+		}
+	}
+	slices.Sort(names)
+	if len(names) < 3 {
+		t.Skip("need at least three migrations to model an upgrade")
+	}
+	older := names[:len(names)-2]
+
+	if _, err := data.Pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range older {
+		body, err := migrationFiles.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := data.Pool.Exec(ctx, string(body)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
+		if _, err := data.Pool.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES($1)`, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	realmID, userID := uuid.New(), uuid.New()
+	hash, err := password.Hash("legacy-password-12345")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO realms(id,name,display_name,issuer_url)
+		VALUES($1,'legacy','Legacy','https://sso.example.com/realms/legacy')`, realmID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO users(id,realm_id,username,display_name,password_hash,enabled)
+		VALUES($1,$2,'legacy-user','Legacy User',$3,true)`, userID, realmID, hash); err != nil {
+		t.Fatal(err)
+	}
+	token, err := cryptoutil.RandomToken(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO sso_sessions(id,realm_id,user_id,token_hash,csrf_hash,expires_at)
+		VALUES($1,$2,$3,$4,$5,now()+interval '1 hour')`,
+		uuid.New(), realmID, userID, data.Sealer.Digest(token), data.Sealer.Digest("csrf")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Migrate(ctx, data.Pool); err != nil {
+		t.Fatalf("upgrade migration failed on a populated database: %v", err)
+	}
+
+	// Records written before the upgrade still work through the current code.
+	if _, err := data.SessionByToken(ctx, token); err != nil {
+		t.Fatalf("a session created before the upgrade stopped working: %v", err)
+	}
+	upgraded, err := data.RealmByID(ctx, realmID)
+	if err != nil {
+		t.Fatalf("a Realm created before the upgrade cannot be read: %v", err)
+	}
+	// Columns the newer releases added must carry defaults that preserve the
+	// previous behaviour rather than switching something on during an upgrade.
+	if upgraded.IdleTimeoutSeconds != 0 {
+		t.Fatalf("idle timeout defaulted to %d; an upgrade must not start expiring sessions", upgraded.IdleTimeoutSeconds)
+	}
+	if upgraded.PasswordMinLength < 8 || upgraded.MaxLoginAttempts < 3 || upgraded.LockoutSeconds < 30 {
+		t.Fatalf("policy defaults are outside their documented range: %+v", upgraded)
+	}
+	result, err := data.Authenticate(ctx, upgraded, "legacy-user", "legacy-password-12345")
+	if err != nil || !result.Success {
+		t.Fatalf("an account created before the upgrade cannot sign in: %+v err=%v", result, err)
+	}
+	// Applying again must be a no-op rather than an error.
+	if err := Migrate(ctx, data.Pool); err != nil {
+		t.Fatalf("re-running migrations failed: %v", err)
+	}
+}
+
+// TestIntegrationConcurrentRefreshRotationIsSafe exercises the case the grace
+// window exists for: two tabs refreshing the same token at the same moment.
+// The earlier coverage presented the token twice in sequence, which does not
+// contend for the row lock the rotation relies on.
+func TestIntegrationConcurrentRefreshRotationIsSafe(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		time.Hour, "127.0.0.1", "integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, sessionID := bootstrap.AdminUserID, session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const attempts = 6
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	issued := make([]string, attempts)
+	errs := make([]error, attempts)
+	for index := range attempts {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			_, token, err := data.RotateRefreshToken(ctx, raw, nil)
+			issued[index], errs[index] = token, err
+		}()
+	}
+	close(start)
+	wait.Wait()
+
+	var succeeded int
+	unique := map[string]bool{}
+	for index, err := range errs {
+		if err != nil {
+			// Inside the grace window nothing should be treated as reuse.
+			if errors.Is(err, ErrTokenReuse) {
+				t.Fatalf("attempt %d was treated as theft inside the grace window", index)
+			}
+			t.Fatalf("attempt %d failed: %v", index, err)
+		}
+		succeeded++
+		if issued[index] == "" || unique[issued[index]] {
+			t.Fatalf("attempt %d returned a duplicate or empty token", index)
+		}
+		unique[issued[index]] = true
+	}
+	if succeeded != attempts {
+		t.Fatalf("%d of %d concurrent refreshes succeeded", succeeded, attempts)
+	}
+
+	// Every token belongs to one family, and every one still works, so no tab
+	// is logged out by another tab's refresh.
+	var families int
+	if err := data.Pool.QueryRow(ctx, `SELECT count(DISTINCT family_id) FROM refresh_tokens`).Scan(&families); err != nil {
+		t.Fatal(err)
+	}
+	if families != 1 {
+		t.Fatalf("concurrent rotation produced %d families", families)
+	}
+	for index, token := range issued {
+		if _, active, err := data.InspectRefreshToken(ctx, token); err != nil || !active {
+			t.Fatalf("token %d is not usable: active=%v err=%v", index, active, err)
+		}
+	}
+
+	// Aging the recorded rotation past the window restores theft detection.
+	if _, err := data.Pool.Exec(ctx, `UPDATE refresh_tokens SET rotated_at=now()-make_interval(secs => $1)
+		WHERE rotated_at IS NOT NULL`, int(refreshRotationGrace.Seconds())+60); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := data.RotateRefreshToken(ctx, raw, nil); !errors.Is(err, ErrTokenReuse) {
+		t.Fatalf("reuse after the grace window: %v", err)
+	}
+}
+
+// TestIntegrationConcurrentLDAPSyncClaimAdmitsOne races the claim the way two
+// administrators or an overlapping scheduled sweep would.
+func TestIntegrationConcurrentLDAPSyncClaimAdmitsOne(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	created, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldaps://ldap.invalid:636",
+		UsersDN: "ou=people,dc=example,dc=com", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const racers = 8
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	claimed := make([]bool, racers)
+	errs := make([]error, racers)
+	for index := range racers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			claimed[index], errs[index] = data.ClaimLDAPSyncForTest(ctx, created.ID)
+		}()
+	}
+	close(start)
+	wait.Wait()
+
+	winners := 0
+	for index, err := range errs {
+		if err != nil {
+			t.Fatalf("racer %d failed: %v", index, err)
+		}
+		if claimed[index] {
+			winners++
+		}
+	}
+	// Two full walks of a directory would interleave writes to the same users.
+	if winners != 1 {
+		t.Fatalf("%d racers claimed the synchronization, want exactly 1", winners)
+	}
+}
+
+// A replayed authorization code means the code leaked: one of the two
+// redemptions was not the relying party. The server cannot tell which, so the
+// tokens the first redemption produced have to go, exactly as a replayed
+// refresh token takes down its family.
+func TestIntegrationAuthorizationCodeReuseRevokesIssuedRefreshTokens(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		time.Hour, "127.0.0.1", "integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := data.CreateAuthorizationCode(ctx, AuthorizationCode{
+		RealmID: bootstrap.RealmID, ClientID: clientID, UserID: bootstrap.AdminUserID,
+		SessionID: session.Session.ID, RedirectURI: "https://client.example.test/callback", Scope: []string{"openid"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := data.RedeemAuthorizationCode(ctx, raw, func(AuthorizationCode) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	issued, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: code.RealmID, ClientID: code.ClientID,
+		UserID: &userID, SessionID: &code.SessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := data.RedeemAuthorizationCode(ctx, raw, func(AuthorizationCode) error { return nil }); !errors.Is(err, ErrCodeReuse) {
+		t.Fatalf("replayed code error = %v, want ErrCodeReuse", err)
+	}
+
+	inspected, active, err := data.InspectRefreshToken(ctx, issued)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		t.Errorf("refresh token issued from a replayed code is still active: %+v", inspected)
+	}
+	var revoked bool
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT revoked_at IS NOT NULL FROM refresh_tokens WHERE session_id=$1 AND client_id=$2`,
+		session.Session.ID, clientID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Error("refresh token from the replayed code was left usable")
+	}
+
+	// An unknown code is still just an unknown code: reuse detection must not
+	// turn a stray request into a revocation signal.
+	if _, err := data.RedeemAuthorizationCode(ctx, "not-a-real-code", func(AuthorizationCode) error { return nil }); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown code error = %v, want ErrNotFound", err)
+	}
+}
+
+// The approval workflow exists so that nobody grants themselves a role. Its
+// only enforcement is that the reviewer is the requester's manager, and
+// manager_id was accepted without checking who it points at — so pointing it
+// at the requester, or at somebody in another realm entirely, dissolved the
+// control it was there to provide.
+func TestIntegrationApprovalReviewerCannotBeSelfOrForeign(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx, `UPDATE realms SET approval_enabled=true WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	role, err := data.CreateRole(ctx, bootstrap.RealmID, "payments-admin", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "alice", Password: "alice-password-123", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Naming yourself as your own approver must be refused outright.
+	if _, err := data.UpdateUser(ctx, alice.ID, UpdateUserInput{
+		Enabled: true, ManagerID: &alice.ID}); err == nil {
+		t.Error("a user was accepted as their own manager")
+	}
+
+	other, err := data.CreateRealm(ctx, CreateRealmInput{
+		Name: "partner", DisplayName: "Partner", IssuerURL: "https://partner.example.test/realms/partner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsider, err := data.CreateUser(ctx, other.ID, CreateUserInput{
+		Username: "outsider", Password: "outsider-password-123", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.UpdateUser(ctx, alice.ID, UpdateUserInput{
+		Enabled: true, ManagerID: &outsider.ID}); err == nil {
+		t.Error("a manager from another realm was accepted")
+	}
+
+	// Even if such a pairing already exists in an upgraded database, deciding
+	// the request must not work: authorization is checked at the decision.
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET manager_id=$2 WHERE id=$1`, alice.ID, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+	alice, err = data.UserByID(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := data.CreateRoleApprovalRequest(ctx, alice, role.ID, "need it")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.DecideApprovalRequest(ctx, request.ID, alice.ID, false, false, uuid.Nil, true, ""); err == nil {
+		t.Error("a requester approved their own role request")
+	}
+	var granted bool
+	if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id=$1 AND role_id=$2)`,
+		alice.ID, role.ID).Scan(&granted); err != nil {
+		t.Fatal(err)
+	}
+	if granted {
+		t.Error("self-approval granted the role")
+	}
+
+	// The workflow itself must still work: a real manager, in the same realm,
+	// approves and the role lands.
+	lead, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "lead", Password: "lead-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET manager_id=$2 WHERE id=$1`, alice.ID, lead.ID); err != nil {
+		t.Fatal(err)
+	}
+	alice, err = data.UserByID(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legitimate, err := data.CreateRoleApprovalRequest(ctx, alice, role.ID, "still need it")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.DecideApprovalRequest(ctx, legitimate.ID, lead.ID, false, false, uuid.Nil, true, "ok"); err != nil {
+		t.Fatalf("a manager could not approve their report's request: %v", err)
+	}
+	if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id=$1 AND role_id=$2)`,
+		alice.ID, role.ID).Scan(&granted); err != nil {
+		t.Fatal(err)
+	}
+	if !granted {
+		t.Error("an approved request did not grant the role")
+	}
+}
+
+// A refresh that fails after the rotation has committed must not cost the
+// client its token family. The exchange is two steps — rotate, then issue —
+// and if the second fails the caller never receives the new token while the
+// old one is already marked rotated. Once the grace window passes, presenting
+// the only token it still holds looks exactly like theft.
+func TestIntegrationFailedRefreshExchangeDoesNotStrandTheClient(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	userID := bootstrap.AdminUserID
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+		UserID: &userID, Scope: []string{"openid"}, ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, _, err := data.InspectRefreshToken(ctx, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, _, err := data.RotateRefreshToken(ctx, raw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stand in for the issue step failing: the caller never saw rotated.
+	if err := data.RollbackRefreshRotation(ctx, original.ID, rotated.ID); err != nil {
+		t.Fatal(err)
+	}
+	var orphans int
+	if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM refresh_tokens WHERE id=$1`, rotated.ID).Scan(&orphans); err != nil {
+		t.Fatal(err)
+	}
+	if orphans != 0 {
+		t.Error("the undelivered token was left behind")
+	}
+
+	// The grace window must not be what saves the retry, so age the rotation
+	// past it before trying again.
+	if _, err := data.Pool.Exec(ctx, `UPDATE refresh_tokens SET rotated_at=now()-interval '10 minutes'
+		WHERE id=$1 AND rotated_at IS NOT NULL`, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	retry, _, err := data.RotateRefreshToken(ctx, raw, nil)
+	if err != nil {
+		t.Fatalf("the client's only refresh token was rejected after a failed exchange: %v", err)
+	}
+	if retry.FamilyID != original.FamilyID {
+		t.Errorf("retry started a new family: %v want %v", retry.FamilyID, original.FamilyID)
+	}
+}
+
+// A directory that returns nothing looks the same whether every account really
+// left or the search was simply pointed at the wrong place. Under the DISABLE
+// policy the old behaviour read it the first way and deactivated every
+// federated account in the Realm, ending all of their sessions — so a mistyped
+// users DN locked the organisation out on the next scheduled sweep.
+func TestIntegrationEmptyLDAPReadDoesNotDisableEveryone(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldaps://ldap.invalid:636",
+		UsersDN: "ou=people,dc=example,dc=com", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "DISABLE",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"kim", "lee", "park"} {
+		user, createErr := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+			Username: name, Password: name + "-password-1234", Enabled: true})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		if _, err := data.Pool.Exec(ctx, `UPDATE users SET federation_id=$2,external_id=$3,
+			federation_synced_at=now()-interval '1 day' WHERE id=$1`, user.ID, provider.ID, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startedAt := time.Now().UTC()
+	disabled, err := data.disableUnseenFederatedUsers(ctx, provider.ID, startedAt, 0)
+	if !errors.Is(err, ErrSyncReadNothing) {
+		t.Fatalf("empty read error = %v, want ErrSyncReadNothing", err)
+	}
+	if disabled != 0 {
+		t.Errorf("an empty read disabled %d accounts", disabled)
+	}
+	var stillEnabled int
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM users WHERE federation_id=$1 AND enabled=true", provider.ID).Scan(&stillEnabled); err != nil {
+		t.Fatal(err)
+	}
+	if stillEnabled != 3 {
+		t.Errorf("enabled federated accounts = %d, want 3", stillEnabled)
+	}
+
+	// The policy must still do its job when the directory actually answered:
+	// two accounts were seen this run, the third was not.
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET federation_synced_at=now()
+		WHERE federation_id=$1 AND username IN ('kim','lee')`, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err = data.disableUnseenFederatedUsers(ctx, provider.ID, startedAt, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled != 1 {
+		t.Errorf("disabled %d accounts, want 1", disabled)
+	}
+	var parkEnabled bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT enabled FROM users WHERE federation_id=$1 AND username='park'", provider.ID).Scan(&parkEnabled); err != nil {
+		t.Fatal(err)
+	}
+	if parkEnabled {
+		t.Error("an account the directory no longer lists stayed enabled")
+	}
+}
+
+// A rotated refresh token inherits its predecessor's expiry, so the whole
+// family dies when the first token would have. That is a deliberate ceiling —
+// a sliding expiry would let a client that keeps refreshing hold a credential
+// forever — but nothing recorded it, and a future change to what rotation
+// copies would flip it silently in the direction that removes the ceiling.
+func TestIntegrationRefreshRotationDoesNotExtendTheFamilyLifetime(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	userID := bootstrap.AdminUserID
+	expiry := time.Now().UTC().Add(30 * time.Minute)
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+		UserID: &userID, Scope: []string{"openid"}, ExpiresAt: expiry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two rotations, so a per-rotation extension would be unmistakable.
+	rotated, rawNext, err := data.RotateRefreshToken(ctx, raw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, _, err = data.RotateRefreshToken(ctx, rawNext, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PostgreSQL stores microseconds, so compare instants rather than values.
+	if drift := rotated.ExpiresAt.Sub(expiry); drift > time.Second || drift < -time.Second {
+		t.Errorf("rotation moved the expiry by %s; the family lifetime must be fixed at issuance", drift)
+	}
+}
+
+// A locked account used to be refused without the password ever being hashed,
+// so it answered in a fraction of the time an ordinary rejection takes. The
+// login error is deliberately identical for every failure, and that timing
+// gap handed back exactly what the wording withholds: this account exists and
+// is locked. Verifying regardless also tells the caller whether the password
+// was right, which is what makes it safe to name the real obstacle.
+func TestIntegrationLockedAccountStillVerifiesThePassword(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE realms SET max_login_attempts=3, lockout_seconds=600 WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "victim-password-1234"
+	victim, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "victim", Password: secret, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if _, err := data.AuthenticatePassword(ctx, realm, "victim", "wrong-password-here"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locked, err := data.UserByID(ctx, victim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if locked.LockedUntil == nil {
+		t.Fatal("the account was not locked by repeated failures")
+	}
+
+	wrong, err := data.AuthenticatePassword(ctx, realm, "victim", "still-wrong-here")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrong.FailureReason != "ACCOUNT_LOCKED" || wrong.CredentialsValid {
+		t.Errorf("locked with a wrong password = %+v", wrong)
+	}
+	right, err := data.AuthenticatePassword(ctx, realm, "victim", secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if right.Success {
+		t.Error("a locked account was allowed in")
+	}
+	if right.FailureReason != "ACCOUNT_LOCKED" || !right.CredentialsValid {
+		t.Errorf("locked with the right password = %+v", right)
+	}
+
+	// Attempts against a locked account must not push the lockout further out,
+	// or anyone could keep a colleague signed out indefinitely.
+	after, err := data.UserByID(ctx, victim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.LockedUntil == nil || !after.LockedUntil.Equal(*locked.LockedUntil) {
+		t.Errorf("the lockout moved: %v then %v", locked.LockedUntil, after.LockedUntil)
+	}
+}
+
+// Which relying parties took part in a session is not recorded anywhere; it is
+// inferred from the refresh tokens and authorization codes still on file. A
+// client that does not use refresh tokens leaves only the code, and the code is
+// swept a day after it expires — so for any session outliving that, back-channel
+// logout quietly stops reaching it. The Realm session lifetime goes to 30 days.
+func TestIntegrationBackchannelTargetsSurvivePruning(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	created, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "no-refresh", Name: "No Refresh", Type: "confidential",
+		RedirectURIs: []string{"https://no-refresh.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"},
+		BackchannelLogoutURI: "https://no-refresh.example.test/backchannel-logout"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		20*24*time.Hour, "127.0.0.1", "prune-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateAuthorizationCode(ctx, AuthorizationCode{
+		RealmID: bootstrap.RealmID, ClientID: created.Client.ID, UserID: bootstrap.AdminUserID,
+		SessionID: session.Session.ID, RedirectURI: "https://no-refresh.example.test/cb",
+		Scope: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := data.BackchannelLogoutTargets(ctx, bootstrap.RealmID, session.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("targets before pruning = %d, want 1", len(targets))
+	}
+
+	// Age the code past the sweep and run the real maintenance pass.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE authorization_codes SET expires_at=now()-interval '3 days' WHERE session_id=$1`,
+		session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.PruneOperationalData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	targets, err = data.BackchannelLogoutTargets(ctx, bootstrap.RealmID, session.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 {
+		t.Errorf("a live session lost its logout target to pruning: %d targets", len(targets))
+	}
+
+	// Retention is one row per client, not every code the session ever used,
+	// so a client that keeps returning to the authorization endpoint cannot
+	// make the table grow without bound.
+	for range 4 {
+		if _, err := data.CreateAuthorizationCode(ctx, AuthorizationCode{
+			RealmID: bootstrap.RealmID, ClientID: created.Client.ID, UserID: bootstrap.AdminUserID,
+			SessionID: session.Session.ID, RedirectURI: "https://no-refresh.example.test/cb",
+			Scope: []string{"openid"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE authorization_codes SET expires_at=expires_at-interval '3 days' WHERE session_id=$1`,
+		session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.PruneOperationalData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var kept int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM authorization_codes WHERE session_id=$1`, session.Session.ID).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 1 {
+		t.Errorf("kept %d codes for one client, want 1", kept)
+	}
+
+	// Once the session is over there is nobody left to notify, so the record
+	// goes with it rather than lingering.
+	if err := data.RevokeSession(ctx, session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.PruneOperationalData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM authorization_codes WHERE session_id=$1`, session.Session.ID).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 0 {
+		t.Errorf("an ended session left %d codes behind", kept)
+	}
+}
+
+// Undoing a rotation must not disturb a concurrent refresh that succeeded.
+// Two tabs refreshing at once both come back with tokens, and if the first
+// exchange then fails and rolls back, the second one's tokens are already
+// somebody's — rolling those back would sign a working client out.
+func TestIntegrationRollbackLeavesAConcurrentRefreshAlone(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	userID := bootstrap.AdminUserID
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+		UserID: &userID, Scope: []string{"openid"}, ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, _, err := data.InspectRefreshToken(ctx, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Both tabs present the same token inside the grace window.
+	first, _, err := data.RotateRefreshToken(ctx, raw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondRaw, err := data.RotateRefreshToken(ctx, raw, nil)
+	if err != nil {
+		t.Fatalf("a second refresh inside the grace window was refused: %v", err)
+	}
+
+	// The first tab's exchange fails and is undone.
+	if err := data.RollbackRefreshRotation(ctx, original.ID, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, active, err := data.InspectRefreshToken(ctx, secondRaw); err != nil || !active {
+		t.Errorf("the concurrent refresh lost its token: active=%v err=%v", active, err)
+	}
+	var survived int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM refresh_tokens WHERE id=$1 AND revoked_at IS NULL`, second.ID).Scan(&survived); err != nil {
+		t.Fatal(err)
+	}
+	if survived != 1 {
+		t.Error("the successful exchange's token was removed by another exchange's rollback")
+	}
+	// The predecessor keeps its rotation, because a successor built on it is
+	// still in use; clearing it would let the old token be replayed.
+	var rotatedAt *time.Time
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT rotated_at FROM refresh_tokens WHERE id=$1`, original.ID).Scan(&rotatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if rotatedAt == nil {
+		t.Error("the predecessor was revived while a live successor exists")
+	}
+}
+
+// Idle expiry is meant to end sessions nobody is using. Only the browser
+// console recorded use, so a session driven entirely through OIDC — a relying
+// party refreshing tokens for someone who is working in it all afternoon —
+// looked idle from the moment they signed in, and was cut off mid-work.
+func TestIntegrationOIDCUseKeepsASessionFromGoingIdle(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE realms SET idle_timeout_seconds=600 WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		8*time.Hour, "127.0.0.1", "idle-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID, ClientID: clientID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(8 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lastAccess := func() time.Time {
+		t.Helper()
+		var value time.Time
+		if err := data.Pool.QueryRow(ctx,
+			`SELECT last_access FROM sso_sessions WHERE id=$1`, sessionID).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	// Five minutes of working through the relying party, inside the timeout.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE sso_sessions SET last_access=now()-interval '5 minutes' WHERE id=$1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	before := lastAccess()
+	if _, _, err := data.RotateRefreshToken(ctx, raw, nil); err != nil {
+		t.Fatalf("refresh inside the idle window failed: %v", err)
+	}
+	if after := lastAccess(); !after.After(before) {
+		t.Errorf("a token refresh did not count as using the session: %s", after)
+	}
+
+	// Genuinely idle past the timeout still expires, which is the point.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE sso_sessions SET last_access=now()-interval '20 minutes' WHERE id=$1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.ValidateActiveSessionBinding(ctx, sessionID, userID, bootstrap.RealmID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("an idle session stayed usable: %v", err)
+	}
+}
+
+// The authorization endpoint writes a row for every sign-in that needs a login
+// screen, and reaching it takes only a client identifier and a redirect URI —
+// both visible in any relying party's sign-in link. Anyone can therefore drive
+// one insert per request, so an expired row must not linger: it is invisible
+// to every reader from the moment it expires.
+func TestIntegrationExpiredPendingAuthorizationsAreSweptPromptly(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	clientID := createIntegrationClient(t, data, bootstrap.RealmID)
+	pending := func(expiresAt time.Time) string {
+		t.Helper()
+		token, err := data.CreateAuthorizationRequest(ctx, AuthorizationRequest{
+			RealmID: bootstrap.RealmID, ClientID: clientID, RedirectURI: "https://client.example.test/callback",
+			ResponseType: "code", Scope: []string{"openid"}, ExpiresAt: expiresAt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return token
+	}
+	stale := pending(time.Now().UTC().Add(-time.Minute))
+	live := pending(time.Now().UTC().Add(5 * time.Minute))
+
+	if _, err := data.AuthorizationRequestByToken(ctx, stale); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("an expired request was still readable: %v", err)
+	}
+	if err := data.PruneOperationalData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM authorization_requests`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Errorf("rows left after the sweep = %d, want 1", remaining)
+	}
+	if _, err := data.AuthorizationRequestByToken(ctx, live); err != nil {
+		t.Errorf("the sweep took a request that was still valid: %v", err)
+	}
+}
+
+// "Is a sync running" had two answers. The guard that refuses a second run
+// bounded the RUNNING status by how long ago it reported in; the listed
+// provider carried the raw column. A run whose process died — a container
+// stopped during a directory walk that may take half an hour — leaves that
+// column saying RUNNING for ever, so the console disabled the sync button and
+// polled every few seconds with no way back, while the server would have
+// accepted a new run all along.
+func TestIntegrationStaleSyncIsNotReportedAsRunning(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldaps://ldap.invalid:636",
+		UsersDN: "ou=people,dc=example,dc=com", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := data.ClaimLDAPSyncForTest(ctx, provider.ID)
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, err = %v", claimed, err)
+	}
+	listed := func() domain.LDAPFederation {
+		t.Helper()
+		items, listErr := data.ListLDAPFederations(ctx, bootstrap.RealmID)
+		if listErr != nil || len(items) != 1 {
+			t.Fatalf("list = %d items, err = %v", len(items), listErr)
+		}
+		return items[0]
+	}
+	running, err := data.LDAPSyncRunning(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !running || !listed().SyncRunning {
+		t.Fatalf("a claimed sync was not reported as running: guard=%v listed=%v", running, listed().SyncRunning)
+	}
+
+	// The process dies without ever reporting back.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET updated_at=now()-interval '2 hours' WHERE id=$1`, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	running, err = data.LDAPSyncRunning(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := listed()
+	if running {
+		t.Error("the guard still considered an abandoned run to be running")
+	}
+	if stale.SyncRunning {
+		t.Error("the listed provider still reported a run in progress, which locks the console out")
+	}
+	if stale.LastSyncStatus != "RUNNING" {
+		t.Errorf("the raw status was expected to remain RUNNING, got %q", stale.LastSyncStatus)
+	}
+}
+
+// A Realm that expires unused sessions refuses them long before expires_at
+// arrives, and that is not something a reader of the listed columns can work
+// out. The console derived "active" from revoked_at and expires_at alone, so
+// it showed sessions as usable that the server had already stopped accepting —
+// an administrator looking for who is signed in, and a user checking their own
+// devices, both being told about sessions that no longer exist.
+func TestIntegrationListedSessionReportsWhetherItStillWorks(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE realms SET idle_timeout_seconds=600 WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		8*time.Hour, "127.0.0.1", "listing-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := func() domain.Session {
+		t.Helper()
+		items, listErr := data.ListSessions(ctx, &bootstrap.RealmID, nil, 10)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		for _, item := range items {
+			if item.ID == session.Session.ID {
+				return item
+			}
+		}
+		t.Fatal("the session was not listed")
+		return domain.Session{}
+	}
+	if !listed().Active {
+		t.Fatal("a fresh session was listed as unusable")
+	}
+
+	// Unused past the idle timeout: refused by the server, while expires_at is
+	// still hours away.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE sso_sessions SET last_access=now()-interval '30 minutes' WHERE id=$1`, session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	idle := listed()
+	if idle.Active {
+		t.Error("an idle-expired session was listed as active")
+	}
+	if !idle.ExpiresAt.After(time.Now()) {
+		t.Fatal("the test needs expires_at to still be in the future to mean anything")
+	}
+	if idle.RevokedAt != nil {
+		t.Error("the session was revoked, which is not the case being tested")
+	}
+}
+
+// Whether a lockout is in force and whether an API key is still accepted both
+// gate an action in the console: the unlock button only appears for a locked
+// account, and rotate and revoke are offered only for a live key. Deciding
+// either against the browser's clock meant a machine running fast hid the only
+// way to release an account nobody could sign in to, and offered no way to
+// withdraw a key that still worked.
+func TestIntegrationLockAndKeyStateComeFromTheServer(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	user, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "locked-probe", Password: "locked-probe-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetched, err := data.UserByID(ctx, user.ID); err != nil || fetched.Locked {
+		t.Fatalf("a new account reported locked=%v err=%v", fetched.Locked, err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE users SET locked_until=now()+interval '10 minutes' WHERE id=$1`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := data.UserByID(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !locked.Locked {
+		t.Error("a locked account did not report it, which hides the unlock action")
+	}
+	// A lockout that has run its course is not in force, even though the
+	// timestamp is still on the row.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE users SET locked_until=now()-interval '1 minute' WHERE id=$1`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if released, err := data.UserByID(ctx, user.ID); err != nil || released.Locked {
+		t.Errorf("an elapsed lockout still reported as locked: %v", err)
+	}
+
+	created, err := data.CreatePersonalAPIKey(ctx, user.ID, "probe", []string{"api:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created.Key.Active {
+		t.Error("a key was reported inactive at the moment it was issued")
+	}
+	keys, err := data.ListPersonalAPIKeys(ctx, user.ID)
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("listed %d keys, err=%v", len(keys), err)
+	}
+	if !keys[0].Active {
+		t.Error("a live key was listed as inactive, which hides rotate and revoke")
+	}
+	if err := data.RevokePersonalAPIKey(ctx, user.ID, created.Key.ID); err != nil {
+		t.Fatal(err)
+	}
+	keys, err = data.ListPersonalAPIKeys(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys[0].Active {
+		t.Error("a revoked key was still listed as active")
+	}
+}
+
+// The DISABLE policy deactivates the accounts a sync did not see and ends
+// their sessions. It is the most consequential thing this service does on its
+// own, and until a real directory could be pointed at it there was no way to
+// run it end to end — the guard against an empty read was tested by calling
+// the sweep directly, not by synchronising anything.
+//
+// Set RESSO_TEST_LDAP_URL alongside the database DSN to run this.
+func TestIntegrationFederationSyncImportsThenDisablesOnlyWhatLeft(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	branch := "ou=sync-leave,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "stays", "leaves")
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "DISABLE",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := data.SyncLDAPFederation(ctx, provider.ID)
+	if err != nil {
+		t.Fatalf("synchronising a reachable directory failed: %v (%+v)", err, summary)
+	}
+	if summary.Read < 2 || summary.Failed != 0 {
+		t.Fatalf("first sync summary = %+v", summary)
+	}
+	enabled := func(username string) (bool, bool) {
+		t.Helper()
+		var isEnabled bool
+		err := data.Pool.QueryRow(ctx,
+			`SELECT enabled FROM users WHERE realm_id=$1 AND username=$2 AND federation_id=$3`,
+			bootstrap.RealmID, username, provider.ID).Scan(&isEnabled)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return isEnabled, true
+	}
+	for _, username := range []string{"stays", "leaves"} {
+		if isEnabled, found := enabled(username); !found || !isEnabled {
+			t.Fatalf("%s was not imported as an enabled account (found=%v)", username, found)
+		}
+	}
+	// Attributes come across, not just the username.
+	var email string
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT email FROM users WHERE realm_id=$1 AND username='stays'`, bootstrap.RealmID).Scan(&email); err != nil {
+		t.Fatal(err)
+	}
+	if email != "stays@example.test" {
+		t.Errorf("imported email = %q", email)
+	}
+
+	// Somebody leaves the directory. Only that account may be deactivated.
+	if err := removeDirectoryEntry(t, "uid=leaves,"+branch); err != nil {
+		t.Fatal(err)
+	}
+	summary, err = data.SyncLDAPFederation(ctx, provider.ID)
+	if err != nil {
+		t.Fatalf("second sync failed: %v (%+v)", err, summary)
+	}
+	if summary.Disabled != 1 {
+		t.Errorf("accounts disabled = %d, want 1", summary.Disabled)
+	}
+	if isEnabled, _ := enabled("leaves"); isEnabled {
+		t.Error("an account the directory no longer lists stayed enabled")
+	}
+	if isEnabled, _ := enabled("stays"); !isEnabled {
+		t.Error("an account still in the directory was deactivated")
+	}
+}
+
+// A directory that answers with nothing looks the same whether everybody left
+// or the search was pointed somewhere wrong, and under the DISABLE policy the
+// second reading would deactivate every federated account in the Realm. The
+// guard against that was previously exercised by calling the sweep directly;
+// this runs a whole synchronisation against a real, empty branch.
+func TestIntegrationFederationSyncRefusesToActOnAnEmptyDirectory(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	credential := "adminpassword"
+	populated := "ou=sync-empty,dc=example,dc=test"
+	createDirectoryBranch(t, populated, "present-one", "present-two")
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: populated, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "DISABLE",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	var imported int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM users WHERE federation_id=$1 AND enabled=true`, provider.ID).Scan(&imported); err != nil {
+		t.Fatal(err)
+	}
+	if imported < 2 {
+		t.Fatalf("imported %d accounts, expected the directory's users", imported)
+	}
+
+	// The search now points at a branch that exists and holds nobody, which is
+	// what a mistyped base or a lost read permission looks like.
+	emptyBranch := "ou=nobody,dc=example,dc=test"
+	createEmptyDirectoryBranch(t, emptyBranch)
+	t.Cleanup(func() { _ = removeDirectoryEntry(t, emptyBranch) })
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET users_dn=$2 WHERE id=$1`, provider.ID, emptyBranch); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := data.SyncLDAPFederation(ctx, provider.ID)
+	if !errors.Is(err, ErrSyncReadNothing) {
+		t.Fatalf("an empty directory returned %v, want ErrSyncReadNothing", err)
+	}
+	if summary.Disabled != 0 {
+		t.Errorf("an empty read disabled %d accounts", summary.Disabled)
+	}
+	var stillEnabled int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM users WHERE federation_id=$1 AND enabled=true`, provider.ID).Scan(&stillEnabled); err != nil {
+		t.Fatal(err)
+	}
+	if stillEnabled != imported {
+		t.Errorf("enabled accounts went from %d to %d on an empty read", imported, stillEnabled)
+	}
+	// The operator has to be able to see why, so the run is recorded as failed.
+	var status, message string
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT last_sync_status,last_sync_error FROM user_federations WHERE id=$1`, provider.ID).Scan(&status, &message); err != nil {
+		t.Fatal(err)
+	}
+	if status != "FAILURE" || message == "" {
+		t.Errorf("the run was recorded as %q with message %q", status, message)
+	}
+}
+
+func createEmptyDirectoryBranch(t *testing.T, dn string) {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	request := ldap.NewAddRequest(dn, nil)
+	request.Attribute("objectClass", []string{"organizationalUnit"})
+	request.Attribute("ou", []string{"nobody"})
+	if err := connection.Add(request); err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
+		t.Fatal(err)
+	}
+}
+
+// Each synchronisation test owns the directory entries it works with.
+//
+// The federation package's tests use the shared accounts at ou=people, and
+// these tests delete an account to see the DISABLE policy act on it. Go runs
+// package test binaries in parallel, so sharing an entry that one package
+// removes and another reads is a race waiting for a slower machine — it did
+// not reproduce here, which is exactly the kind of assurance not worth having.
+func createDirectoryBranch(t *testing.T, branch string, usernames ...string) {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	unit := ldap.NewAddRequest(branch, nil)
+	unit.Attribute("objectClass", []string{"organizationalUnit"})
+	unit.Attribute("ou", []string{strings.SplitN(strings.TrimPrefix(branch, "ou="), ",", 2)[0]})
+	if err := connection.Add(unit); err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
+		t.Fatal(err)
+	}
+	for _, username := range usernames {
+		entry := ldap.NewAddRequest("uid="+username+","+branch, nil)
+		entry.Attribute("objectClass", []string{"inetOrgPerson"})
+		entry.Attribute("uid", []string{username})
+		entry.Attribute("cn", []string{username + " Person"})
+		entry.Attribute("sn", []string{"Person"})
+		entry.Attribute("mail", []string{username + "@example.test"})
+		entry.Attribute("userPassword", []string{username + "-pass-1234"})
+		if err := connection.Add(entry); err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { removeDirectoryBranch(t, branch) })
+}
+
+func removeDirectoryBranch(t *testing.T, branch string) {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	found, err := connection.Search(ldap.NewSearchRequest(branch, ldap.ScopeWholeSubtree,
+		ldap.NeverDerefAliases, 0, 10, false, "(objectClass=*)", []string{"1.1"}, nil))
+	if err != nil {
+		return
+	}
+	// Children first: a directory refuses to delete a branch that still holds
+	// entries.
+	for index := len(found.Entries) - 1; index >= 0; index-- {
+		_ = connection.Del(ldap.NewDelRequest(found.Entries[index].DN, nil))
+	}
+}
+
+// The directory is modified through the same library the service uses, so the
+// test needs no command-line tools on whatever machine it runs on.
+func directoryConnection(t *testing.T) *ldap.Conn {
+	t.Helper()
+	connection, err := ldap.DialURL(strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.Bind("cn=admin,dc=example,dc=test", "adminpassword"); err != nil {
+		_ = connection.Close()
+		t.Fatal(err)
+	}
+	return connection
+}
+
+func removeDirectoryEntry(t *testing.T, dn string) error {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	return connection.Del(ldap.NewDelRequest(dn, nil))
+}
+
+// What an administrator may do to a federated account depends on the edit
+// mode, and getting that wrong writes into a directory the service does not
+// own — or refuses a change the operator was told they could make. None of it
+// had been run: the READ_ONLY refusal, the WRITABLE write-through, or signing
+// in as a directory account at all.
+func TestIntegrationFederatedAccountsFollowTheEditMode(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	branch := "ou=sync-edit,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "editable")
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported, err := data.userByRealmUsername(ctx, bootstrap.RealmID, "editable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.FederationID == nil || imported.ExternalDN == nil {
+		t.Fatalf("the imported account was not linked to the directory: %+v", imported)
+	}
+
+	// Authenticate is the entry point the sign-in handler uses; it routes a
+	// linked account to the directory instead of to a local hash.
+	result, err := data.Authenticate(ctx, realm, "editable", "editable-pass-1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("a directory account could not sign in: %+v", result)
+	}
+	if wrong, err := data.Authenticate(ctx, realm, "editable", "not-the-password"); err != nil || wrong.Success {
+		t.Errorf("a wrong directory password was accepted: %+v err=%v", wrong, err)
+	}
+
+	// READ_ONLY means the directory is the record: an edit here is refused
+	// rather than quietly diverging from it.
+	if _, err := data.UpdateUser(ctx, imported.ID, UpdateUserInput{
+		Enabled: true, Email: "elsewhere@example.test", DisplayName: "Elsewhere"}); !errors.Is(err, ErrFederationReadOnly) {
+		t.Errorf("editing a READ_ONLY account returned %v, want ErrFederationReadOnly", err)
+	}
+	if err := data.ChangePassword(ctx, imported.ID, "editable-pass-1234", "another-pass-1234", false); !errors.Is(err, ErrFederationPasswordExternal) {
+		t.Errorf("changing a READ_ONLY password returned %v, want ErrFederationPasswordExternal", err)
+	}
+
+	// WRITABLE means the change is carried into the directory, which is the
+	// only way to tell it apart from a local edit that happens to stick.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET edit_mode='WRITABLE' WHERE id=$1`, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.UpdateUser(ctx, imported.ID, UpdateUserInput{
+		Enabled: true, Email: "moved@example.test", DisplayName: "Moved Person"}); err != nil {
+		t.Fatalf("editing a WRITABLE account failed: %v", err)
+	}
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	found, err := connection.Search(ldap.NewSearchRequest(*imported.ExternalDN, ldap.ScopeBaseObject,
+		ldap.NeverDerefAliases, 1, 5, false, "(objectClass=*)", []string{"mail", "cn"}, nil))
+	if err != nil || len(found.Entries) != 1 {
+		t.Fatalf("reading the entry back failed: %v", err)
+	}
+	if got := found.Entries[0].GetAttributeValue("mail"); got != "moved@example.test" {
+		t.Errorf("the directory still holds mail=%q", got)
+	}
+	if got := found.Entries[0].GetAttributeValue("cn"); got != "Moved Person" {
+		t.Errorf("the directory still holds cn=%q", got)
+	}
+
+	// And a password change reaches the directory too, which is what the
+	// person will actually sign in with next.
+	if err := data.ChangePassword(ctx, imported.ID, "editable-pass-1234", "changed-pass-5678", false); err != nil {
+		t.Fatalf("changing a WRITABLE password failed: %v", err)
+	}
+	if after, err := data.Authenticate(ctx, realm, "editable", "changed-pass-5678"); err != nil || !after.Success {
+		t.Errorf("the new directory password was refused: %+v err=%v", after, err)
+	}
+}
+
+// A directory group deciding a Realm role is permissions coming from a system
+// this service does not control, and the half that matters is the removal:
+// somebody leaving a group has to lose the role at the next synchronisation.
+// Retaining it is how a person keeps access after being moved off a team.
+func TestIntegrationDirectoryGroupsGrantAndWithdrawRoles(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	branch := "ou=sync-groups,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "member")
+	memberDN := "uid=member," + branch
+	groupBranch := "ou=sync-teams,dc=example,dc=test"
+	groupDN := "cn=payments," + groupBranch
+	createDirectoryGroup(t, groupBranch, groupDN, memberDN)
+
+	role, err := data.CreateRole(ctx, bootstrap.RealmID, "payments-operator", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn", MemberOfLDAPAttribute: "memberOf",
+		GroupRoleMappings: map[string]string{"payments": "payments-operator"},
+		ImportEnabled:     true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	holdsRole := func() bool {
+		t.Helper()
+		var held bool
+		if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_roles ur
+			JOIN users u ON u.id=ur.user_id
+			WHERE u.realm_id=$1 AND u.username='member' AND ur.role_id=$2)`,
+			bootstrap.RealmID, role.ID).Scan(&held); err != nil {
+			t.Fatal(err)
+		}
+		return held
+	}
+	if !holdsRole() {
+		t.Fatal("membership of the mapped group did not grant the role")
+	}
+
+	// Off the team. The role has to go with the membership.
+	removeDirectoryGroupMember(t, groupDN, memberDN)
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	if holdsRole() {
+		t.Error("leaving the group left the role in place, so access outlived the membership")
+	}
+}
+
+func createDirectoryGroup(t *testing.T, branch, groupDN, memberDN string) {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	unit := ldap.NewAddRequest(branch, nil)
+	unit.Attribute("objectClass", []string{"organizationalUnit"})
+	unit.Attribute("ou", []string{strings.SplitN(strings.TrimPrefix(branch, "ou="), ",", 2)[0]})
+	if err := connection.Add(unit); err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
+		t.Fatal(err)
+	}
+	group := ldap.NewAddRequest(groupDN, nil)
+	group.Attribute("objectClass", []string{"groupOfNames"})
+	group.Attribute("cn", []string{strings.SplitN(strings.TrimPrefix(groupDN, "cn="), ",", 2)[0]})
+	group.Attribute("member", []string{memberDN})
+	if err := connection.Add(group); err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { removeDirectoryBranch(t, branch) })
+}
+
+// removeDirectoryGroupMember empties the group rather than deleting the entry,
+// because groupOfNames requires at least one member and the directory would
+// refuse to remove the last one.
+func removeDirectoryGroupMember(t *testing.T, groupDN, memberDN string) {
+	t.Helper()
+	connection := directoryConnection(t)
+	defer func() { _ = connection.Close() }()
+	if err := connection.Del(ldap.NewDelRequest(groupDN, nil)); err != nil {
+		t.Fatalf("removing the group failed: %v", err)
+	}
+	_ = memberDN
+}
+
+// A directory that cannot be reached must not be mistaken for a wrong
+// password. Counting those attempts would mean an outage locks people out of
+// their own accounts, and the lockout would outlast the outage — everybody
+// affected would still be barred once the directory came back.
+func TestIntegrationDirectoryOutageDoesNotCountAsAFailedPassword(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE realms SET max_login_attempts=3, lockout_seconds=600 WHERE id=$1`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "ou=sync-outage,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "onleave")
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := data.Authenticate(ctx, realm, "onleave", "onleave-pass-1234"); err != nil || !result.Success {
+		t.Fatalf("the account could not sign in before the outage: %+v err=%v", result, err)
+	}
+
+	// The directory goes away.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET connection_url='ldap://127.0.0.1:1' WHERE id=$1`, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		result, err := data.Authenticate(ctx, realm, "onleave", "onleave-pass-1234")
+		if err == nil {
+			t.Fatalf("an unreachable directory was answered with %+v rather than an error", result)
+		}
+	}
+	var attempts int
+	var locked *time.Time
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT failed_attempts,locked_until FROM users WHERE realm_id=$1 AND username='onleave'`,
+		bootstrap.RealmID).Scan(&attempts, &locked); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Errorf("an outage counted %d failed attempts", attempts)
+	}
+	if locked != nil {
+		t.Error("an outage locked the account, which would outlast the outage itself")
+	}
+
+	// And once the directory is back, the same password works.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET connection_url=$2 WHERE id=$1`, provider.ID, directory); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := data.Authenticate(ctx, realm, "onleave", "onleave-pass-1234"); err != nil || !result.Success {
+		t.Errorf("the account could not sign in after the outage: %+v err=%v", result, err)
 	}
 }
