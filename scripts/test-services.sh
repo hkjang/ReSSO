@@ -166,9 +166,36 @@ start_tls_directory() {
   # varies with the machine — thirty seconds was enough here and not always
   # enough on a loaded runner, which made the check itself the flaky part.
   # Waiting longer costs nothing except when something is genuinely wrong.
+  #
+  # Two things had to be right here, and each was hiding the other.
+  #
+  # The report is captured and then searched, rather than piped into `grep -q`.
+  # Under `set -o pipefail` that pipeline reports the producer's status when the
+  # consumer leaves first: grep -q exits on the matching line, openssl is still
+  # writing the rest of its report, takes SIGPIPE, and the pipeline comes back
+  # 141 — a successful match reported as a failure. Whether openssl has finished
+  # writing by then depends on the machine, which is why this passed here and
+  # failed on a loaded runner, with the diagnostic printed twenty milliseconds
+  # after the give-up showing the certificate had been fine all along.
+  #
+  # And "Verify return code: 0" alone does not mean a certificate verified:
+  # openssl prints it when there was no peer certificate to check, because
+  # nothing failed. Docker publishes the port the moment the container starts,
+  # so until slapd is listening the connection is accepted and closed, and that
+  # empty exchange satisfies the string. The subject line only appears when a
+  # certificate was actually presented, so both are required. The old check was
+  # saved from this by the bug above — a false match returned 141 and the loop
+  # kept waiting — and fixing only that one let the readiness check pass before
+  # the directory was up.
   for _ in $(seq 1 120); do
-    openssl s_client -connect "127.0.0.1:${tls_port}" -CAfile "$certs/ca.crt" </dev/null 2>&1 \
-      | grep -q "Verify return code: 0" && return
+    report="$(openssl s_client -connect "127.0.0.1:${tls_port}" -CAfile "$certs/ca.crt" </dev/null 2>&1 || true)"
+    case "$report" in
+      *"subject="*)
+        case "$report" in
+          *"Verify return code: 0"*) return ;;
+        esac
+        ;;
+    esac
     sleep 1
   done
   log "the TLS directory never served a verifiable certificate"
