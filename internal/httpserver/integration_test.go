@@ -1236,3 +1236,60 @@ func TestIntegrationTokenIssuanceFailuresAreCounted(t *testing.T) {
 		t.Error("a failed request was counted as an issued token")
 	}
 }
+
+// An agent reading the user directory through MCP left no trace at all, so a
+// disclosure about that access could not be answered — nobody could say
+// whether it had happened. Both outcomes are worth recording: the read itself,
+// and the attempt that was turned away.
+func TestIntegrationMCPDirectoryReadsAreRecorded(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intern, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "intern", Password: "intern-password-123", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminKey, err := data.CreatePersonalAPIKey(ctx, bootstrap.AdminUserID, "agent",
+		[]string{"mcp:read", "admin:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	internKey, err := data.CreatePersonalAPIKey(ctx, intern.ID, "agent", []string{"mcp:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	search := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resso_search_users","arguments":{"query":"ad"}}}`
+	status := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"resso_service_status","arguments":{}}}`
+
+	callIntegrationMCP(t, server.Client(), server.URL, adminKey.Secret, search)
+	callIntegrationMCP(t, server.Client(), server.URL, internKey.Secret, search)
+	// Status is polled and harmless; recording it would bury what matters.
+	callIntegrationMCP(t, server.Client(), server.URL, adminKey.Secret, status)
+
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "MCP_TOOL_CALL", Ascending: true, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("recorded %d calls, want the two directory reads only", len(page.Items))
+	}
+	if page.Items[0].Result != "SUCCESS" || page.Items[0].ActorName != "admin" {
+		t.Errorf("the permitted read recorded %+v", page.Items[0])
+	}
+	if page.Items[1].Result != "FAILURE" || page.Items[1].ActorName != "intern" {
+		t.Errorf("the refused attempt recorded %+v", page.Items[1])
+	}
+	for _, item := range page.Items {
+		if item.TargetID != "resso_search_users" {
+			t.Errorf("the tool was not recorded: %+v", item)
+		}
+	}
+}

@@ -72,6 +72,7 @@ ReSSO는 확장을 직접 설치하지 않습니다. 확장 설치는 데이터�
 | `AUTHORIZATION_CODE_REUSED` | 인가 코드가 두 번 제시되었습니다. 코드가 유출된 것이며, 해당 Session·Client의 Refresh Token은 이미 폐기되었습니다. 기록된 계정과 Client를 확인하고 RP의 Redirect 설정과 Referrer 정책을 점검하세요. |
 | `REFRESH_TOKEN_REUSE` | Refresh Token이 회전 이후 다시 제시되어 계열이 폐기되었습니다. |
 | `LDAP_FEDERATION_SYNC` `result=FAILURE` | 동기화 실패. `DISABLE` 정책이면 계정 비활성화가 반영되지 않습니다. |
+| `MCP_TOOL_CALL` | 에이전트가 MCP로 사람 또는 Client의 기록을 조회했습니다. 상세의 `tool`이 어떤 도구인지, `result`가 허용 여부입니다. `FAILURE`는 권한이 없는 키가 시도했다는 뜻이므로 어떤 키인지 확인하세요. 서비스 상태 조회는 기록하지 않습니다. |
 | `TOKEN_REVOKED` | RP가 Revocation endpoint를 호출했습니다. 상세의 `revoked`가 실제 결과입니다 — `refresh_token`(계열 폐기, `family_id` 포함), `access_token`(`jti` 포함), `none`(일치하는 Token 없음). RFC 7009은 일치 여부와 무관하게 200을 반환하므로, Token이 실제로 폐기되었는지는 이 값으로만 알 수 있습니다. |
 
 ## Back-Channel Logout

@@ -100,6 +100,7 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mcpResponse{JSONRPC: "2.0", ID: request.ID, Result: map[string]any{"tools": s.mcpTools(principal)}})
 	case "tools/call":
 		result, callErr := s.callMCPTool(r, principal, request.Params)
+		s.auditMCPCall(r, principal, request.Params, callErr)
 		if callErr != nil {
 			writeJSON(w, http.StatusOK, mcpResponse{JSONRPC: "2.0", ID: request.ID, Result: map[string]any{
 				"content": []any{map[string]any{"type": "text", "text": callErr.Error()}}, "isError": true,
@@ -152,6 +153,45 @@ func (s *Server) authenticateMCPPrincipal(r *http.Request) (domain.Principal, er
 	}
 	return domain.Principal{UserID: user.ID, RealmID: user.RealmID, Username: user.Username,
 		PlatformAdmin: user.PlatformAdmin, RealmAdmin: realmAdmin, Scopes: scopes}, nil
+}
+
+// auditMCPCall records an agent reading people or relying parties.
+//
+// Nothing about this endpoint was recorded before, which left an operator with
+// no way to answer the question a disclosure prompts — was our directory read,
+// and by whom — and no trace of it going forward either. An agent acting on
+// somebody's behalf through a long-lived key is exactly the access an audit
+// obligation is about.
+//
+// Only the tools that return people and relying parties are recorded. Service
+// status is harmless and an agent may poll it, and filling a year of retention
+// with that would bury the entries worth finding. Refusals are recorded too:
+// an attempt that was turned away is the signal that somebody tried.
+func (s *Server) auditMCPCall(r *http.Request, principal domain.Principal, raw json.RawMessage, callErr error) {
+	var call struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &call); err != nil || call.Name == "" {
+		return
+	}
+	if !slices.Contains(auditedMCPTools, call.Name) {
+		return
+	}
+	outcome := "SUCCESS"
+	detail := map[string]any{"tool": call.Name}
+	if callErr != nil {
+		outcome = "FAILURE"
+		detail["refused"] = callErr.Error()
+	}
+	realmID := principal.RealmID
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "MCP_TOOL_CALL", outcome,
+		"tool", call.Name, detail)
+}
+
+// auditedMCPTools are the ones that return records about people or the relying
+// parties they sign in to. They are also the ones gated on admin:read.
+var auditedMCPTools = []string{
+	"resso_search_users", "resso_list_clients", "resso_list_realms", "resso_list_user_federations",
 }
 
 func (s *Server) writeMCPError(w http.ResponseWriter, id json.RawMessage, code int, message string, data any) {
