@@ -215,7 +215,7 @@ Realm 설정의 “팀장 검토·승인 프로세스 사용”이 켜진 경우
 4. Discovery, 로그인, Token, JWKS, UserInfo smoke test를 수행합니다.
 5. 문제가 있으면 이전 이미지로 Container를 되돌립니다.
 
-DB Migration은 기동 시 Advisory Lock 아래 자동 적용됩니다. Migration 적용 후 애플리케이션 이미지 롤백이 필요한 경우에는 릴리즈 노트의 DB 호환성을 먼저 확인해야 합니다.
+DB Migration은 기동 시 Advisory Lock 아래 자동 적용됩니다. Migration 적용 후 애플리케이션 이미지 롤백이 필요한 경우에는 릴리즈 노트의 DB 호환성을 먼저 확인해야 합니다. 각 릴리즈의 Upgrade notes에 직전 버전으로 되돌릴 수 있는지와, 되돌린 동안 적용되지 않는 설정이 무엇인지 적습니다.
 
 GitHub Release에 첨부되는 공식 오프라인 Docker 아카이브는 `linux/amd64` 전용입니다. ARM64 운영 환경은 대상 플랫폼에서 별도 이미지를 빌드하고 동일한 검증 절차를 수행해야 합니다.
 
