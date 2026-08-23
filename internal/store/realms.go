@@ -49,13 +49,46 @@ func invalidf(format string, arguments ...any) error {
 	return &MessagedError{Sentinel: ErrInvalidInput, Message: fmt.Sprintf(format, arguments...)}
 }
 
-// isUniqueViolation reports PostgreSQL's unique-constraint violation, which is
-// how a taken name arrives when it is not caught before the insert. Checking it
-// beforehand would still race, so the constraint stays the authority and this
-// only translates what it said.
-func isUniqueViolation(err error) bool {
+// takenValueMessages says what each unique constraint means when a write
+// collides with it. The names are read from the error PostgreSQL returns and
+// come from the migrations, listed here rather than guessed at the call site:
+// the users table alone has three, and answering an email collision with "that
+// username is taken" sends somebody to change a field that was never the
+// problem.
+//
+// The value the caller supplied is deliberately absent from these sentences.
+// Which value is at fault is exactly what the constraint decides, so pairing a
+// message with a value chosen by the call site is how the two come apart.
+var takenValueMessages = map[string]string{
+	"users_realm_id_username_key": "이미 사용 중인 사용자 이름입니다.",
+	"idx_users_realm_username_ci": "이미 사용 중인 사용자 이름입니다. 대소문자만 다른 이름도 같은 것으로 봅니다.",
+	// The plain UNIQUE(realm_id, email) from 001 was dropped by 003 in favour
+	// of this partial index, which lets more than one account have no email.
+	"idx_users_realm_email_ci":           "이 Realm의 다른 사용자가 이미 쓰고 있는 이메일 주소입니다.",
+	"realms_name_key":                    "이미 사용 중인 Realm 이름입니다.",
+	"realms_issuer_url_key":              "다른 Realm이 이미 쓰고 있는 Issuer URL입니다.",
+	"clients_realm_id_client_id_key":     "이미 사용 중인 Client ID입니다.",
+	"roles_realm_id_name_key":            "이 Realm에 이미 있는 Role 이름입니다.",
+	"client_roles_client_id_name_key":    "이 Client에 이미 있는 Role 이름입니다.",
+	"user_federations_realm_id_name_key": "이미 사용 중인 LDAP 공급자 이름입니다.",
+}
+
+// conflictFromUnique translates a unique-constraint violation into a sentence,
+// and reports whether the error was one at all.
+//
+// Looking the value up before the write would still race, so the constraint
+// stays the authority and this only says what it said. A constraint that is not
+// listed above still gets a readable answer, one that does not claim to know
+// which field it was.
+func conflictFromUnique(err error) (error, bool) {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		return nil, false
+	}
+	if message, known := takenValueMessages[pgErr.ConstraintName]; known {
+		return conflictf("%s", message), true
+	}
+	return conflictf("같은 값을 이미 쓰고 있는 항목이 있습니다."), true
 }
 
 // realmNamePattern mirrors the CHECK constraint on realms.name, so a name that
@@ -144,8 +177,8 @@ func (s *Store) CreateRealm(ctx context.Context, input CreateRealmInput) (domain
 	_, err = tx.Exec(ctx, `INSERT INTO realms(id,name,display_name,issuer_url,created_at,updated_at)
 		VALUES($1,$2,$3,$4,$5,$5)`, realm.ID, realm.Name, realm.DisplayName, realm.IssuerURL, now)
 	if err != nil {
-		if isUniqueViolation(err) {
-			return domain.Realm{}, conflictf("이미 사용 중인 Realm 이름 또는 Issuer URL입니다: %s", realm.Name)
+		if conflict, taken := conflictFromUnique(err); taken {
+			return domain.Realm{}, conflict
 		}
 		return domain.Realm{}, fmt.Errorf("create realm: %w", err)
 	}
@@ -228,6 +261,9 @@ func (s *Store) UpdateRealm(ctx context.Context, id uuid.UUID, input UpdateRealm
 		input.AccessTokenTTLSeconds, input.RefreshTokenTTLSeconds, input.SessionTTLSeconds,
 		input.PasswordMinLength, input.MaxLoginAttempts, input.LockoutSeconds, input.IdleTimeoutSeconds)
 	if err != nil {
+		if conflict, taken := conflictFromUnique(err); taken {
+			return domain.Realm{}, conflict
+		}
 		return domain.Realm{}, fmt.Errorf("update realm: %w", err)
 	}
 	return s.RealmByID(ctx, id)

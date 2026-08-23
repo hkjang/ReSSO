@@ -58,8 +58,8 @@ func (s *Store) CreateRole(ctx context.Context, realmID uuid.UUID, name, descrip
 	role := Role{ID: uuid.New(), RealmID: realmID, Name: name, Description: strings.TrimSpace(description), CreatedAt: now, UpdatedAt: now}
 	_, err := s.Pool.Exec(ctx, `INSERT INTO roles(id,realm_id,name,description,created_at,updated_at)
         VALUES($1,$2,$3,$4,$5,$5)`, role.ID, role.RealmID, role.Name, role.Description, now)
-	if isUniqueViolation(err) {
-		return Role{}, conflictf("이 Realm에 이미 있는 Role 이름입니다: %s", role.Name)
+	if conflict, taken := conflictFromUnique(err); taken {
+		return Role{}, conflict
 	}
 	return role, err
 }
@@ -146,8 +146,8 @@ func (s *Store) CreateClientRole(ctx context.Context, realmID, clientID uuid.UUI
 	}
 	_, err = s.Pool.Exec(ctx, `INSERT INTO client_roles(id,client_id,name,description,created_at)
 		VALUES($1,$2,$3,$4,$5)`, role.ID, clientID, role.Name, role.Description, role.CreatedAt)
-	if isUniqueViolation(err) {
-		return ClientRole{}, conflictf("이 Client에 이미 있는 Role 이름입니다: %s", role.Name)
+	if conflict, taken := conflictFromUnique(err); taken {
+		return ClientRole{}, conflict
 	}
 	return role, err
 }

@@ -2099,6 +2099,10 @@ func TestIntegrationTakenNamesAreExplainedNotDumped(t *testing.T) {
 	realmPath := "/api/admin/v1/realms/" + bootstrap.RealmID.String()
 
 	// Something for each collision to collide with.
+	if _, err := data.UpdateUser(ctx, bootstrap.AdminUserID, store.UpdateUserInput{
+		DisplayName: "Administrator", Email: "admin@example.test", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 	if status, body := post(realmPath+"/clients",
 		`{"client_id":"portal","name":"Portal","type":"public","redirect_uris":["https://portal.example.test/cb"]}`); status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("creating the first client answered %d %v", status, body)
@@ -2107,6 +2111,9 @@ func TestIntegrationTakenNamesAreExplainedNotDumped(t *testing.T) {
 		t.Fatalf("creating the first role answered %d %v", status, body)
 	}
 
+	// What each message has to name is the field the constraint decided was at
+	// fault, not the value the request carried — the value is the one thing the
+	// handler cannot know when a table has several unique constraints.
 	for _, collision := range []struct {
 		what, path, body string
 		wantStatus       int
@@ -2114,19 +2121,24 @@ func TestIntegrationTakenNamesAreExplainedNotDumped(t *testing.T) {
 	}{
 		{"a taken username", realmPath + "/users",
 			`{"username":"admin","password":"another-password-1234","enabled":true}`,
-			http.StatusConflict, "admin"},
+			http.StatusConflict, "사용자 이름"},
 		{"a taken client id", realmPath + "/clients",
 			`{"client_id":"portal","name":"Second","type":"public","redirect_uris":["https://second.example.test/cb"]}`,
-			http.StatusConflict, "portal"},
+			http.StatusConflict, "Client ID"},
 		{"a taken role name", realmPath + "/roles",
 			`{"name":"auditor","description":""}`,
-			http.StatusConflict, "auditor"},
+			http.StatusConflict, "Role 이름"},
 		{"a taken realm name", "/api/admin/v1/realms",
 			`{"name":"master","display_name":"Second","issuer_url":"https://second.example.test/realms/master"}`,
-			http.StatusConflict, "master"},
+			http.StatusConflict, "Realm 이름"},
 		{"a realm name that does not fit", "/api/admin/v1/realms",
 			`{"name":"My Realm","display_name":"Spaced","issuer_url":"https://spaced.example.test/realms/x"}`,
 			http.StatusBadRequest, "하이픈"},
+		// The same table, a different constraint: the message has to follow the
+		// constraint that fired rather than the field the handler knows about.
+		{"a taken email", realmPath + "/users",
+			`{"username":"someone-else","email":"admin@example.test","password":"another-password-1234","enabled":true}`,
+			http.StatusConflict, "이메일"},
 	} {
 		status, body := post(collision.path, collision.body)
 		message, _ := body["message"].(string)

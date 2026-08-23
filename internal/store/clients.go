@@ -137,6 +137,9 @@ func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClie
 		input.DefaultScopes, input.RequirePKCE, input.Enabled, input.AccessTokenTTLSeconds,
 		input.RefreshTokenTTLSeconds, backchannelURI)
 	if err != nil {
+		if conflict, taken := conflictFromUnique(err); taken {
+			return domain.Client{}, conflict
+		}
 		return domain.Client{}, fmt.Errorf("update client: %w", err)
 	}
 	if command.RowsAffected() == 0 {
@@ -196,8 +199,8 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 		client.RequirePKCE, client.AccessTokenTTLSeconds, client.RefreshTokenTTLSeconds,
 		client.BackchannelLogoutURI, client.CreatedAt)
 	if err != nil {
-		if isUniqueViolation(err) {
-			return CreatedClient{}, conflictf("이미 사용 중인 Client ID입니다: %s", client.ClientID)
+		if conflict, taken := conflictFromUnique(err); taken {
+			return CreatedClient{}, conflict
 		}
 		return CreatedClient{}, fmt.Errorf("create client: %w", err)
 	}

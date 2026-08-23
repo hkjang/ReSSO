@@ -195,6 +195,9 @@ func (s *Store) CreateLDAPFederation(ctx context.Context, realmID uuid.UUID, inp
 		provider.MemberOfLDAPAttribute, mappings, provider.ImportEnabled, provider.SyncRegistrations,
 		provider.MissingUserAction, provider.EditMode, provider.BatchSize, provider.SyncPeriodSeconds)
 	if err != nil {
+		if conflict, taken := conflictFromUnique(err); taken {
+			return domain.LDAPFederation{}, conflict
+		}
 		return domain.LDAPFederation{}, fmt.Errorf("create LDAP federation: %w", err)
 	}
 	return s.LDAPFederationByID(ctx, id)
@@ -239,6 +242,9 @@ func (s *Store) UpdateLDAPFederation(ctx context.Context, id uuid.UUID, input LD
 		provider.MemberOfLDAPAttribute, mappings, provider.ImportEnabled, provider.SyncRegistrations,
 		provider.MissingUserAction, provider.EditMode, provider.BatchSize, provider.SyncPeriodSeconds)
 	if err != nil {
+		if conflict, taken := conflictFromUnique(err); taken {
+			return domain.LDAPFederation{}, conflict
+		}
 		return domain.LDAPFederation{}, fmt.Errorf("update LDAP federation: %w", err)
 	}
 	if command.RowsAffected() == 0 {

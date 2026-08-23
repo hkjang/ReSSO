@@ -3408,3 +3408,102 @@ func TestIntegrationRefreshRotationAsksTheDatabaseForTheTime(t *testing.T) {
 			"which means the measurement is wrong rather than the clocks", skew)
 	}
 }
+
+// Which value is at fault is what the constraint decides, so the message has
+// to be chosen from the constraint that fired. The users table alone carries
+// three, and answering an email collision with "that username is taken" sends
+// somebody to change a field that was never the problem — which is what the
+// first pass at this did, by mapping any unique violation on a create to the
+// one field the call site happened to know about.
+func TestIntegrationTakenValuesNameTheFieldThatCollided(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm := bootstrap.RealmID
+
+	// Every constraint the table above claims to know must exist, or its entry
+	// quietly stops applying and the vague fallback takes over instead.
+	for name := range takenValueMessages {
+		var exists bool
+		if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(
+			SELECT 1 FROM pg_constraint WHERE conname=$1
+			UNION ALL
+			SELECT 1 FROM pg_indexes WHERE indexname=$1 AND schemaname=current_schema())`,
+			name).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if !exists {
+			t.Errorf("takenValueMessages names %q, which this schema does not have", name)
+		}
+	}
+
+	if _, err := data.CreateUser(ctx, realm, CreateUserInput{Username: "alice",
+		Email: "shared@example.test", Password: "probe-password-1234", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	carol, err := data.CreateUser(ctx, realm, CreateUserInput{Username: "carol",
+		Email: "carol@example.test", Password: "probe-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := data.CreateRealm(ctx, CreateRealmInput{Name: "second", DisplayName: "Second",
+		IssuerURL: "https://second.example.test/realms/second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	master, err := data.RealmByID(ctx, realm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmPolicy := func(issuer string) UpdateRealmInput {
+		return UpdateRealmInput{DisplayName: "Second", IssuerURL: issuer, Enabled: true,
+			AccessTokenTTLSeconds: 300, RefreshTokenTTLSeconds: 1800, SessionTTLSeconds: 28800,
+			PasswordMinLength: 12, MaxLoginAttempts: 5, LockoutSeconds: 900}
+	}
+
+	for _, collision := range []struct {
+		what   string
+		do     func() error
+		expect string
+	}{
+		{"a taken username", func() error {
+			_, err := data.CreateUser(ctx, realm, CreateUserInput{Username: "alice",
+				Password: "probe-password-1234", Enabled: true})
+			return err
+		}, "사용자 이름"},
+		{"a username differing only in case", func() error {
+			_, err := data.CreateUser(ctx, realm, CreateUserInput{Username: "ALICE",
+				Password: "probe-password-1234", Enabled: true})
+			return err
+		}, "사용자 이름"},
+		{"a taken email on create", func() error {
+			_, err := data.CreateUser(ctx, realm, CreateUserInput{Username: "bob",
+				Email: "shared@example.test", Password: "probe-password-1234", Enabled: true})
+			return err
+		}, "이메일"},
+		{"a taken email on update", func() error {
+			_, err := data.UpdateUser(ctx, carol.ID, UpdateUserInput{DisplayName: "Carol",
+				Email: "shared@example.test", Enabled: true})
+			return err
+		}, "이메일"},
+		{"a taken issuer URL on update", func() error {
+			_, err := data.UpdateRealm(ctx, other.ID, realmPolicy(master.IssuerURL))
+			return err
+		}, "Issuer URL"},
+	} {
+		err := collision.do()
+		if !errors.Is(err, ErrConflict) {
+			t.Errorf("%s returned %v, want a conflict", collision.what, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), collision.expect) {
+			t.Errorf("%s was reported as %q, which does not name %s",
+				collision.what, err.Error(), collision.expect)
+		}
+	}
+
+	// The value that was free still goes in, so this bounds the refusal.
+	if _, err := data.UpdateRealm(ctx, other.ID, realmPolicy("https://third.example.test/realms/second")); err != nil {
+		t.Errorf("a free issuer URL was refused: %v", err)
+	}
+}

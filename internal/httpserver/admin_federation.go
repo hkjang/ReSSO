@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -48,6 +49,10 @@ func (s *Server) adminCreateLDAPFederation(w http.ResponseWriter, r *http.Reques
 	}
 	item, err := s.store.CreateLDAPFederation(r.Context(), realmID, input)
 	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeStoreError(w, r, err)
+			return
+		}
 		writeError(w, r, http.StatusBadRequest, "ldap_federation_creation_failed", err.Error())
 		return
 	}
@@ -73,6 +78,10 @@ func (s *Server) adminUpdateLDAPFederation(w http.ResponseWriter, r *http.Reques
 	}
 	item, err := s.store.UpdateLDAPFederation(r.Context(), federationID, input)
 	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeStoreError(w, r, err)
+			return
+		}
 		writeError(w, r, http.StatusBadRequest, "ldap_federation_update_failed", err.Error())
 		return
 	}

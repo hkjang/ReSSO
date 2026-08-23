@@ -229,6 +229,10 @@ func (s *Server) adminUpdateRealm(w http.ResponseWriter, r *http.Request) {
 	}
 	realm, err := s.store.UpdateRealm(r.Context(), id, input)
 	if err != nil {
+		if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrInvalidInput) {
+			writeStoreError(w, r, err)
+			return
+		}
 		writeError(w, r, http.StatusBadRequest, "realm_update_failed", err.Error())
 		return
 	}

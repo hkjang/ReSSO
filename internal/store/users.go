@@ -176,8 +176,8 @@ func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateU
 		manager_id,password_changed_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$10)`,
 		user.ID, realmID, user.Username, user.Email, user.EmailVerified, user.DisplayName, hashed, user.Enabled, user.ManagerID, now)
 	if err != nil {
-		if isUniqueViolation(err) {
-			return domain.User{}, conflictf("이미 사용 중인 사용자 이름입니다: %s", user.Username)
+		if conflict, taken := conflictFromUnique(err); taken {
+			return domain.User{}, conflict
 		}
 		return domain.User{}, fmt.Errorf("create user: %w", err)
 	}
@@ -224,6 +224,9 @@ func (s *Store) UpdateUser(ctx context.Context, userID uuid.UUID, input UpdateUs
 		email=$2,display_name=$3,enabled=$4,
 		manager_id=$5,updated_at=now() WHERE id=$1`, userID, email, displayName, input.Enabled, input.ManagerID, input.EmailVerified, emailChanged)
 	if err != nil {
+		if conflict, taken := conflictFromUnique(err); taken {
+			return domain.User{}, conflict
+		}
 		return domain.User{}, fmt.Errorf("update user: %w", err)
 	}
 	if command.RowsAffected() == 0 {
@@ -262,6 +265,9 @@ func (s *Store) UpdateProfile(ctx context.Context, userID uuid.UUID, input Updat
 		email=$2,display_name=$3,updated_at=now() WHERE id=$1`,
 		userID, email, displayName, emailChanged)
 	if err != nil {
+		if conflict, taken := conflictFromUnique(err); taken {
+			return domain.User{}, conflict
+		}
 		return domain.User{}, fmt.Errorf("update profile: %w", err)
 	}
 	return s.UserByID(ctx, userID)
