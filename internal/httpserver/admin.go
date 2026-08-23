@@ -130,12 +130,24 @@ func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err)
 		return
 	}
+	// Reported rather than judged here: a difference between the two clocks
+	// shifts every session and token lifetime by its size, and the refresh
+	// rotation grace is where it stops being a shift and starts signing people
+	// out — so that window is the threshold worth naming.
+	skew, roundTrip, skewErr := s.store.ClockSkew(r.Context())
+	if skewErr != nil {
+		s.logger.Warn("clock difference could not be measured",
+			"trace_id", traceIDFrom(r.Context()), "error", skewErr)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"realms": counts.Realms, "users": counts.Users,
 		"clients": counts.Clients, "active_sessions": counts.ActiveSessions, "pending_approvals": counts.PendingApprovals,
 		"readiness": map[string]any{"issuer_https": readiness.IssuerHTTPS, "signing_keys_ready": readiness.SigningKeysReady,
 			"federation_failures": readiness.FederationFailures, "locked_users": readiness.LockedUsers,
 			"expiring_api_keys": readiness.ExpiringAPIKeys, "aging_signing_keys": readiness.AgingSigningKeys,
-			"signing_key_advisory_days": signingKeyAdvisoryDays}})
+			"signing_key_advisory_days":   signingKeyAdvisoryDays,
+			"clock_skew_seconds":          skew.Seconds(),
+			"clock_skew_round_trip_ms":    roundTrip.Milliseconds(),
+			"clock_skew_advisory_seconds": store.RefreshRotationGrace.Seconds()}})
 }
 
 func (s *Server) adminListRealms(w http.ResponseWriter, r *http.Request) {

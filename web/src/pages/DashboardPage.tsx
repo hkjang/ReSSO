@@ -11,7 +11,7 @@ import { api } from '../lib/api'
 import { PageHeader, ContentCard } from '../components/Page'
 import { ErrorAlert, PageLoading } from '../components/Feedback'
 
-interface DashboardData { realms: number; users: number; clients: number; active_sessions: number; pending_approvals: number; readiness: { issuer_https: boolean; signing_keys_ready: boolean; federation_failures: number; locked_users: number; expiring_api_keys: number; aging_signing_keys: number; signing_key_advisory_days: number } }
+interface DashboardData { realms: number; users: number; clients: number; active_sessions: number; pending_approvals: number; readiness: { issuer_https: boolean; signing_keys_ready: boolean; federation_failures: number; locked_users: number; expiring_api_keys: number; aging_signing_keys: number; signing_key_advisory_days: number; clock_skew_seconds: number; clock_skew_round_trip_ms: number; clock_skew_advisory_seconds: number } }
 
 export function DashboardPage() {
   const query = useQuery({ queryKey: ['dashboard'], queryFn: () => api<DashboardData>('/api/admin/v1/dashboard'), refetchInterval: 30_000 })
@@ -33,6 +33,10 @@ export function DashboardPage() {
     { label: '잠긴 사용자', ready: (query.data?.readiness.locked_users ?? 0) === 0, detail: `${query.data?.readiness.locked_users ?? 0}명`, to: '/admin/users', action: '잠긴 사용자 보기' },
     { label: '7일 내 API 키 만료', ready: (query.data?.readiness.expiring_api_keys ?? 0) === 0, detail: `${query.data?.readiness.expiring_api_keys ?? 0}개`, to: '/admin/audit', action: '감사 이벤트 확인' },
     { label: `${query.data?.readiness.signing_key_advisory_days ?? 180}일 초과 서명 키`, ready: (query.data?.readiness.aging_signing_keys ?? 0) === 0, detail: `${query.data?.readiness.aging_signing_keys ?? 0}개`, to: '/admin/keys', action: '서명 키 회전' },
+    // Two clocks. Their difference shifts every session and token lifetime by
+    // its size, and past the refresh rotation grace it starts signing people
+    // out of relying parties, so that window is the threshold.
+    { label: '서버·데이터베이스 시각 차이', ready: Math.abs(query.data?.readiness.clock_skew_seconds ?? 0) < (query.data?.readiness.clock_skew_advisory_seconds ?? 30), detail: `${(query.data?.readiness.clock_skew_seconds ?? 0).toFixed(1)}초 (측정 오차 ±${query.data?.readiness.clock_skew_round_trip_ms ?? 0}ms)`, to: '/admin/audit', action: '시각 동기화 확인' },
   ]
   return (
     <>

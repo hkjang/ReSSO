@@ -229,6 +229,10 @@ var ErrTokenReuse = errors.New("refresh token reuse detected")
 // revoked token — are treated as reuse.
 const refreshRotationGrace = 30 * time.Second
 
+// RefreshRotationGrace is the window above, exported so the console can say
+// why a difference between the two clocks of that size begins to matter.
+const RefreshRotationGrace = refreshRotationGrace
+
 // RotateRefreshToken enforces one-time use outside refreshRotationGrace. Reuse
 // revokes the entire token family so a stolen older token cannot silently
 // maintain persistence.
@@ -239,26 +243,39 @@ func (s *Store) RotateRefreshToken(ctx context.Context, raw string, reducedScope
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var old RefreshToken
-	var rotatedAt, revokedAt *time.Time
+	var used, withinGrace, expired bool
+	// The grace window and the expiry are decided by the database, because the
+	// timestamps they are measured against were written by the database.
+	// Comparing rotated_at against this process's clock made the answer depend
+	// on the difference between two clocks: run more than the grace window
+	// ahead of PostgreSQL and every legitimate retry inside it reads as a
+	// replayed token — the family is revoked, the person is signed out of that
+	// relying party, and REFRESH_TOKEN_REUSE records an incident that never
+	// happened. ReSSO is built to run offline, where there is often no time
+	// source to keep the two in step. InspectRefreshToken and sessionIsLive
+	// already ask the database; this makes the third path agree with them.
 	err = tx.QueryRow(ctx, `SELECT id,family_id,parent_id,realm_id,client_id,user_id,session_id,scope,
-        expires_at,rotated_at,revoked_at FROM refresh_tokens WHERE token_hash=ANY($1::bytea[]) FOR UPDATE`, s.Sealer.Digests(raw)).Scan(
+        expires_at,(rotated_at IS NOT NULL OR revoked_at IS NOT NULL),
+        (rotated_at IS NOT NULL AND revoked_at IS NULL AND rotated_at > now()-make_interval(secs => $2)),
+        expires_at <= now()
+        FROM refresh_tokens WHERE token_hash=ANY($1::bytea[]) FOR UPDATE`,
+		s.Sealer.Digests(raw), refreshRotationGrace.Seconds()).Scan(
 		&old.ID, &old.FamilyID, &old.ParentID, &old.RealmID, &old.ClientID, &old.UserID,
-		&old.SessionID, &old.Scope, &old.ExpiresAt, &rotatedAt, &revokedAt)
+		&old.SessionID, &old.Scope, &old.ExpiresAt, &used, &withinGrace, &expired)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RefreshToken{}, "", ErrNotFound
 	}
 	if err != nil {
 		return RefreshToken{}, "", err
 	}
-	withinGrace := rotatedAt != nil && revokedAt == nil && time.Since(*rotatedAt) <= refreshRotationGrace
-	if (rotatedAt != nil || revokedAt != nil) && !withinGrace {
+	if used && !withinGrace {
 		_, _ = tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE family_id=$1`, old.FamilyID)
 		if err := tx.Commit(ctx); err != nil {
 			return RefreshToken{}, "", err
 		}
 		return RefreshToken{}, "", ErrTokenReuse
 	}
-	if old.ExpiresAt.Before(time.Now().UTC()) {
+	if expired {
 		return RefreshToken{}, "", ErrNotFound
 	}
 	if old.SessionID != nil {

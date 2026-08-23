@@ -3317,3 +3317,94 @@ func TestIntegrationSyncReportsWhenItsOwnOutcomeIsNotRecorded(t *testing.T) {
 		t.Errorf("the blocked writes did not stay blocked: status=%s events=%d", status, events)
 	}
 }
+
+// The refresh rotation grace decides whether a token presented twice is a
+// legitimate retry or a replay, and the timestamp it is measured from is
+// written by the database. Measuring it against this process's clock made the
+// answer depend on the difference between two clocks: run more than the grace
+// ahead of PostgreSQL and every retry inside the window reads as a replay —
+// the family is revoked, the person is signed out of that relying party, and
+// REFRESH_TOKEN_REUSE records an incident that never happened. ReSSO runs
+// offline, where there is often nothing keeping the two in step.
+//
+// A single clock cannot demonstrate the difference, so what is pinned here is
+// that both decisions come from the database: the boundary is moved by writing
+// rotated_at and expires_at with the database's own now(), which is the one
+// reading a process-clock implementation cannot be trusted to agree with.
+func TestIntegrationRefreshRotationAsksTheDatabaseForTheTime(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	client, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "clock-probe", Name: "Clock Probe", Type: "confidential",
+		RedirectURIs: []string{"https://probe.example.test/cb"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "clock-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, sessionID := bootstrap.AdminUserID, session.Session.ID
+	issue := func() string {
+		t.Helper()
+		raw, issueErr := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID,
+			ClientID: client.Client.ID, UserID: &userID, SessionID: &sessionID,
+			Scope: []string{"openid"}, ExpiresAt: time.Now().UTC().Add(time.Hour)})
+		if issueErr != nil {
+			t.Fatal(issueErr)
+		}
+		return raw
+	}
+	// Both timestamps are moved with the database's own now(), so the value the
+	// decision is measured against and the reading it is compared to come from
+	// the same clock — which is the whole point.
+	setRotatedAgo := func(raw string, seconds int) {
+		t.Helper()
+		if _, err := data.Pool.Exec(ctx, `UPDATE refresh_tokens
+			SET rotated_at=now()-make_interval(secs => $2) WHERE token_hash=ANY($1::bytea[])`,
+			data.Sealer.Digests(raw), seconds); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Rotated a moment ago: a retry inside the grace window is served, and the
+	// family survives.
+	inGrace := issue()
+	setRotatedAgo(inGrace, 2)
+	if _, _, err := data.RotateRefreshToken(ctx, inGrace, nil); err != nil {
+		t.Fatalf("a retry two seconds after the rotation was refused: %v", err)
+	}
+
+	// Rotated well outside it: the same presentation is a replay.
+	stale := issue()
+	setRotatedAgo(stale, int(RefreshRotationGrace.Seconds())+10)
+	if _, _, err := data.RotateRefreshToken(ctx, stale, nil); !errors.Is(err, ErrTokenReuse) {
+		t.Fatalf("a token rotated outside the grace window returned %v, want ErrTokenReuse", err)
+	}
+
+	// Expiry is the database's reading too.
+	expired := issue()
+	if _, err := data.Pool.Exec(ctx, `UPDATE refresh_tokens SET expires_at=now()-interval '1 second'
+		WHERE token_hash=ANY($1::bytea[])`, data.Sealer.Digests(expired)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := data.RotateRefreshToken(ctx, expired, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("an expired token returned %v, want ErrNotFound", err)
+	}
+
+	// And the difference between the two clocks is reported rather than left to
+	// be discovered as a handful of unrelated oddities.
+	skew, roundTrip, err := data.ClockSkew(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip <= 0 {
+		t.Errorf("the reading reported no round trip, so its uncertainty is unstated")
+	}
+	if skew > time.Minute || skew < -time.Minute {
+		t.Errorf("this machine reports %v of difference from its own PostgreSQL, "+
+			"which means the measurement is wrong rather than the clocks", skew)
+	}
+}
