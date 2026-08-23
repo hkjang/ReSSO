@@ -3613,3 +3613,70 @@ func TestIntegrationRealmPolicyBoundsAgreeEverywhere(t *testing.T) {
 		t.Errorf("only %d of %d documented policy rows were found to check", checked, len(settings))
 	}
 }
+
+// A rate limiter that cannot work must not answer that everything is fine.
+// The three entry points each derived Allowed from a zero decision and reached
+// three different conclusions from the same unusable settings — and a window of
+// zero, which turns the limiter off outright, came back allowed from all three:
+//
+//	maximum 0        consume=true   check=false  record=false
+//	window 0         consume=true   check=true   record=true
+//
+// The values come from literals in the handlers rather than from
+// configuration, so reaching this is a mistake in the code. Failing the request
+// is how such a mistake gets found, instead of running with the throttle in
+// front of password hashing silently absent.
+func TestIntegrationLoginLimiterRefusesToRunWithoutUsableSettings(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	_ = bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+
+	for _, unusable := range []struct {
+		what    string
+		maximum int
+		window  time.Duration
+	}{
+		{"a maximum of zero", 0, time.Minute},
+		{"a negative maximum", -1, time.Minute},
+		{"no window at all", 5, 0},
+		{"a negative window", 5, -time.Minute},
+	} {
+		bucket := "limiter-probe/" + unusable.what
+		for name, call := range map[string]func() (RateLimitDecision, error){
+			"ConsumeLoginRateLimit": func() (RateLimitDecision, error) {
+				return data.ConsumeLoginRateLimit(ctx, bucket, unusable.maximum, unusable.window)
+			},
+			"CheckLoginRateLimit": func() (RateLimitDecision, error) {
+				return data.CheckLoginRateLimit(ctx, bucket, unusable.maximum, unusable.window)
+			},
+			"RecordLoginFailure": func() (RateLimitDecision, error) {
+				return data.RecordLoginFailure(ctx, bucket, unusable.maximum, unusable.window)
+			},
+		} {
+			decision, err := call()
+			if !errors.Is(err, ErrInvalidInput) {
+				t.Errorf("%s with %s returned %v, want it refused", name, unusable.what, err)
+			}
+			if decision.Allowed {
+				t.Errorf("%s with %s allowed the attempt anyway", name, unusable.what)
+			}
+		}
+	}
+
+	// Usable settings still count, so this bounds the refusal rather than
+	// disabling the limiter from the other direction.
+	bucket := "limiter-probe/usable"
+	for attempt := 1; attempt <= 2; attempt++ {
+		decision, err := data.RecordLoginFailure(ctx, bucket, 3, time.Minute)
+		if err != nil || !decision.Allowed || decision.Attempts != attempt {
+			t.Fatalf("failure %d recorded %+v, err=%v", attempt, decision, err)
+		}
+	}
+	decision, err := data.RecordLoginFailure(ctx, bucket, 3, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Allowed || decision.RetryAfterSeconds < 1 {
+		t.Errorf("reaching the maximum reported %+v, want it limited with a wait", decision)
+	}
+}

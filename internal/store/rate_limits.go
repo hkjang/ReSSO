@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"time"
 )
@@ -18,24 +19,33 @@ type RateLimitDecision struct {
 // It is intended for coarse IP throttling before authentication work begins.
 func (s *Store) ConsumeLoginRateLimit(ctx context.Context, bucket string, maximum int, window time.Duration) (RateLimitDecision, error) {
 	decision, err := s.recordLoginRateLimit(ctx, bucket, maximum, window)
+	if err != nil {
+		return RateLimitDecision{}, err
+	}
 	decision.Allowed = decision.Attempts <= maximum
-	return decision, err
+	return decision, nil
 }
 
 // CheckLoginRateLimit checks a failure bucket without consuming an attempt.
 // Expired and missing buckets are allowed.
 func (s *Store) CheckLoginRateLimit(ctx context.Context, bucket string, maximum int, window time.Duration) (RateLimitDecision, error) {
 	decision, err := s.mutateLoginRateLimit(ctx, bucket, maximum, window, 0)
+	if err != nil {
+		return RateLimitDecision{}, err
+	}
 	decision.Allowed = decision.Attempts < maximum
-	return decision, err
+	return decision, nil
 }
 
 // RecordLoginFailure increments an account failure bucket. Reaching the
 // configured maximum limits the current response and subsequent attempts.
 func (s *Store) RecordLoginFailure(ctx context.Context, bucket string, maximum int, window time.Duration) (RateLimitDecision, error) {
 	decision, err := s.recordLoginRateLimit(ctx, bucket, maximum, window)
+	if err != nil {
+		return RateLimitDecision{}, err
+	}
 	decision.Allowed = decision.Attempts < maximum
-	return decision, err
+	return decision, nil
 }
 
 func (s *Store) ResetLoginRateLimit(ctx context.Context, bucket string) error {
@@ -53,16 +63,6 @@ func (s *Store) ResetLoginRateLimit(ctx context.Context, bucket string) error {
 	return tx.Commit(ctx)
 }
 
-// AllowLoginAttempt remains as a compatibility wrapper for callers that want
-// the original count-every-request behavior.
-func (s *Store) AllowLoginAttempt(ctx context.Context, bucket string, maximum int, window time.Duration) (bool, error) {
-	if _, ok := rateLimitSeconds(maximum, window); !ok {
-		return false, nil
-	}
-	decision, err := s.ConsumeLoginRateLimit(ctx, bucket, maximum, window)
-	return decision.Allowed, err
-}
-
 func (s *Store) recordLoginRateLimit(ctx context.Context, bucket string, maximum int, window time.Duration) (RateLimitDecision, error) {
 	return s.mutateLoginRateLimit(ctx, bucket, maximum, window, 1)
 }
@@ -73,7 +73,17 @@ func (s *Store) recordLoginRateLimit(ctx context.Context, bucket string, maximum
 func (s *Store) mutateLoginRateLimit(ctx context.Context, bucket string, maximum int, window time.Duration, increment int) (RateLimitDecision, error) {
 	seconds, ok := rateLimitSeconds(maximum, window)
 	if !ok {
-		return RateLimitDecision{}, nil
+		// A limiter that cannot work must not answer that everything is fine.
+		// The three callers derived Allowed from a zero decision and reached
+		// three different conclusions from the same unusable settings — and a
+		// window of zero, which turns the limiter off outright, came back
+		// allowed from all three. These values come from literals in the
+		// handlers rather than from configuration, so this is a mistake in the
+		// code, and failing the request is how it gets found instead of
+		// running with the throttle silently absent.
+		return RateLimitDecision{}, fmt.Errorf(
+			"%w: login rate limit needs a maximum of at least 1 and a positive window, got %d and %s",
+			ErrInvalidInput, maximum, window)
 	}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
