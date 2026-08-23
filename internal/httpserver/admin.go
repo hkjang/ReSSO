@@ -190,6 +190,10 @@ func (s *Server) adminCreateRealm(w http.ResponseWriter, r *http.Request) {
 	}
 	realm, err := s.store.CreateRealm(r.Context(), input)
 	if err != nil {
+		if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrInvalidInput) {
+			writeStoreError(w, r, err)
+			return
+		}
 		writeError(w, r, http.StatusBadRequest, "realm_creation_failed", err.Error())
 		return
 	}
@@ -264,6 +268,10 @@ func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 	user, err := s.store.CreateUser(r.Context(), realmID, input)
 	if err != nil {
 		if errors.Is(err, store.ErrInvalidInput) {
+			writeStoreError(w, r, err)
+			return
+		}
+		if errors.Is(err, store.ErrConflict) {
 			writeStoreError(w, r, err)
 			return
 		}
@@ -388,6 +396,10 @@ func (s *Server) adminCreateClient(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := s.store.CreateClient(r.Context(), realmID, input)
 	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeStoreError(w, r, err)
+			return
+		}
 		writeError(w, r, http.StatusBadRequest, "client_creation_failed", err.Error())
 		return
 	}
@@ -478,6 +490,10 @@ func (s *Server) adminCreateRole(w http.ResponseWriter, r *http.Request) {
 	}
 	role, err := s.store.CreateRole(r.Context(), realmID, input.Name, input.Description)
 	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeStoreError(w, r, err)
+			return
+		}
 		writeError(w, r, http.StatusBadRequest, "role_creation_failed", err.Error())
 		return
 	}
@@ -569,6 +585,10 @@ func (s *Server) adminCreateClientRole(w http.ResponseWriter, r *http.Request) {
 	}
 	role, err := s.store.CreateClientRole(r.Context(), realmID, clientID, input.Name, input.Description)
 	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeStoreError(w, r, err)
+			return
+		}
 		writeError(w, r, http.StatusBadRequest, "client_role_creation_failed", err.Error())
 		return
 	}

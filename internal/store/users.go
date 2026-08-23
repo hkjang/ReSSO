@@ -176,6 +176,9 @@ func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateU
 		manager_id,password_changed_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$10)`,
 		user.ID, realmID, user.Username, user.Email, user.EmailVerified, user.DisplayName, hashed, user.Enabled, user.ManagerID, now)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return domain.User{}, conflictf("이미 사용 중인 사용자 이름입니다: %s", user.Username)
+		}
 		return domain.User{}, fmt.Errorf("create user: %w", err)
 	}
 	_, _ = s.Pool.Exec(ctx, `INSERT INTO user_roles(user_id,role_id)

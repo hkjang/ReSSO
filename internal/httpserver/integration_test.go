@@ -2046,3 +2046,107 @@ func TestIntegrationLogoutRecordsASessionItCouldNotEnd(t *testing.T) {
 		}
 	}
 }
+
+// Naming collisions are the most ordinary mistake an administrator makes, and
+// every one of them reached the console as the raw constraint violation —
+// `duplicate key value violates unique constraint "clients_realm_id_client_id_key"
+// (SQLSTATE 23505)`. A Realm name that did not fit its shape arrived the same
+// way, from a CHECK constraint, while the console's own form states that rule
+// in its helper text and only a browser was enforcing it. The policy numbers
+// beside these fields already got the opposite treatment, and say so in the
+// comment above realmPolicyBounds.
+func TestIntegrationTakenNamesAreExplainedNotDumped(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := &http.Client{Jar: jar}
+	response := postIntegrationLogin(t, browser, server.URL, "admin", "bootstrap-password-123")
+	var login struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&login); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+
+	post := func(path, body string) (int, map[string]any) {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodPost, server.URL+path, strings.NewReader(body))
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", login.CSRFToken)
+		result, doErr := browser.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer result.Body.Close()
+		var decoded map[string]any
+		_ = json.NewDecoder(result.Body).Decode(&decoded)
+		return result.StatusCode, decoded
+	}
+	realmPath := "/api/admin/v1/realms/" + bootstrap.RealmID.String()
+
+	// Something for each collision to collide with.
+	if status, body := post(realmPath+"/clients",
+		`{"client_id":"portal","name":"Portal","type":"public","redirect_uris":["https://portal.example.test/cb"]}`); status != http.StatusCreated && status != http.StatusOK {
+		t.Fatalf("creating the first client answered %d %v", status, body)
+	}
+	if status, body := post(realmPath+"/roles", `{"name":"auditor","description":""}`); status != http.StatusCreated && status != http.StatusOK {
+		t.Fatalf("creating the first role answered %d %v", status, body)
+	}
+
+	for _, collision := range []struct {
+		what, path, body string
+		wantStatus       int
+		wantIn           string
+	}{
+		{"a taken username", realmPath + "/users",
+			`{"username":"admin","password":"another-password-1234","enabled":true}`,
+			http.StatusConflict, "admin"},
+		{"a taken client id", realmPath + "/clients",
+			`{"client_id":"portal","name":"Second","type":"public","redirect_uris":["https://second.example.test/cb"]}`,
+			http.StatusConflict, "portal"},
+		{"a taken role name", realmPath + "/roles",
+			`{"name":"auditor","description":""}`,
+			http.StatusConflict, "auditor"},
+		{"a taken realm name", "/api/admin/v1/realms",
+			`{"name":"master","display_name":"Second","issuer_url":"https://second.example.test/realms/master"}`,
+			http.StatusConflict, "master"},
+		{"a realm name that does not fit", "/api/admin/v1/realms",
+			`{"name":"My Realm","display_name":"Spaced","issuer_url":"https://spaced.example.test/realms/x"}`,
+			http.StatusBadRequest, "하이픈"},
+	} {
+		status, body := post(collision.path, collision.body)
+		message, _ := body["message"].(string)
+		if status != collision.wantStatus {
+			t.Errorf("%s answered %d, want %d (%v)", collision.what, status, collision.wantStatus, body)
+		}
+		if !strings.Contains(message, collision.wantIn) {
+			t.Errorf("%s did not say what the problem was: %q", collision.what, message)
+		}
+		// Whatever the message says, it must not be the database saying it.
+		for _, leak := range []string{"SQLSTATE", "constraint", "violates", "pq:", "ERROR:"} {
+			if strings.Contains(message, leak) {
+				t.Errorf("%s leaked database text (%q): %q", collision.what, leak, message)
+			}
+		}
+	}
+
+	// A name that is free still works, so this bounds the refusal rather than
+	// widening it.
+	if status, body := post(realmPath+"/roles", `{"name":"reviewer","description":""}`); status >= 400 {
+		t.Errorf("creating a role with a free name answered %d %v", status, body)
+	}
+}

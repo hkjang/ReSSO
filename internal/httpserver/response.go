@@ -26,13 +26,26 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, messag
 }
 
 func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
+	// A store.MessagedError carries a sentence written for the reader; only
+	// those are passed through, so no database text can reach the response by
+	// this route.
+	var messaged *store.MessagedError
+	explained := errors.As(err, &messaged)
 	switch {
 	case errors.Is(err, store.ErrInvalidInput):
-		writeError(w, r, http.StatusBadRequest, "invalid_input", "입력값이 올바르지 않습니다.")
+		message := "입력값이 올바르지 않습니다."
+		if explained {
+			message = messaged.Message
+		}
+		writeError(w, r, http.StatusBadRequest, "invalid_input", message)
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, r, http.StatusNotFound, "not_found", "요청한 항목을 찾을 수 없습니다.")
 	case errors.Is(err, store.ErrConflict):
-		writeError(w, r, http.StatusConflict, "conflict", "동일한 항목이 이미 존재합니다.")
+		message := "동일한 항목이 이미 존재합니다."
+		if explained {
+			message = messaged.Message
+		}
+		writeError(w, r, http.StatusConflict, "conflict", message)
 	default:
 		writeError(w, r, http.StatusInternalServerError, "internal_error", "요청을 처리하지 못했습니다.")
 	}

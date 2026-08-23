@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/hkjang/ReSSO/internal/domain"
 )
@@ -17,6 +19,49 @@ import (
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
 var ErrInvalidInput = errors.New("invalid input")
+
+// MessagedError carries a sentence written for the person who will read it,
+// alongside the sentinel that decides the status code.
+//
+// Creating something with a name that is taken, or a Realm name that does not
+// fit the shape, reached the console as the raw constraint violation —
+// `duplicate key value violates unique constraint "clients_realm_id_client_id_key"
+// (SQLSTATE 23505)` — for every one of user, client, role and Realm. Naming
+// collisions are the most ordinary mistake an administrator makes, so that was
+// the most likely error in the product to be answered with an internal
+// constraint name. The policy numbers next to these fields already got the
+// opposite treatment, and say so in the comment above realmPolicyBounds.
+type MessagedError struct {
+	Sentinel error
+	Message  string
+}
+
+func (e *MessagedError) Error() string { return e.Message }
+func (e *MessagedError) Unwrap() error { return e.Sentinel }
+
+// conflictf reports that a value is already taken, in words.
+func conflictf(format string, arguments ...any) error {
+	return &MessagedError{Sentinel: ErrConflict, Message: fmt.Sprintf(format, arguments...)}
+}
+
+// invalidf reports a value that cannot be stored, in words.
+func invalidf(format string, arguments ...any) error {
+	return &MessagedError{Sentinel: ErrInvalidInput, Message: fmt.Sprintf(format, arguments...)}
+}
+
+// isUniqueViolation reports PostgreSQL's unique-constraint violation, which is
+// how a taken name arrives when it is not caught before the insert. Checking it
+// beforehand would still race, so the constraint stays the authority and this
+// only translates what it said.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// realmNamePattern mirrors the CHECK constraint on realms.name, so a name that
+// does not fit is reported as the rule it broke. The console's own form states
+// this rule in its helper text while only a browser was enforcing it.
+var realmNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 // ErrInvalidManager marks a rejected reporting line. It is distinct from a
 // generic invalid input so the console can say which field is wrong and why,
@@ -81,6 +126,10 @@ func (s *Store) CreateRealm(ctx context.Context, input CreateRealmInput) (domain
 		Enabled: true, AccessTokenTTLSeconds: 300, RefreshTokenTTLSeconds: 1800,
 		SessionTTLSeconds: 28800, CreatedAt: now, UpdatedAt: now,
 	}
+	if realm.Name != "" && !realmNamePattern.MatchString(realm.Name) {
+		return domain.Realm{}, invalidf(
+			"Realm 이름은 소문자·숫자·하이픈만 쓸 수 있고 소문자나 숫자로 시작해야 합니다 (최대 63자)")
+	}
 	if realm.Name == "" || realm.DisplayName == "" || realm.IssuerURL == "" {
 		return domain.Realm{}, errors.New("name, display_name and issuer_url are required")
 	}
@@ -95,6 +144,9 @@ func (s *Store) CreateRealm(ctx context.Context, input CreateRealmInput) (domain
 	_, err = tx.Exec(ctx, `INSERT INTO realms(id,name,display_name,issuer_url,created_at,updated_at)
 		VALUES($1,$2,$3,$4,$5,$5)`, realm.ID, realm.Name, realm.DisplayName, realm.IssuerURL, now)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return domain.Realm{}, conflictf("이미 사용 중인 Realm 이름 또는 Issuer URL입니다: %s", realm.Name)
+		}
 		return domain.Realm{}, fmt.Errorf("create realm: %w", err)
 	}
 	for _, name := range []string{"user", "realm-admin", "offline_access"} {

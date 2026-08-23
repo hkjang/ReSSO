@@ -196,6 +196,9 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 		client.RequirePKCE, client.AccessTokenTTLSeconds, client.RefreshTokenTTLSeconds,
 		client.BackchannelLogoutURI, client.CreatedAt)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return CreatedClient{}, conflictf("이미 사용 중인 Client ID입니다: %s", client.ClientID)
+		}
 		return CreatedClient{}, fmt.Errorf("create client: %w", err)
 	}
 	return CreatedClient{Client: client, ClientSecret: secret}, nil
