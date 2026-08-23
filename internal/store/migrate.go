@@ -14,6 +14,49 @@ import (
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
+// MigrationsAheadOfBinary lists the schema versions the database has applied
+// that this binary does not carry.
+//
+// Rolling the container back to an earlier image is step five of the
+// documented upgrade procedure, and the older binary then finds every
+// migration it knows about already applied and starts as if nothing were
+// unusual. Whether that is safe depends on what the newer migrations did, and
+// the release notes say so per release — but the service could see the fact
+// plainly and said nothing, leaving the operator's only protection a document
+// they had to remember to read during an incident.
+//
+// It reports rather than refuses. A rollback is a deliberate act taken when
+// something is already wrong, and a service that will not start takes away the
+// escape hatch at exactly the moment it is needed.
+func MigrationsAheadOfBinary(ctx context.Context, pool *pgxpool.Pool) ([]string, error) {
+	embedded := map[string]bool{}
+	entries, err := fs.ReadDir(migrationFiles, "migrations")
+	if err != nil {
+		return nil, fmt.Errorf("read embedded migrations: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			embedded[entry.Name()] = true
+		}
+	}
+	rows, err := pool.Query(ctx, "SELECT version FROM schema_migrations ORDER BY version")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ahead := make([]string, 0)
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return nil, err
+		}
+		if !embedded[version] {
+			ahead = append(ahead, version)
+		}
+	}
+	return ahead, rows.Err()
+}
+
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {

@@ -225,8 +225,11 @@ func (s *Store) RecoverPlatformAdmin(ctx context.Context, username, replacement 
 }
 
 type RecoveryDiagnosis struct {
-	DatabaseReady                bool     `json:"database_ready"`
-	AppliedMigrations            []string `json:"applied_migrations"`
+	DatabaseReady     bool     `json:"database_ready"`
+	AppliedMigrations []string `json:"applied_migrations"`
+	// MigrationsAheadOfBinary names schema versions the database has and this
+	// build does not, which is what a rolled-back image looks like from here.
+	MigrationsAheadOfBinary      []string `json:"migrations_ahead_of_binary"`
 	RealmCount                   int      `json:"realm_count"`
 	PlatformAdminCount           int      `json:"platform_admin_count"`
 	ActiveSigningKeyCount        int      `json:"active_signing_key_count"`
@@ -267,6 +270,12 @@ func (s *Store) DiagnoseRecovery(ctx context.Context) (RecoveryDiagnosis, error)
 	applied := make(map[string]bool, len(result.AppliedMigrations))
 	for _, version := range result.AppliedMigrations {
 		applied[version] = true
+	}
+	result.MigrationsAheadOfBinary = make([]string, 0)
+	for _, version := range result.AppliedMigrations {
+		if _, err := migrationFiles.ReadFile("migrations/" + version); err != nil {
+			result.MigrationsAheadOfBinary = append(result.MigrationsAheadOfBinary, version)
+		}
 	}
 	entries, err := fs.ReadDir(migrationFiles, "migrations")
 	if err != nil {

@@ -68,6 +68,20 @@ func main() {
 		bootstrapLogger.Error("database migration failed", "error", err)
 		os.Exit(1)
 	}
+	// Rolling the container back to an earlier image leaves this binary
+	// running against a schema a later one built. Whether that is safe is in
+	// the release notes of the version that made the change, and the service
+	// can see the fact plainly, so it says so instead of starting as if
+	// nothing were unusual. It is not treated as fatal: a rollback is done
+	// when something is already wrong, and refusing to start would take away
+	// the way out.
+	if ahead, err := store.MigrationsAheadOfBinary(startupCtx, data.Pool); err != nil {
+		bootstrapLogger.Warn("could not compare the schema against this build", "error", err)
+	} else if len(ahead) > 0 {
+		bootstrapLogger.Warn("the database has schema migrations this build does not carry; "+
+			"a newer ReSSO has run against it, so check that version's upgrade notes before relying on this one",
+			"migrations", ahead, "version", version.Version)
+	}
 	if indexed, indexErr := data.EnsureSearchIndexes(startupCtx); indexErr != nil {
 		bootstrapLogger.Warn("optional user search indexes could not be created", "error", indexErr)
 	} else if !indexed {

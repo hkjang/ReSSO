@@ -3739,3 +3739,61 @@ func TestIntegrationPublicClientKeepsPKCEThroughAnUpdate(t *testing.T) {
 		t.Error("a confidential Client could not turn PKCE off")
 	}
 }
+
+// Rolling the container back to an earlier image is step five of the
+// documented upgrade procedure, and the older binary then finds every
+// migration it knows about already applied and starts as if nothing were
+// unusual. Whether that is safe depends on what the newer migrations did —
+// the release notes say so per release — but the service could see the fact
+// plainly and said nothing, leaving the operator's only protection a document
+// they had to remember to read during an incident.
+func TestIntegrationSchemaAheadOfThisBuildIsReported(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	_ = bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+
+	ahead, err := MigrationsAheadOfBinary(ctx, data.Pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ahead) != 0 {
+		t.Fatalf("a database this build migrated reports %v ahead of it", ahead)
+	}
+	diagnosis, err := data.DiagnoseRecovery(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnosis.MigrationsAheadOfBinary) != 0 || !diagnosis.DatabaseReady {
+		t.Fatalf("a matching schema was not diagnosed as ready: %+v", diagnosis.MigrationsAheadOfBinary)
+	}
+
+	// What a rolled-back image sees: a version recorded by a build that had a
+	// migration this one does not carry.
+	if _, err := data.Pool.Exec(ctx,
+		`INSERT INTO schema_migrations(version) VALUES('900_from_a_later_release.sql')`); err != nil {
+		t.Fatal(err)
+	}
+	ahead, err = MigrationsAheadOfBinary(ctx, data.Pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ahead) != 1 || ahead[0] != "900_from_a_later_release.sql" {
+		t.Errorf("the newer migration was not reported: %v", ahead)
+	}
+	diagnosis, err = data.DiagnoseRecovery(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnosis.MigrationsAheadOfBinary) != 1 {
+		t.Errorf("the diagnosis did not name it: %+v", diagnosis.MigrationsAheadOfBinary)
+	}
+	// And it is reported, not refused: the database is still usable, because a
+	// rollback happens when something is already wrong and a service that will
+	// not start takes away the way out.
+	if !diagnosis.DatabaseReady {
+		t.Error("a schema ahead of this build was diagnosed as not ready")
+	}
+	if err := Migrate(ctx, data.Pool); err != nil {
+		t.Errorf("migrating against a schema ahead of this build failed: %v", err)
+	}
+}
