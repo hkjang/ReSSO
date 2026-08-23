@@ -345,9 +345,11 @@ func (s *Server) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "password_reset_failed", err.Error())
 		return
 	}
-	_ = s.store.RevokeAllUserSessions(r.Context(), userID, nil)
-	s.audit(r, &realmID, &principal.UserID, principal.Username, "PASSWORD_RESET", "SUCCESS", "user", userID.String(), nil)
-	w.WriteHeader(http.StatusNoContent)
+	ended, detail := s.endOtherSessions(r, userID, nil)
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "PASSWORD_RESET",
+		partialIfNot(ended), "user", userID.String(), detail)
+	writeSessionsEnded(w, ended,
+		"비밀번호는 재설정되었지만 이 계정의 세션을 종료하지 못했습니다. 세션 화면에서 직접 종료하세요.")
 }
 
 func (s *Server) adminListClients(w http.ResponseWriter, r *http.Request) {

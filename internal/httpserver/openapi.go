@@ -13,8 +13,12 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 		"CreateUserInput", "User", "201", "Created user")
 	updateUser := openAPIJSONOperation("Administration", "사용자 변경", true,
 		"UpdateUserInput", "User", "200", "Updated user")
-	resetPassword := openAPIJSONOperation("Administration", "사용자 비밀번호 재설정", true,
-		"ResetPasswordInput", "", "204", "Password reset")
+	resetPassword := withPartialSessionRevocation(openAPIJSONOperation("Administration",
+		"사용자 비밀번호 재설정", true, "ResetPasswordInput", "", "204",
+		"Password reset and the account's sessions ended"))
+	changePassword := withPartialSessionRevocation(openAPIJSONOperation("Personal",
+		"내 비밀번호 변경", true, "ChangePasswordInput", "", "204",
+		"Password changed and the other sessions ended"))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
@@ -31,7 +35,7 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 			"/api/v1/meta":        openAPIPath("get", "Metadata", "서비스 버전 조회", false),
 			"/api/v1/me":          openAPIReadPath("Personal", "현재 사용자 컨텍스트 조회"),
 			"/api/v1/me/profile":  map[string]any{"put": profileUpdate},
-			"/api/v1/me/password": openAPIPath("put", "Personal", "내 비밀번호 변경", true),
+			"/api/v1/me/password": map[string]any{"put": changePassword},
 			"/api/v1/me/sessions": openAPIReadPath("Personal", "내 로그인 세션 조회"),
 			"/api/v1/me/api-keys": map[string]any{
 				"get":  openAPIReadOperation("Personal", "내 API 키 조회"),
@@ -280,7 +284,40 @@ func openAPIUserSchemas() map[string]any {
 				"new_password": map[string]any{"type": "string", "format": "password", "minLength": 1},
 			},
 		},
+		"ChangePasswordInput": map[string]any{
+			"type":     "object",
+			"required": []string{"current_password", "new_password"},
+			"properties": map[string]any{
+				"current_password": map[string]any{"type": "string", "format": "password"},
+				"new_password":     map[string]any{"type": "string", "format": "password", "minLength": 1},
+			},
+		},
+		"PartialSessionRevocation": map[string]any{
+			"type":        "object",
+			"description": "비밀번호는 바뀌었지만 세션 종료가 실패한 경우의 응답. 감사 이벤트는 PARTIAL로 기록됩니다.",
+			"required":    []string{"other_sessions_ended", "message"},
+			"properties": map[string]any{
+				"other_sessions_ended": map[string]any{"type": "boolean", "enum": []any{false}},
+				"message":              map[string]any{"type": "string"},
+			},
+		},
 	}
+}
+
+// withPartialSessionRevocation declares the second shape a password endpoint
+// can answer with. Changing a password ends the account's other sessions, and
+// that step can fail on its own after the password is already changed — the
+// request is not refused, so a client that assumes 204 is a client that never
+// learns those sessions are still live.
+func withPartialSessionRevocation(operation map[string]any) map[string]any {
+	responses, _ := operation["responses"].(map[string]any)
+	responses["200"] = map[string]any{
+		"description": "Password changed, but the account's other sessions could not be ended",
+		"content": map[string]any{"application/json": map[string]any{
+			"schema": map[string]any{"$ref": "#/components/schemas/PartialSessionRevocation"},
+		}},
+	}
+	return operation
 }
 
 func nullableUUIDSchema() map[string]any {

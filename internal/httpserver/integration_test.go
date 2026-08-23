@@ -1751,3 +1751,129 @@ func TestIntegrationSuspendingARealmReachesSessionsAndKeys(t *testing.T) {
 		t.Errorf("lifting the suspension did not restore an unexpired API key: %d", status)
 	}
 }
+
+// Changing a password ends the account's other sessions, and that is the whole
+// reason the change is offered to somebody who believes their password is
+// known. The revocation is a second step that can fail on its own after the
+// password has already changed, and both endpoints dropped its error: the
+// response was 204, the audit entry said SUCCESS, and nothing was logged. The
+// console states the promise on the page while the sessions stayed live.
+func TestIntegrationPasswordChangeAdmitsWhenSessionsSurvive(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := &http.Client{Jar: jar}
+	response := postIntegrationLogin(t, browser, server.URL, "admin", "bootstrap-password-123")
+	var login struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&login); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+
+	changePassword := func(current, replacement string) (int, map[string]any) {
+		t.Helper()
+		body := fmt.Sprintf(`{"current_password":%q,"new_password":%q}`, current, replacement)
+		request, requestErr := http.NewRequest(http.MethodPut, server.URL+"/api/v1/me/password",
+			strings.NewReader(body))
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", login.CSRFToken)
+		result, doErr := browser.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer result.Body.Close()
+		var decoded map[string]any
+		_ = json.NewDecoder(result.Body).Decode(&decoded)
+		return result.StatusCode, decoded
+	}
+	lastAudit := func() (string, map[string]any) {
+		t.Helper()
+		page, auditErr := data.ListAudit(ctx, store.AuditFilter{EventType: "PASSWORD_CHANGE", Limit: 1})
+		if auditErr != nil {
+			t.Fatal(auditErr)
+		}
+		if len(page.Items) == 0 {
+			t.Fatal("the password change was not audited at all")
+		}
+		var detail map[string]any
+		_ = json.Unmarshal(page.Items[0].Detail, &detail)
+		return page.Items[0].Result, detail
+	}
+	otherSession := func() bool {
+		t.Helper()
+		session, sessionErr := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+			time.Hour, "127.0.0.1", "password-change-test", "password")
+		if sessionErr != nil {
+			t.Fatal(sessionErr)
+		}
+		return session.Token != ""
+	}
+
+	// An ordinary change keeps the contract it had: 204, and SUCCESS.
+	_ = otherSession()
+	if status, body := changePassword("bootstrap-password-123", "first-replacement-1234"); status != http.StatusNoContent {
+		t.Fatalf("an ordinary password change answered %d %v", status, body)
+	}
+	if result, detail := lastAudit(); result != "SUCCESS" || len(detail) != 0 {
+		t.Errorf("an ordinary change audited as %s %v", result, detail)
+	}
+
+	// A live session for the next change to end. Without one there is nothing
+	// for the revoking UPDATE to touch, so it would succeed by doing nothing.
+	_ = otherSession()
+
+	// Now let only the revoking UPDATE fail. Reads and last_access touches are
+	// untouched, so the request still authenticates — which is what makes this
+	// the shape of a real transient failure rather than a broken database.
+	if _, err := data.Pool.Exec(ctx, `CREATE FUNCTION block_revocation() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'revocation blocked for the test'; END $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `CREATE TRIGGER block_revocation BEFORE UPDATE ON sso_sessions
+		FOR EACH ROW WHEN (NEW.revoked_at IS NOT NULL AND OLD.revoked_at IS NULL)
+		EXECUTE FUNCTION block_revocation()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "DROP TRIGGER IF EXISTS block_revocation ON sso_sessions")
+	})
+
+	status, body := changePassword("first-replacement-1234", "second-replacement-1234")
+	if status != http.StatusOK {
+		t.Fatalf("a change whose revocation failed answered %d %v", status, body)
+	}
+	if body["other_sessions_ended"] != false {
+		t.Errorf("the response did not say the sessions survived: %v", body)
+	}
+	if message, _ := body["message"].(string); message == "" {
+		t.Error("the response carried no explanation for the person reading it")
+	}
+	// The password really did change, so refusing would have been the wrong
+	// answer — the point is that the caller is told what did not happen.
+	if _, err := data.AuthenticatePassword(ctx, domain.Realm{ID: bootstrap.RealmID},
+		"admin", "second-replacement-1234"); err != nil {
+		t.Fatal(err)
+	}
+	result, detail := lastAudit()
+	if result != "PARTIAL" {
+		t.Errorf("the audit entry reads %s, want PARTIAL", result)
+	}
+	if detail["other_sessions_ended"] != false || detail["error"] == nil {
+		t.Errorf("the audit entry does not record what failed: %v", detail)
+	}
+}

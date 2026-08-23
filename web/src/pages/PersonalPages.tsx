@@ -44,8 +44,19 @@ export function PersonalSecurityPage() {
   const [replacement, setReplacement] = useState('')
   const [confirm, setConfirm] = useState('')
   const change = useMutation({
-    mutationFn: () => api<void>('/api/v1/me/password', { method: 'PUT', ...jsonBody({ current_password: current, new_password: replacement }) }),
-    onSuccess: () => { setCurrent(''); setReplacement(''); setConfirm(''); notify('비밀번호를 변경하고 다른 세션을 종료했습니다.') },
+    mutationFn: () => api<{ other_sessions_ended?: boolean; message?: string } | undefined>('/api/v1/me/password', { method: 'PUT', ...jsonBody({ current_password: current, new_password: replacement }) }),
+    // The toast said the other sessions were ended whatever happened. Ending
+    // them can fail on its own after the password has already changed, and
+    // somebody who changed it because they think it is known needs to hear
+    // that rather than be reassured.
+    onSuccess: (result) => {
+      setCurrent(''); setReplacement(''); setConfirm('')
+      if (result?.other_sessions_ended === false) {
+        notify(result.message ?? '비밀번호는 변경되었지만 다른 세션을 종료하지 못했습니다.', 'warning')
+        return
+      }
+      notify('비밀번호를 변경하고 다른 세션을 종료했습니다.')
+    },
   })
   // The Realm's own minimum, rather than a guess. The form previously allowed
   // submitting at 8 characters while the default policy required 12, so the

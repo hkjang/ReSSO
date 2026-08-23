@@ -98,9 +98,51 @@ func (s *Server) changeMyPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "password_change_failed", err.Error())
 		return
 	}
-	_ = s.store.RevokeAllUserSessions(r.Context(), principal.UserID, principal.SessionID)
-	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "PASSWORD_CHANGE", "SUCCESS", "user", principal.UserID.String(), nil)
-	w.WriteHeader(http.StatusNoContent)
+	ended, detail := s.endOtherSessions(r, principal.UserID, principal.SessionID)
+	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "PASSWORD_CHANGE",
+		partialIfNot(ended), "user", principal.UserID.String(), detail)
+	writeSessionsEnded(w, ended,
+		"비밀번호는 변경되었지만 다른 기기의 세션을 종료하지 못했습니다. `내 세션`에서 직접 종료하세요.")
+}
+
+// endOtherSessions ends the sessions a password change is meant to end and
+// reports whether it worked.
+//
+// The password has already changed by the time this runs and cannot be taken
+// back, so a failure here is no reason to refuse the request. It is every
+// reason not to answer that the whole thing went fine, which is what both
+// callers did: the error was dropped on the floor, the audit entry said
+// SUCCESS, and the response was 204. Someone changing their password because
+// they believe it is known, or an administrator resetting a compromised
+// account, was told the other sessions were gone while they were still live —
+// and the console states that promise on the page.
+func (s *Server) endOtherSessions(r *http.Request, userID uuid.UUID, except *uuid.UUID) (bool, map[string]any) {
+	if err := s.store.RevokeAllUserSessions(r.Context(), userID, except); err != nil {
+		s.logger.Error("other sessions could not be ended after a password change",
+			"trace_id", traceIDFrom(r.Context()), "user_id", userID, "error", err)
+		return false, map[string]any{"other_sessions_ended": false, "error": err.Error()}
+	}
+	return true, nil
+}
+
+// partialIfNot names an outcome that is neither a clean success nor a failure:
+// the request did what it was asked, and something it carries with it did not.
+func partialIfNot(ok bool) string {
+	if ok {
+		return "SUCCESS"
+	}
+	return "PARTIAL"
+}
+
+// writeSessionsEnded answers 204 when everything was done, and 200 with what
+// was not when it was not. The unchanged status on the ordinary path keeps the
+// contract these two endpoints already had.
+func writeSessionsEnded(w http.ResponseWriter, ended bool, message string) {
+	if ended {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"other_sessions_ended": false, "message": message})
 }
 
 func (s *Server) mySessions(w http.ResponseWriter, r *http.Request) {
