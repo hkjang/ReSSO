@@ -134,7 +134,28 @@ func (s *Server) Handler() http.Handler {
 	router.Post("/mcp", s.mcp)
 	router.Get("/mcp", s.mcpMethodNotAllowed)
 
+	// The console is a single-page application, so anything the routes above
+	// did not claim is one of its own paths and gets the document.
 	router.Handle("/*", s.spaHandler())
+
+	// Everything that reaches this point is inside a mounted API subtree —
+	// the catch-all above answers every unclaimed path at the root — so it is
+	// a request to this service's API for something that is not there.
+	//
+	// chi answers those itself with `404 page not found` in plain text, and a
+	// path that exists for another method with an empty 405 carrying no body
+	// at all. Every other refusal this service makes is a JSON object with
+	// error, message and trace_id, and the OpenAPI document promises that
+	// shape for 4XX on every operation. A caller that mistyped a path, or
+	// called one that a later version removed, is exactly the caller whose
+	// error handling then fails on the response it was written to read.
+	router.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, r, http.StatusNotFound, "not_found", "요청한 경로가 없습니다.")
+	})
+	router.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
+			"이 경로는 해당 HTTP 메서드를 받지 않습니다.")
+	})
 	return router
 }
 
