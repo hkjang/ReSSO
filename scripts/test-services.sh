@@ -168,7 +168,15 @@ start_tls_directory() {
       | grep -q "Verify return code: 0" && return
     sleep 1
   done
-  log "the TLS directory never served a verifiable certificate"; exit 1
+  log "the TLS directory never served a verifiable certificate"
+  log "--- what it says about its own certificates ---"
+  docker logs "$tls_container" 2>&1 | grep -iE 'tls|cert|error|fatal' | tail -20 >&2 || true
+  log "--- what it is actually serving ---"
+  openssl s_client -connect "127.0.0.1:${tls_port}" -CAfile "$certs/ca.crt" </dev/null 2>&1 \
+    | grep -E 'subject=|issuer=|Verify return code|connect:' | head -5 >&2 || true
+  log "--- what was mounted ---"
+  ls -l "$certs" >&2 || true
+  exit 1
 }
 
 start_postgres
