@@ -162,8 +162,11 @@ start_tls_directory() {
     -v "$certs:/container/service/slapd/assets/certs" osixia/openldap:1.5.0 >/dev/null
   wait_for_directory "$tls_container"
   seed_directory "$tls_container"
-  # The TLS listener answers a moment after plain LDAP does.
-  for _ in $(seq 1 30); do
+  # The TLS listener answers some time after plain LDAP does, and how long
+  # varies with the machine — thirty seconds was enough here and not always
+  # enough on a loaded runner, which made the check itself the flaky part.
+  # Waiting longer costs nothing except when something is genuinely wrong.
+  for _ in $(seq 1 120); do
     openssl s_client -connect "127.0.0.1:${tls_port}" -CAfile "$certs/ca.crt" </dev/null 2>&1 \
       | grep -q "Verify return code: 0" && return
     sleep 1
