@@ -809,6 +809,112 @@ func TestIntegrationRevocationAuditRecordsWhatWasRevoked(t *testing.T) {
 	}
 }
 
+// Introspection is how a resource server asks, in real time, whether a token
+// it was handed still stands. Disabling an account stopped it at userinfo and
+// at the refresh grant immediately, but this endpoint kept answering active
+// until the access token expired on its own — so the one API built to give the
+// current answer was the one giving the stale one, and an operator who had
+// just disabled somebody watched them keep working.
+func TestIntegrationIntrospectionFollowsTheAccountItReportsOn(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceServer, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "introspection-rs", Name: "Introspecting Resource Server", Type: "confidential",
+		RedirectURIs:  []string{"https://rs.example.test/cb"},
+		GrantTypes:    []string{"authorization_code", "client_credentials"},
+		DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "introspected", Password: "introspected-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "introspection-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	userTokens, err := service.IssueUserTokens(ctx, realm, resourceServer.Client, user, session.Session.ID,
+		[]string{"openid"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	introspect := func(token string) bool {
+		t.Helper()
+		form := url.Values{"token": {token}, "client_id": {"introspection-rs"},
+			"client_secret": {resourceServer.ClientSecret}}
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token/introspect", form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		var decoded map[string]any
+		if decodeErr := json.NewDecoder(response.Body).Decode(&decoded); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		active, _ := decoded["active"].(bool)
+		return active
+	}
+	userInfoAccepts := func(token string) bool {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodGet,
+			server.URL+"/realms/master/protocol/openid-connect/userinfo", nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer response.Body.Close()
+		return response.StatusCode == http.StatusOK
+	}
+
+	if !introspect(userTokens.AccessToken) || !userInfoAccepts(userTokens.AccessToken) {
+		t.Fatal("an enabled account's token was not usable to begin with")
+	}
+	if _, err := data.UpdateUser(ctx, user.ID, store.UpdateUserInput{
+		DisplayName: user.DisplayName, Email: user.Email, Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if userInfoAccepts(userTokens.AccessToken) {
+		t.Error("userinfo served a disabled account")
+	}
+	if introspect(userTokens.AccessToken) {
+		t.Error("introspection reported active for a disabled account")
+	}
+
+	// A client's own token names no person, so nothing about an account can
+	// make it inactive. Checking it here keeps the account lookup from being
+	// applied to a subject that is a client identifier.
+	clientToken, err := service.IssueClientToken(ctx, realm, resourceServer.Client, []string{"openid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !introspect(clientToken.AccessToken) {
+		t.Error("a client-credentials token was reported inactive")
+	}
+}
+
 // max_age is how a relying party demands a fresh proof of identity before
 // something sensitive. It was accepted and ignored, so the request came back
 // with a code minted from whatever session already existed — indistinguishable,

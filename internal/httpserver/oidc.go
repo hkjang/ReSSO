@@ -509,6 +509,9 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 	// server pattern impossible: an API validating tokens minted for a
 	// different client always saw active=false.
 	if verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, ""); verifyErr == nil {
+		// A session identifier is what distinguishes a token issued to a
+		// person from a client's own credentials, whose subject is the client
+		// identifier rather than a user.
 		if verified.Extra.SessionID != "" {
 			sid, parseErr := uuid.Parse(verified.Extra.SessionID)
 			if parseErr != nil {
@@ -516,6 +519,21 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if _, sessionErr := s.store.SessionAuthTime(r.Context(), sid); sessionErr != nil {
+				writeJSON(w, http.StatusOK, map[string]any{"active": false})
+				return
+			}
+			// Disabling an account has to mean the same thing here as it does
+			// at userinfo and at the refresh grant, which both refuse the
+			// moment the flag flips. This endpoint is how a resource server
+			// asks that very question, so answering active=true while every
+			// other path refuses left the account working exactly where the
+			// operator was most likely to believe it had stopped.
+			subject, subjectErr := uuid.Parse(verified.Claims.Subject)
+			if subjectErr != nil {
+				writeJSON(w, http.StatusOK, map[string]any{"active": false})
+				return
+			}
+			if user, userErr := s.store.UserByID(r.Context(), subject); userErr != nil || !user.Enabled {
 				writeJSON(w, http.StatusOK, map[string]any{"active": false})
 				return
 			}
