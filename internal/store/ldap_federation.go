@@ -72,6 +72,13 @@ type LDAPSyncSummary struct {
 	Updated      int       `json:"updated"`
 	Failed       int       `json:"failed"`
 	Disabled     int64     `json:"disabled"`
+	// RecordError reports that the run finished but its outcome did not reach
+	// the provider row or the audit trail. Both writes used to be issued and
+	// discarded, so a sweep that deactivated accounts could return success
+	// while the console still showed the previous run and the trail held no
+	// entry for this one — and the trail is where an operator is told to look
+	// to find out whether a DISABLE policy acted on them.
+	RecordError string `json:"record_error,omitempty"`
 }
 
 type LDAPAuthenticationTestResult struct {
@@ -437,7 +444,7 @@ func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncS
 	summary := LDAPSyncSummary{FederationID: id, StartedAt: time.Now().UTC()}
 	if !runtime.Provider.ImportEnabled {
 		err := errors.New("full user synchronization is disabled; enable user import or use just-in-time registration")
-		s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, err)
+		summary.RecordError = recordError(s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, err))
 		return summary, err
 	}
 	claimed, err := s.claimLDAPSync(ctx, id)
@@ -449,7 +456,7 @@ func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncS
 	}
 	users, err := federation.FetchUsers(ctx, federation.RuntimeConfig{Provider: runtime.Provider, BindCredential: runtime.BindCredential})
 	if err != nil {
-		s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, err)
+		summary.RecordError = recordError(s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, err))
 		return summary, err
 	}
 	summary.Read = len(users)
@@ -480,7 +487,7 @@ func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncS
 	case summary.Failed > 0:
 		syncErr = fmt.Errorf("%d LDAP users could not be synchronized", summary.Failed)
 	}
-	s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, syncErr)
+	summary.RecordError = recordError(s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, syncErr))
 	return summary, syncErr
 }
 
@@ -539,7 +546,28 @@ func (s *Store) disableUnseenFederatedUsers(ctx context.Context, providerID uuid
 	return int64(len(disabled)), nil
 }
 
-func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederation, summary LDAPSyncSummary, syncErr error) {
+// finishLDAPSync records how a run ended and reports whether the recording
+// itself worked.
+//
+// Both writes were previously issued and discarded. A run whose bookkeeping
+// failed returned success to its caller while the provider stayed at RUNNING
+// showing the previous run's numbers, and nothing at all was written to the
+// audit trail — including for a sweep that had just deactivated accounts and
+// signed them out everywhere. The trail is exactly where an operator is told
+// to look to find out whether a DISABLE policy acted on them, so it cannot
+// lose an entry quietly. The Store performs no logging of its own, so the
+// failure travels back on the summary for the callers, which already report
+// what a run did.
+// recordError renders a bookkeeping failure for the summary, which travels to
+// the console as JSON.
+func recordError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederation, summary LDAPSyncSummary, syncErr error) error {
 	status, message := "SUCCESS", ""
 	if syncErr != nil {
 		status, message = "FAILURE", syncErr.Error()
@@ -547,10 +575,13 @@ func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederati
 	if len(message) > 1000 {
 		message = message[:1000]
 	}
-	_, _ = s.Pool.Exec(ctx, `UPDATE user_federations SET last_sync_at=now(),last_sync_status=$2,last_sync_error=$3,
+	var failures []error
+	if _, err := s.Pool.Exec(ctx, `UPDATE user_federations SET last_sync_at=now(),last_sync_status=$2,last_sync_error=$3,
         last_sync_added=$4,last_sync_updated=$5,last_sync_failed=$6,
         next_sync_at=CASE WHEN sync_period_seconds>0 THEN now()+make_interval(secs=>sync_period_seconds) END,
-        updated_at=now() WHERE id=$1`, provider.ID, status, message, summary.Added, summary.Updated, summary.Failed)
+        updated_at=now() WHERE id=$1`, provider.ID, status, message, summary.Added, summary.Updated, summary.Failed); err != nil {
+		failures = append(failures, fmt.Errorf("record the outcome on the provider: %w", err))
+	}
 
 	// The outcome belongs in the audit trail, not only in the server log: a
 	// run under the DISABLE policy deactivates accounts and ends their
@@ -563,9 +594,12 @@ func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederati
 	if message != "" {
 		detail["error"] = message
 	}
-	_ = s.WriteAudit(ctx, AuditEvent{RealmID: &realmID, ActorName: "system",
+	if err := s.WriteAudit(ctx, AuditEvent{RealmID: &realmID, ActorName: "system",
 		EventType: "LDAP_FEDERATION_SYNC", Result: status, TargetType: "user_federation",
-		TargetID: provider.ID.String(), Detail: detail})
+		TargetID: provider.ID.String(), Detail: detail}); err != nil {
+		failures = append(failures, fmt.Errorf("write the audit event: %w", err))
+	}
+	return errors.Join(failures...)
 }
 
 func (s *Store) upsertFederatedUser(ctx context.Context, provider domain.LDAPFederation, external federation.User, syncedAt time.Time) (bool, error) {

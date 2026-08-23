@@ -192,6 +192,14 @@ func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.
 				syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Minute)
 				summary, syncErr := data.SyncLDAPFederation(syncCtx, id)
 				syncCancel()
+				if summary.RecordError != "" {
+					// Nothing else will report this run: the provider row
+					// still shows the previous one and the audit trail has no
+					// entry for it.
+					logger.Error("scheduled LDAP federation sync finished but its outcome was not recorded",
+						"federation_id", id, "read", summary.Read, "added", summary.Added,
+						"disabled", summary.Disabled, "error", summary.RecordError)
+				}
 				if errors.Is(syncErr, store.ErrSyncInProgress) {
 					// An administrator started this provider by hand; skipping
 					// is the correct outcome, not a failure.

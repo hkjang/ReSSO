@@ -3217,3 +3217,103 @@ func TestIntegrationRetentionSweepDoesNotStopAtOneFailure(t *testing.T) {
 		t.Errorf("a spent deadline reported %v, want the statements left undone", deadlineErr)
 	}
 }
+
+// A synchronization records how it ended in two places: the provider row the
+// console reads, and the audit trail. Both writes were issued and discarded,
+// so a run whose bookkeeping failed returned success while the console still
+// showed the previous run's numbers and the trail held no entry for this one —
+// including for a sweep that had just deactivated an account and signed it out
+// everywhere. The upgrade notes send an operator to that trail to find out
+// whether the DISABLE policy acted on them, so it cannot lose an entry
+// quietly.
+func TestIntegrationSyncReportsWhenItsOwnOutcomeIsNotRecorded(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	branch := "ou=sync-bookkeeping,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "stays", "leaves")
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "DISABLE",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded := func() (string, int) {
+		t.Helper()
+		var status string
+		if err := data.Pool.QueryRow(ctx, `SELECT last_sync_status FROM user_federations WHERE id=$1`,
+			provider.ID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		var events int
+		if err := data.Pool.QueryRow(ctx,
+			`SELECT count(*) FROM audit_events WHERE event_type='LDAP_FEDERATION_SYNC'`).Scan(&events); err != nil {
+			t.Fatal(err)
+		}
+		return status, events
+	}
+
+	summary, err := data.SyncLDAPFederation(ctx, provider.ID)
+	if err != nil || summary.RecordError != "" {
+		t.Fatalf("a healthy sync reported err=%v record_error=%q", err, summary.RecordError)
+	}
+	if status, events := recorded(); status != "SUCCESS" || events != 1 {
+		t.Fatalf("a healthy sync recorded status=%s events=%d", status, events)
+	}
+
+	// Block both bookkeeping writes and nothing else, so the run itself — the
+	// directory read, the upserts, the DISABLE sweep — proceeds normally.
+	for _, statement := range []string{
+		`CREATE FUNCTION block_bookkeeping() RETURNS trigger AS $$
+			BEGIN RAISE EXCEPTION 'bookkeeping blocked for the test'; END $$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER block_outcome BEFORE UPDATE ON user_federations
+			FOR EACH ROW WHEN (NEW.last_sync_status <> 'RUNNING') EXECUTE FUNCTION block_bookkeeping()`,
+		`CREATE TRIGGER block_audit BEFORE INSERT ON audit_events
+			FOR EACH ROW WHEN (NEW.event_type='LDAP_FEDERATION_SYNC') EXECUTE FUNCTION block_bookkeeping()`,
+	} {
+		if _, err := data.Pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "DROP TRIGGER IF EXISTS block_outcome ON user_federations")
+		_, _ = data.Pool.Exec(context.Background(), "DROP TRIGGER IF EXISTS block_audit ON audit_events")
+	})
+
+	if err := removeDirectoryEntry(t, "uid=leaves,"+branch); err != nil {
+		t.Fatal(err)
+	}
+	summary, err = data.SyncLDAPFederation(ctx, provider.ID)
+	if err != nil {
+		t.Fatalf("blocking the bookkeeping should not fail the run itself: %v", err)
+	}
+	// The run really did act on somebody, which is what makes the missing
+	// record worth reporting rather than tidying away.
+	if summary.Disabled != 1 {
+		t.Fatalf("the run disabled %d accounts, want 1", summary.Disabled)
+	}
+	if summary.RecordError == "" {
+		t.Fatal("the run reported nothing about its outcome not being recorded")
+	}
+	for _, expected := range []string{"provider", "audit"} {
+		if !strings.Contains(summary.RecordError, expected) {
+			t.Errorf("the report does not name the %s write: %q", expected, summary.RecordError)
+		}
+	}
+	// And the two places an operator would look really are unchanged, which is
+	// the reason the summary has to carry it.
+	if status, events := recorded(); status != "RUNNING" || events != 1 {
+		t.Errorf("the blocked writes did not stay blocked: status=%s events=%d", status, events)
+	}
+}

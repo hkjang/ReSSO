@@ -186,6 +186,16 @@ func (s *Server) adminSyncLDAPFederation(w http.ResponseWriter, r *http.Request)
 	go func() {
 		defer cancel()
 		summary, err := s.store.SyncLDAPFederation(syncCtx, federationID)
+		// The response above sends the administrator to the provider's own
+		// last_sync fields to follow this. When the run could not record its
+		// outcome, those fields are the one place that will not say so, and
+		// neither will the audit trail — so this line is all that is left.
+		if summary.RecordError != "" {
+			s.logger.Error("LDAP federation sync finished but its outcome was not recorded; "+
+				"the provider still shows the previous run and the audit trail has no entry for this one",
+				"trace_id", traceID, "federation_id", federationID, "read", summary.Read,
+				"added", summary.Added, "disabled", summary.Disabled, "error", summary.RecordError)
+		}
 		if err != nil {
 			s.logger.Error("LDAP federation sync failed", "trace_id", traceID, "federation_id", federationID,
 				"read", summary.Read, "failed", summary.Failed, "error", err)
