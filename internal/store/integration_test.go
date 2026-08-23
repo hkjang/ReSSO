@@ -3680,3 +3680,62 @@ func TestIntegrationLoginLimiterRefusesToRunWithoutUsableSettings(t *testing.T) 
 		t.Errorf("reaching the maximum reported %+v, want it limited with a wait", decision)
 	}
 }
+
+// A public Client has no secret, so PKCE is the only thing tying an
+// authorization code to whoever asked for it: without it a code lifted from
+// the redirect — browser history, a rival app registered for the same custom
+// scheme, a referrer — is redeemable by anyone who has it. Creation forced it
+// on and updating did not, so an ordinary edit could take it away, while the
+// compatibility document says it is enforced for public Clients.
+func TestIntegrationPublicClientKeepsPKCEThroughAnUpdate(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+
+	public, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "spa", Name: "SPA", Type: "public",
+		RedirectURIs: []string{"https://spa.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"},
+		RequirePKCE: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !public.Client.RequirePKCE {
+		t.Fatal("a public Client was created without PKCE")
+	}
+	updated, err := data.UpdateClient(ctx, public.Client.ID, UpdateClientInput{
+		Name: "SPA", RedirectURIs: public.Client.RedirectURIs,
+		GrantTypes: public.Client.GrantTypes, DefaultScopes: public.Client.DefaultScopes,
+		RequirePKCE: false, Enabled: true,
+		AccessTokenTTLSeconds:  public.Client.AccessTokenTTLSeconds,
+		RefreshTokenTTLSeconds: public.Client.RefreshTokenTTLSeconds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.RequirePKCE {
+		t.Error("an update took PKCE away from a public Client")
+	}
+
+	// A confidential Client authenticates with its secret, so it may choose.
+	// Forcing it there would be a different product than the one documented.
+	confidential, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "service", Name: "Service", Type: "confidential",
+		RedirectURIs: []string{"https://service.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"},
+		RequirePKCE: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relaxed, err := data.UpdateClient(ctx, confidential.Client.ID, UpdateClientInput{
+		Name: "Service", RedirectURIs: confidential.Client.RedirectURIs,
+		GrantTypes: confidential.Client.GrantTypes, DefaultScopes: confidential.Client.DefaultScopes,
+		RequirePKCE: false, Enabled: true,
+		AccessTokenTTLSeconds:  confidential.Client.AccessTokenTTLSeconds,
+		RefreshTokenTTLSeconds: confidential.Client.RefreshTokenTTLSeconds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if relaxed.RequirePKCE {
+		t.Error("a confidential Client could not turn PKCE off")
+	}
+}

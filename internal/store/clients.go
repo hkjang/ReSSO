@@ -129,9 +129,16 @@ func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClie
 	if err != nil {
 		return domain.Client{}, err
 	}
+	// A public Client keeps PKCE whatever the request says, the same rule
+	// CreateClient applies. Only creation enforced it, so an ordinary edit
+	// could take it away — and for a Client with no secret, PKCE is the only
+	// thing tying an authorization code to whoever asked for it. The type is
+	// read from the row rather than taken from the caller because it cannot be
+	// changed after creation and is not part of this input.
 	command, err := s.Pool.Exec(ctx, `UPDATE clients SET name=$2,redirect_uris=$3,
         post_logout_redirect_uris=$4,web_origins=$5,grant_types=$6,default_scopes=$7,
-        require_pkce=$8,enabled=$9,access_token_ttl_seconds=$10,refresh_token_ttl_seconds=$11,
+        require_pkce=($8 OR type='public'),enabled=$9,access_token_ttl_seconds=$10,
+        refresh_token_ttl_seconds=$11,
         backchannel_logout_uri=$12,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.Name),
 		input.RedirectURIs, input.PostLogoutRedirectURIs, input.WebOrigins, input.GrantTypes,
 		input.DefaultScopes, input.RequirePKCE, input.Enabled, input.AccessTokenTTLSeconds,
