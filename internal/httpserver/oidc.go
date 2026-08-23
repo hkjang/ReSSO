@@ -277,6 +277,7 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 			return
 		}
 		s.logger.Error("token issue failed", "trace_id", traceIDFrom(r.Context()), "error", err)
+		s.metrics.Add(metricTokenErrors, 1, "authorization_code")
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}
@@ -334,6 +335,7 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 			return
 		}
 		s.logger.Error("refresh token issue failed", "trace_id", traceIDFrom(r.Context()), "error", err)
+		s.metrics.Add(metricTokenErrors, 1, "refresh_token")
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}
@@ -354,6 +356,8 @@ func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Req
 	}
 	response, err := s.oidc.IssueClientToken(r.Context(), realm, client, scopes)
 	if err != nil {
+		s.logger.Error("client token issue failed", "trace_id", traceIDFrom(r.Context()), "error", err)
+		s.metrics.Add(metricTokenErrors, 1, "client_credentials")
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token could not be issued")
 		return
 	}

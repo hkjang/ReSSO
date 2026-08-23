@@ -1176,3 +1176,63 @@ func TestIntegrationLoginErrorsAreCounted(t *testing.T) {
 		t.Errorf("the attempt was not counted as an error:\n%s", exported.String())
 	}
 }
+
+// A signing key the service cannot open takes every token request with it.
+// Counting only successes meant that showed up as the issuance series going
+// flat — indistinguishable from a quiet hour, and the only other signal was a
+// line in the log.
+func TestIntegrationTokenIssuanceFailuresAreCounted(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "issue-probe", Name: "Issue Probe", Type: "confidential",
+		RedirectURIs: []string{"https://probe.example.test/cb"},
+		GrantTypes:   []string{"client_credentials"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The key is there but its envelope no longer opens, which is what a
+	// keyring that does not match the database looks like.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE signing_keys SET private_key_cipher=decode('00', 'hex') WHERE realm_id=$1 AND status='ACTIVE'`,
+		realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	data.InvalidateAllSigningKeys()
+
+	metrics := observability.NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {"issue-probe"},
+		"client_secret": {created.ClientSecret}, "scope": {"openid"}}
+	response, err := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("an unopenable signing key answered %d", response.StatusCode)
+	}
+	var exported strings.Builder
+	metrics.WritePrometheus(&exported)
+	if !strings.Contains(exported.String(), `resso_token_errors_total{grant_type="client_credentials"} 1`) {
+		t.Errorf("the failure was not counted:\n%s", exported.String())
+	}
+	// And it is not passed off as an issuance, which is what the other counter
+	// is for.
+	if strings.Contains(exported.String(), `resso_tokens_issued_total{grant_type="client_credentials"}`) {
+		t.Error("a failed request was counted as an issued token")
+	}
+}
