@@ -176,8 +176,25 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 		}
 		hintedSubject = subject
 	}
+	// prompt is a space-delimited set, not one value. Comparing the whole
+	// parameter meant `prompt=login consent` — which several SDKs send — did
+	// not match "login", so the session was reused and a code issued: a
+	// relying party asking for a fresh proof of identity before something
+	// sensitive got one from an hour-old session and could not tell.
 	prompt := query.Get("prompt")
-	if prompt != "login" {
+	prompts := map[string]bool{}
+	for _, value := range strings.Fields(prompt) {
+		prompts[value] = true
+	}
+	// none forbids any interaction and login demands it. A request asking for
+	// both cannot be answered, and answering the half that happens to be
+	// checked first is how the other half goes unnoticed.
+	if prompts["none"] && prompts["login"] {
+		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "invalid_request",
+			"prompt cannot request both none and login")
+		return
+	}
+	if !prompts["login"] {
 		if authenticated, sessionErr := s.store.SessionByToken(r.Context(), sessionCookie(r)); sessionErr == nil && authenticated.User.RealmID == realm.ID {
 			// The existing session may be reused only if it belongs to the
 			// account the relying party named and authenticated recently
@@ -206,7 +223,7 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if prompt == "none" {
+	if prompts["none"] {
 		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "login_required", "no active SSO session")
 		return
 	}

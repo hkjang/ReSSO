@@ -8,7 +8,7 @@
 | OIDC Discovery | 구현 |
 | Authorization Code | 구현. 1회 사용이며 재사용 시 해당 Session·Client의 Refresh Token 폐기 |
 | PKCE S256 | 구현, Public Client 강제 |
-| `prompt=login` / `prompt=none` | 구현 |
+| `prompt` | 사양대로 공백으로 구분된 목록으로 읽습니다. `login`은 SSO Session이 있어도 재인증을 요구하고, `none`은 재사용할 Session이 없으면 `login_required`를 반환합니다. 화면이 없는 `consent`·`select_account`는 무시하며, 그것들이 함께 와도 `login`·`none` 처리는 그대로입니다. 서로 모순되는 `none`과 `login`을 함께 요구하면 `invalid_request`로 거절합니다 |
 | `id_token_hint` | 구현. 지정한 계정과 현재 Session의 사용자가 다르면 조용히 코드를 발급하지 않고 재인증을 요구합니다 |
 | `request` / `request_uri` | 미지원. 무시하지 않고 `request_not_supported` / `request_uri_not_supported`로 거절합니다 |
 | `max_age` | 구현. 마지막 인증이 지정한 시간보다 오래되었으면 SSO Session이 있어도 재인증을 요구하며, `prompt=none`이면 `login_required`를 반환합니다 |

@@ -2162,3 +2162,84 @@ func TestIntegrationTakenNamesAreExplainedNotDumped(t *testing.T) {
 		t.Errorf("creating a role with a free name answered %d %v", status, body)
 	}
 }
+
+// prompt is a space-delimited set, and it was compared as one value. So
+// `prompt=login consent` — which several SDKs send — did not match "login",
+// the existing session was reused, and a code came back: a relying party
+// asking for a fresh proof of identity before something sensitive received one
+// minted from an hour-old session, with nothing in the response to say so.
+// That is the same silence max_age and id_token_hint were fixed for.
+func TestIntegrationPromptIsReadAsTheListItIs(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+		ClientID: "prompt-rp", Name: "Prompt RP", Type: "public",
+		RedirectURIs: []string{"http://localhost:9999/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"},
+		RequirePKCE: true}); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	response := postIntegrationLogin(t, browser, server.URL, "admin", "bootstrap-password-123")
+	_ = response.Body.Close()
+
+	authorize := func(prompt string) string {
+		t.Helper()
+		query := url.Values{
+			"client_id": {"prompt-rp"}, "redirect_uri": {"http://localhost:9999/cb"},
+			"response_type": {"code"}, "scope": {"openid"}, "state": {"prompt-state"},
+			"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+			"code_challenge_method": {"S256"},
+		}
+		if prompt != "" {
+			query.Set("prompt", prompt)
+		}
+		result, doErr := browser.Get(server.URL + "/realms/master/protocol/openid-connect/auth?" + query.Encode())
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer result.Body.Close()
+		return result.Header.Get("Location")
+	}
+
+	// Without a prompt the live session is what the parameter exists to
+	// override, so this has to keep working or the rest proves nothing.
+	if location := authorize(""); !strings.Contains(location, "code=") {
+		t.Fatalf("an ordinary authorization did not reuse the session: %q", location)
+	}
+	for _, asking := range []string{"login", "login consent", "consent login", "select_account login"} {
+		if location := authorize(asking); !strings.Contains(location, "/login?request=") {
+			t.Errorf("prompt=%q did not ask the person to authenticate again: %q", asking, location)
+		}
+	}
+	// A value this server has no screen for is not a reason to refuse; it is
+	// ignored, and the session is reused as it would be without it.
+	for _, ignored := range []string{"consent", "select_account", "consent select_account"} {
+		if location := authorize(ignored); !strings.Contains(location, "code=") {
+			t.Errorf("prompt=%q was treated as something to act on: %q", ignored, location)
+		}
+	}
+	// none forbids interaction and login demands it; a request asking for both
+	// cannot be answered, and answering whichever is checked first is how the
+	// other goes unnoticed.
+	location := authorize("none login")
+	if !strings.Contains(location, "error=invalid_request") {
+		t.Errorf("prompt=%q was answered rather than refused: %q", "none login", location)
+	}
+}
