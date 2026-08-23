@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -92,13 +94,29 @@ func (s *Store) ListSystemLogs(ctx context.Context, level, query string, limit, 
 	return logs, rows.Err()
 }
 
+// PruneOperationalData applies the fixed retentions. Every statement is
+// attempted, and the failures are reported together.
+//
+// Stopping at the first error meant one statement decided the fate of every
+// statement after it. That is worse than it sounds, because it repeats: the
+// same statement fails at the same position every hour, so the tables it
+// shields never get collected at all, they grow, and growing makes the
+// statement slower still. The likeliest trigger is not a broken query but the
+// deadline the caller sets — and the largest table by far, a year of audit
+// events, used to sit third in a list of nine.
+//
+// So the order matters too, and it is now the order of what cannot wait:
+// tables that fill from outside traffic first, then the ones bounded by
+// sessions, then the long historical retentions. If time runs out, what is
+// left undone is the part that can wait another hour.
 func (s *Store) PruneOperationalData(ctx context.Context) error {
 	// Fixed retention is intentional: no additional environment configuration
 	// is needed, while audit events remain available for one year.
-	statements := []string{
-		"UPDATE signing_keys SET status='RETIRED' WHERE status='PASSIVE' AND retire_at<now()",
-		"DELETE FROM system_logs WHERE occurred_at < now() - interval '30 days'",
-		"DELETE FROM audit_events WHERE occurred_at < now() - interval '365 days'",
+	statements := []struct{ what, sql string }{
+		// Not a retention: a passive signing key that has reached its retire_at
+		// must stop being offered, and it is cheap.
+		{"retire passive signing keys",
+			"UPDATE signing_keys SET status='RETIRED' WHERE status='PASSIVE' AND retire_at<now()"},
 		// A pending request is invisible to every reader the moment it
 		// expires, so the extra day bought nothing — and this table fills
 		// from unauthenticated traffic. Reaching the endpoint that writes a
@@ -106,7 +124,12 @@ func (s *Store) PruneOperationalData(ctx context.Context) error {
 		// which appear in any relying party's sign-in link, so anyone can
 		// drive one insert per request. Keeping those for a day turned a
 		// burst of traffic into storage that outlives it.
-		"DELETE FROM authorization_requests WHERE expires_at < now()",
+		{"expired authorization requests",
+			"DELETE FROM authorization_requests WHERE expires_at < now()"},
+		{"expired login rate limit buckets",
+			"DELETE FROM login_rate_limits WHERE updated_at < now() - interval '1 day'"},
+		{"expired access token revocations",
+			"DELETE FROM revoked_access_tokens WHERE expires_at < now()"},
 		// An authorization code outlives its usefulness as a credential in
 		// ninety seconds, but it is also the only record that a client took
 		// part in a session — back-channel logout reads it to decide who to
@@ -114,22 +137,36 @@ func (s *Store) PruneOperationalData(ctx context.Context) error {
 		// that unable to tell its relying parties the user had signed out.
 		// One row per client is kept while the session is live, which is all
 		// the notification needs, and everything else still goes.
-		`DELETE FROM authorization_codes a WHERE a.expires_at < now() - interval '1 day'
+		{"spent authorization codes",
+			`DELETE FROM authorization_codes a WHERE a.expires_at < now() - interval '1 day'
             AND (NOT EXISTS(SELECT 1 FROM sso_sessions s WHERE s.id=a.session_id
                     AND s.revoked_at IS NULL AND s.expires_at>now())
                 OR EXISTS(SELECT 1 FROM authorization_codes b WHERE b.session_id=a.session_id
-                    AND b.client_id=a.client_id AND b.expires_at>a.expires_at))`,
-		"DELETE FROM revoked_access_tokens WHERE expires_at < now()",
-		"DELETE FROM login_rate_limits WHERE updated_at < now() - interval '1 day'",
+                    AND b.client_id=a.client_id AND b.expires_at>a.expires_at))`},
 		// Refresh tokens were only collected through the session cascade, so a
 		// long-lived session accumulated every rotation it ever performed.
-		"DELETE FROM refresh_tokens WHERE expires_at < now() - interval '7 days'",
-		"DELETE FROM sso_sessions WHERE expires_at < now() - interval '30 days'",
+		{"expired refresh tokens",
+			"DELETE FROM refresh_tokens WHERE expires_at < now() - interval '7 days'"},
+		{"expired sessions",
+			"DELETE FROM sso_sessions WHERE expires_at < now() - interval '30 days'"},
+		{"system logs past retention",
+			"DELETE FROM system_logs WHERE occurred_at < now() - interval '30 days'"},
+		{"audit events past retention",
+			"DELETE FROM audit_events WHERE occurred_at < now() - interval '365 days'"},
 	}
+	var failures []error
 	for _, statement := range statements {
-		if _, err := s.Pool.Exec(ctx, statement); err != nil {
-			return err
+		if _, err := s.Pool.Exec(ctx, statement.sql); err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", statement.what, err))
+			// A spent deadline is the one failure that does carry to the rest:
+			// every remaining statement would fail the same way and say so
+			// nine times over.
+			if ctx.Err() != nil {
+				failures = append(failures, fmt.Errorf(
+					"%d further retention statements were not attempted", len(statements)-len(failures)))
+				break
+			}
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }

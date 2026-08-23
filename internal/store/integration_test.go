@@ -3120,3 +3120,100 @@ func TestIntegrationDisablingAnAccountSignsItOutForGood(t *testing.T) {
 		t.Errorf("disabling twice notified relying parties again: %+v", told)
 	}
 }
+
+// The retention sweep used to return at the first failing statement, so one
+// statement decided the fate of every statement after it. That repeats every
+// hour at the same position, so the tables behind the failure are never
+// collected at all — they grow, and growing makes the failure more likely
+// still. The realistic trigger is the two-minute deadline the caller sets
+// running out on the largest table, which is a year of audit events, and that
+// one used to sit third in a list of nine.
+func TestIntegrationRetentionSweepDoesNotStopAtOneFailure(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	client, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "retention-probe", Name: "Retention Probe", Type: "public",
+		RedirectURIs: []string{"https://probe.example.test/cb"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One expired row for three of the statements that follow the audit sweep.
+	// The first fills from unauthenticated traffic, which is what makes it the
+	// worst one to leave uncollected.
+	seed := func(marker string) {
+		t.Helper()
+		if _, err := data.Pool.Exec(ctx, `INSERT INTO authorization_requests(id,token_hash,realm_id,client_id,
+			redirect_uri,response_type,scope,state,nonce,code_challenge,code_challenge_method,expires_at)
+			VALUES($1,$2,$3,$4,'https://probe.example.test/cb','code',ARRAY['openid'],'','','','S256',
+			now()-interval '1 hour')`, uuid.New(), data.Sealer.Digest(marker),
+			bootstrap.RealmID, client.Client.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := data.Pool.Exec(ctx, `INSERT INTO revoked_access_tokens(jti,expires_at)
+			VALUES($1,now()-interval '1 hour')`, uuid.New()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := data.Pool.Exec(ctx, `INSERT INTO login_rate_limits(bucket_hash,attempts,
+			window_started_at,updated_at) VALUES($1,1,now()-interval '30 days',now()-interval '30 days')`,
+			data.Sealer.Digest(marker)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	uncollected := func() int {
+		t.Helper()
+		var total int
+		if err := data.Pool.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM authorization_requests)
+			+ (SELECT count(*) FROM revoked_access_tokens)
+			+ (SELECT count(*) FROM login_rate_limits)`).Scan(&total); err != nil {
+			t.Fatal(err)
+		}
+		return total
+	}
+
+	seed("healthy")
+	if err := data.PruneOperationalData(ctx); err != nil {
+		t.Fatalf("a healthy sweep reported %v", err)
+	}
+	if left := uncollected(); left != 0 {
+		t.Fatalf("a healthy sweep left %d expired rows", left)
+	}
+
+	// Break one statement in the middle of the list. Renaming the table is a
+	// stand-in for whatever makes a statement fail on a real installation —
+	// a lock, a statement timeout, a deadline — and the point is only that
+	// the ones after it still run.
+	seed("broken")
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE audit_events RENAME TO audit_events_moved"); err != nil {
+		t.Fatal(err)
+	}
+	restore := func() {
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE audit_events_moved RENAME TO audit_events"); err != nil {
+			t.Error(err)
+		}
+	}
+	sweepErr := data.PruneOperationalData(ctx)
+	restore()
+	if sweepErr == nil {
+		t.Fatal("a sweep with a broken statement reported success")
+	}
+	// An operator reading one line has to be able to tell which statement it
+	// was; "cleanup failed" and nothing else was the whole report before.
+	if !strings.Contains(sweepErr.Error(), "audit events past retention") {
+		t.Errorf("the failure does not name the statement: %v", sweepErr)
+	}
+	if left := uncollected(); left != 0 {
+		t.Errorf("one broken statement left %d expired rows uncollected", left)
+	}
+
+	// A spent deadline is the one failure that does carry to the rest, and
+	// saying so beats repeating the same error for every statement left.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	deadlineErr := data.PruneOperationalData(cancelled)
+	if deadlineErr == nil || !strings.Contains(deadlineErr.Error(), "were not attempted") {
+		t.Errorf("a spent deadline reported %v, want the statements left undone", deadlineErr)
+	}
+}
