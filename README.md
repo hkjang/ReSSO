@@ -183,6 +183,7 @@ scrape_configs:
 | `resso_backchannel_logout_total` | Back-Channel Logout 전달 결과 |
 | `resso_federation_sync_total` | 주기 LDAP 동기화 성공·실패 수 |
 | `resso_system_log_records_total` | 서버 로그의 데이터베이스 기록·유실·실패 수 |
+| `resso_uptime_seconds` | 이 인스턴스가 기동한 뒤 지난 시간 |
 
 ## 개발 및 검증
 

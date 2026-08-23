@@ -1,11 +1,15 @@
 package httpserver
 
 import (
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/hkjang/ReSSO/internal/observability"
 )
 
 // The operations guide's table of signals tells an operator which audit events
@@ -114,4 +118,50 @@ func auditEventLiterals(t *testing.T, root string) map[string]bool {
 		t.Fatal("no audit event literals were found; the patterns no longer match how they are written")
 	}
 	return events
+}
+
+// The README publishes the metric list as what an operator points Prometheus
+// at, and an entry that no longer exists is a dashboard panel that stays empty
+// while looking configured. The check runs both ways here, unlike the audit
+// table above: that one is a selection of signals worth watching, this one
+// claims to be the list.
+func TestReadmeListsTheMetricsTheServiceExposes(t *testing.T) {
+	root := filepath.Join("..", "..")
+	readme, err := os.ReadFile(filepath.Join(root, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	documented := map[string]bool{}
+	for _, match := range regexp.MustCompile("`(resso_[a-z_]+)`").FindAllStringSubmatch(string(readme), -1) {
+		documented[match[1]] = true
+	}
+	if len(documented) == 0 {
+		t.Fatal("the README no longer names any metric")
+	}
+
+	// The registry a running instance serves from, including the series the
+	// log mirror registers — it is created in main with this same registry, so
+	// leaving it out would understate what /metrics carries.
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(nil, logger, nil, nil)
+	observability.NewDBHandler(slog.NewTextHandler(io.Discard, nil), nil, "resso", server.metrics)
+	var exposition strings.Builder
+	server.metrics.WritePrometheus(&exposition)
+	exposed := map[string]bool{}
+	for _, line := range strings.Split(exposition.String(), "\n") {
+		if after, found := strings.CutPrefix(line, "# TYPE "); found {
+			exposed[strings.Fields(after)[0]] = true
+		}
+	}
+
+	for name := range exposed {
+		if !documented[name] {
+			t.Errorf("/metrics serves %s, which the README does not list", name)
+		}
+	}
+	for name := range documented {
+		if !exposed[name] {
+			t.Errorf("the README lists %s, which nothing serves", name)
+		}
+	}
 }
