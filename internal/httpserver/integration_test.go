@@ -2243,3 +2243,123 @@ func TestIntegrationPromptIsReadAsTheListItIs(t *testing.T) {
 		t.Errorf("prompt=%q was answered rather than refused: %q", "none login", location)
 	}
 }
+
+// The discovery document is the contract a relying party configures itself
+// from without asking anybody, so an advertisement that does not match
+// behaviour is found by an integrator at the worst moment. Each claim checked
+// here is exercised in both directions: what the document offers has to work,
+// and something it does not offer has to be refused rather than quietly
+// treated as something else.
+func TestIntegrationDiscoveryAdvertisesWhatTheEndpointsDo(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+		ClientID: "discovery-rp", Name: "Discovery RP", Type: "confidential",
+		RedirectURIs:  []string{"http://localhost:9999/cb"},
+		GrantTypes:    []string{"authorization_code", "refresh_token", "client_credentials"},
+		DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	response, err := client.Get(server.URL + "/realms/master/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&document); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	offers := func(field, value string) bool {
+		for _, entry := range document[field].([]any) {
+			if entry == value {
+				return true
+			}
+		}
+		return false
+	}
+
+	// The authorization endpoint, asked with one parameter varied at a time.
+	authorize := func(overrides url.Values) string {
+		t.Helper()
+		query := url.Values{
+			"client_id": {"discovery-rp"}, "redirect_uri": {"http://localhost:9999/cb"},
+			"response_type": {"code"}, "scope": {"openid"}, "state": {"discovery"},
+			"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+			"code_challenge_method": {"S256"},
+		}
+		for key, values := range overrides {
+			query[key] = values
+		}
+		result, doErr := client.Get(server.URL + "/realms/master/protocol/openid-connect/auth?" + query.Encode())
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer result.Body.Close()
+		return result.Header.Get("Location")
+	}
+
+	if !offers("response_types_supported", "code") || !offers("response_modes_supported", "query") {
+		t.Fatal("the document no longer offers the code flow this test is written against")
+	}
+	if location := authorize(nil); strings.Contains(location, "error=") {
+		t.Errorf("response_type=code is advertised and was refused: %q", location)
+	}
+	for field, refusal := range map[string]struct {
+		params    url.Values
+		wantError string
+	}{
+		"an unadvertised response_type": {url.Values{"response_type": {"token"}}, "unsupported_response_type"},
+		"an unadvertised response_mode": {url.Values{"response_mode": {"fragment"}}, "unsupported_response_mode"},
+		// plain PKCE is the one that matters: it puts the verifier in the
+		// authorization request, so anyone who sees the request can redeem
+		// the code. The document offers only S256.
+		"an unadvertised code_challenge_method": {url.Values{"code_challenge_method": {"plain"},
+			"code_challenge": {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"}}, "invalid_request"},
+		// The document says it supports neither, and says so rather than
+		// ignoring them, which would use the unsigned query string instead.
+		"the request parameter":     {url.Values{"request": {"eyJhbGciOiJub25lIn0."}}, "request_not_supported"},
+		"the request_uri parameter": {url.Values{"request_uri": {"https://rp.example.test/req"}}, "request_uri_not_supported"},
+	} {
+		if location := authorize(refusal.params); !strings.Contains(location, "error="+refusal.wantError) {
+			t.Errorf("%s was answered with %q, want %s", field, location, refusal.wantError)
+		}
+	}
+	if offers("code_challenge_methods_supported", "plain") {
+		t.Error("the document offers plain PKCE, which the authorization endpoint refuses")
+	}
+
+	// The token endpoint, for a grant the document does not list.
+	secret, err := data.RotateClientSecret(ctx, created.Client.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{"grant_type": {"password"}, "client_id": {"discovery-rp"},
+		"client_secret": {secret}, "username": {"admin"}, "password": {"bootstrap-password-123"}}
+	result, err := client.PostForm(server.URL+"/realms/master/protocol/openid-connect/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	_ = json.NewDecoder(result.Body).Decode(&body)
+	_ = result.Body.Close()
+	if offers("grant_types_supported", "password") {
+		t.Error("the document offers the password grant")
+	}
+	if body["error"] != "unsupported_grant_type" {
+		t.Errorf("an unadvertised grant answered %v, want unsupported_grant_type", body)
+	}
+}
