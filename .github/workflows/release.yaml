@@ -97,6 +97,31 @@ jobs:
           docker save "resso:${GITHUB_REF_NAME}" | gzip -9 -n > "resso-${GITHUB_REF_NAME}.tar.gz"
           gzip -t "resso-${GITHUB_REF_NAME}.tar.gz"
           sha256sum "resso-${GITHUB_REF_NAME}.tar.gz" > release-sha256.txt
+      # What is published has to be loadable by the command the README gives,
+      # from the two files as published and nothing else. Packaging was
+      # verified up to this point and the reverse trip never was, so a change
+      # to either the packaging or the loading script could ship a release that
+      # an operator cannot bring in — the one step that happens where nobody
+      # can fix it.
+      - name: Load the published archive back, as an operator would
+        shell: bash
+        run: |
+          docker image rm "resso:${GITHUB_REF_NAME}"
+          if docker image inspect "resso:${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "the image was still present, so the load below would prove nothing" >&2
+            exit 1
+          fi
+          ./scripts/offline-load.sh "resso-${GITHUB_REF_NAME}.tar.gz"
+          docker image inspect "resso:${GITHUB_REF_NAME}" >/dev/null
+          # And a damaged archive has to be refused rather than half-loaded.
+          cp "resso-${GITHUB_REF_NAME}.tar.gz" damaged.tar.gz
+          printf '\x00' | dd of=damaged.tar.gz bs=1 seek=64 conv=notrunc status=none
+          sed "s/resso-${GITHUB_REF_NAME}.tar.gz/damaged.tar.gz/" release-sha256.txt > damaged-sha256.txt
+          if ./scripts/offline-load.sh damaged.tar.gz damaged-sha256.txt; then
+            echo "a damaged archive was accepted" >&2
+            exit 1
+          fi
+          rm -f damaged.tar.gz damaged-sha256.txt
       - name: Create GitHub release with the image archive
         env:
           GH_TOKEN: ${{ github.token }}
