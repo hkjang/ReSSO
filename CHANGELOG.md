@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Realm이나 Client를 비활성화해도 일부 endpoint가 계속 응답하던 문제**를 수정했습니다. Realm을 조회하는 8개 endpoint 중 Discovery·JWKS·인가·Token만 `enabled`를 확인했고, userinfo·Introspection·Revocation·RP-Initiated Logout은 같은 헬퍼를 쓰면서 확인하지 않았습니다. 그래서 **정지시킨 테넌트가 사용자의 claim을 계속 내주고 Resource Server에게 Token이 유효하다고 계속 답했습니다.** Client도 마찬가지로 Token endpoint만 확인했고, Introspection과 Revocation은 확인하지 않았습니다. Introspection은 Resource Server 패턴을 위해 **같은 Realm의 모든 Confidential Client에게 열려 있으므로**, 폐기했거나 침해된 연동을 비활성화해도 그 Client의 Secret은 남의 Token을 검증하고 내용(`sub`·`username`·`scope`·`azp`)을 읽어내는 데 그대로 쓸 수 있었습니다. 두 검사를 각 호출부가 아니라 헬퍼에서 강제하도록 옮겼습니다 — 8개 중 4개, 3개 중 1개만 기억하고 있었다는 것이 호출부에 두는 방식의 결과입니다.
+- RP-Initiated Logout이 Client를 두 가지 방법으로 찾으면서 **한쪽만 `enabled`를 확인하던 문제**를 함께 수정했습니다. `client_id`로 지정하면 거절됐지만 그 Client의 ID Token을 `id_token_hint`으로 제시하면 통과했고, 이 Client가 결정하는 것은 `post_logout_redirect_uri`를 허용할지 여부입니다.
+- 비활성화된 Client가 이미 발급받은 Access Token은 서명 만료까지 유효합니다. 이번 수정은 Client의 **자격 증명**을 막는 것이고, 발급된 Token을 소급해서 무효화하지는 않습니다. Refresh 교환은 Token endpoint에서 이미 거절되므로 갱신되지는 않습니다.
+
 - **계정 비활성화가 실제로는 아무 세션도 끝내지 않던 문제**를 수정했습니다. 모든 세션 조회가 `users.enabled`로 걸러지기 때문에 쿠키는 곧바로 통하지 않게 되고, 그래서 로그아웃된 것처럼 보였습니다. 그러나 Session 레코드도 Refresh Token도 살아 있었고 RP에는 아무 통지도 가지 않았습니다. 결과는 두 가지입니다. 자체 세션을 유지하는 애플리케이션에서는 그 사람이 **계속 로그인 상태로 남고**, 조사나 정직이 끝나 계정을 **다시 활성화하면 비활성화 시점에 열려 있던 세션이 전부 그대로 돌아옵니다** — 애초에 비활성화의 이유였던 그 세션까지 포함해서. 이제 비활성화는 Session과 Refresh Token을 폐기하고 Back-Channel Logout을 전송하며, 재활성화해도 이전 Session은 복구되지 않습니다. 콘솔은 저장 전에 이 사실을 경고로 알립니다.
 - 같은 수정으로 **LDAP `DISABLE` 정책이 Refresh Token을 남겨두고 RP에 알리지 않던 문제**도 함께 해결됐습니다. 이 정책은 콘솔과 문서 모두 "비활성화 및 세션 종료"라고 설명하지만 실제로는 Session 레코드만 SQL로 폐기했고, 그래서 퇴사자가 연동 애플리케이션에서는 계속 로그인 상태였습니다. 비활성화는 콘솔·LDAP 정리·공급자 연결 해제 세 곳에서 일어나고 각자 "세션 종료"의 의미가 달랐는데, 이제 한 경로를 지납니다. 이번 정리에서 사라진 계정만 대상으로 하므로 예전에 떠난 사람에게 로그아웃이 반복 전송되지 않습니다.
 

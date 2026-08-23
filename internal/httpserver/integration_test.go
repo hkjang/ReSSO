@@ -1399,3 +1399,180 @@ func TestIntegrationMCPDirectoryReadsAreRecorded(t *testing.T) {
 		}
 	}
 }
+
+// Switching a Realm off, or a Client, is an operator saying "this stops now".
+// Whether it stopped depended on which endpoint was asked. Discovery, JWKS,
+// authorization and the token endpoint tested the flags; userinfo,
+// introspection, revocation and RP-initiated logout resolved the Realm through
+// the same helper and never looked, and introspection and revocation
+// authenticated the Client through the same helper and never looked either.
+//
+// So a suspended tenant went on handing out its users' claims and telling
+// resource servers their tokens were good, and a decommissioned Client kept a
+// working secret at the one endpoint that is deliberately open to every
+// confidential Client of the Realm — able to validate and read the contents of
+// tokens minted for anybody else.
+func TestIntegrationDisabledRealmAndClientAreRefusedEverywhere(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "suspendable-rs", Name: "Resource Server", Type: "confidential",
+		RedirectURIs:           []string{"https://rs.example.test/cb"},
+		PostLogoutRedirectURIs: []string{"https://rs.example.test/bye"},
+		GrantTypes:             []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "tenant-user", Password: "tenant-user-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "suspension-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	base := server.URL + "/realms/master/protocol/openid-connect"
+
+	// Revocation consumes the token it is given, so every probe gets its own.
+	freshToken := func() string {
+		t.Helper()
+		issued, issueErr := service.IssueUserTokens(ctx, realm, rs.Client, user, session.Session.ID,
+			[]string{"openid"}, "", false)
+		if issueErr != nil {
+			t.Fatal(issueErr)
+		}
+		return issued.AccessToken
+	}
+	clientForm := func() url.Values {
+		return url.Values{"token": {freshToken()}, "client_id": {"suspendable-rs"},
+			"client_secret": {rs.ClientSecret}}
+	}
+	post := func(path string, form url.Values) (int, map[string]any) {
+		t.Helper()
+		response, postErr := server.Client().PostForm(base+path, form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		var decoded map[string]any
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		return response.StatusCode, decoded
+	}
+	userInfoStatus := func() int {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodGet, base+"/userinfo", nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Authorization", "Bearer "+freshToken())
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer response.Body.Close()
+		return response.StatusCode
+	}
+	discoveryStatus := func() int {
+		t.Helper()
+		response, getErr := server.Client().Get(server.URL + "/realms/master/.well-known/openid-configuration")
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		defer response.Body.Close()
+		return response.StatusCode
+	}
+	introspectionActive := func() bool {
+		t.Helper()
+		_, body := post("/token/introspect", clientForm())
+		active, _ := body["active"].(bool)
+		return active
+	}
+
+	if discoveryStatus() != http.StatusOK || userInfoStatus() != http.StatusOK || !introspectionActive() {
+		t.Fatal("the Realm and Client did not work to begin with")
+	}
+
+	setRealmEnabled := func(enabled bool) {
+		t.Helper()
+		if _, err := data.UpdateRealm(ctx, realm.ID, store.UpdateRealmInput{
+			DisplayName: realm.DisplayName, IssuerURL: realm.IssuerURL, Enabled: enabled,
+			AccessTokenTTLSeconds:  realm.AccessTokenTTLSeconds,
+			RefreshTokenTTLSeconds: realm.RefreshTokenTTLSeconds,
+			SessionTTLSeconds:      realm.SessionTTLSeconds,
+			PasswordMinLength:      realm.PasswordMinLength, MaxLoginAttempts: realm.MaxLoginAttempts,
+			LockoutSeconds: realm.LockoutSeconds}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setRealmEnabled(false)
+	if status := discoveryStatus(); status != http.StatusNotFound {
+		t.Errorf("a suspended Realm answered discovery with %d", status)
+	}
+	if status := userInfoStatus(); status != http.StatusUnauthorized {
+		t.Errorf("a suspended Realm served userinfo with %d", status)
+	}
+	if introspectionActive() {
+		t.Error("a suspended Realm told a resource server its token was active")
+	}
+	// RFC 7009 requires 200 whether or not anything matched, so the refusal
+	// here is that nothing is revoked, not the status code.
+	if status, _ := post("/revoke", clientForm()); status != http.StatusOK {
+		t.Errorf("revocation on a suspended Realm answered %d, want 200 per RFC 7009", status)
+	}
+	setRealmEnabled(true)
+
+	if _, err := data.UpdateClient(ctx, rs.Client.ID, store.UpdateClientInput{
+		Name: rs.Client.Name, RedirectURIs: rs.Client.RedirectURIs,
+		PostLogoutRedirectURIs: rs.Client.PostLogoutRedirectURIs,
+		GrantTypes:             rs.Client.GrantTypes, DefaultScopes: rs.Client.DefaultScopes,
+		RequirePKCE: rs.Client.RequirePKCE, Enabled: false,
+		AccessTokenTTLSeconds:  rs.Client.AccessTokenTTLSeconds,
+		RefreshTokenTTLSeconds: rs.Client.RefreshTokenTTLSeconds}); err != nil {
+		t.Fatal(err)
+	}
+	for path, endpoint := range map[string]string{"/token/introspect": "introspection", "/revoke": "revocation"} {
+		status, body := post(path, clientForm())
+		if status != http.StatusUnauthorized || body["error"] != "invalid_client" {
+			t.Errorf("a switched-off Client was accepted at %s: status=%d body=%v", endpoint, status, body)
+		}
+	}
+	// The Realm is still running, and a token minted before the Client was
+	// switched off carries its own expiry — this is about the Client's
+	// credentials, not about retroactively unmaking what it was issued.
+	if status := userInfoStatus(); status != http.StatusOK {
+		t.Errorf("switching off one Client broke userinfo for the Realm: %d", status)
+	}
+
+	// RP-initiated logout resolves the Client two ways and only one of them
+	// tested the flag, so a switched-off Client's registered post-logout
+	// target was still honoured when its ID token was presented as the hint.
+	hint := issueIntegrationIDTokenFor(t, data, realm, "suspendable-rs", user, session.Session.ID)
+	noRedirect := server.Client()
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	logout, err := noRedirect.Get(base + "/logout?id_token_hint=" + url.QueryEscape(hint) +
+		"&post_logout_redirect_uri=" + url.QueryEscape("https://rs.example.test/bye"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logout.Body.Close()
+	if location := logout.Header.Get("Location"); strings.Contains(location, "rs.example.test/bye") {
+		t.Errorf("a switched-off Client's post-logout redirect was honoured: %q", location)
+	}
+}

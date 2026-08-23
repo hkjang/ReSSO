@@ -19,13 +19,30 @@ import (
 	"github.com/hkjang/ReSSO/internal/store"
 )
 
+// realmFromPath resolves the Realm named in the route and refuses one that is
+// switched off.
+//
+// The check lives here rather than at each caller because splitting it is how
+// a path gets forgotten: of the eight endpoints that resolve a Realm this way,
+// discovery, JWKS, authorization and the token endpoint tested the flag and
+// userinfo, introspection, revocation and RP-initiated logout did not. So
+// suspending a tenant took away its ability to issue anything while leaving it
+// answering for the tokens already out there — vouching for them to resource
+// servers and handing back the subject's claims.
 func (s *Server) realmFromPath(r *http.Request) (domain.Realm, error) {
-	return s.store.RealmByName(r.Context(), chi.URLParam(r, "realm"))
+	realm, err := s.store.RealmByName(r.Context(), chi.URLParam(r, "realm"))
+	if err != nil {
+		return domain.Realm{}, err
+	}
+	if !realm.Enabled {
+		return domain.Realm{}, store.ErrNotFound
+	}
+	return realm, nil
 }
 
 func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 	realm, err := s.realmFromPath(r)
-	if err != nil || !realm.Enabled {
+	if err != nil {
 		writeError(w, r, http.StatusNotFound, "realm_not_found", "Realm을 찾을 수 없습니다.")
 		return
 	}
@@ -63,7 +80,7 @@ func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
 	realm, err := s.realmFromPath(r)
-	if err != nil || !realm.Enabled {
+	if err != nil {
 		writeError(w, r, http.StatusNotFound, "realm_not_found", "Realm을 찾을 수 없습니다.")
 		return
 	}
@@ -82,7 +99,7 @@ func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 	realm, err := s.realmFromPath(r)
-	if err != nil || !realm.Enabled {
+	if err != nil {
 		writeError(w, r, http.StatusNotFound, "realm_not_found", "Realm을 찾을 수 없습니다.")
 		return
 	}
@@ -212,12 +229,12 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	realm, err := s.realmFromPath(r)
-	if err != nil || !realm.Enabled {
+	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "realm is unavailable")
 		return
 	}
 	client, authenticated, err := s.authenticateOIDCClient(r, realm)
-	if err != nil || !authenticated || !client.Enabled {
+	if err != nil || !authenticated {
 		s.writeClientAuthError(w, r, err)
 		return
 	}
@@ -399,6 +416,17 @@ func (s *Server) authenticateOIDCClient(r *http.Request, realm domain.Realm) (do
 		}
 		s.metrics.Add(metricClientAuth, 1, realm.Name)
 		return client, false, err
+	}
+	// A switched-off Client authenticates no better than a wrong secret. Only
+	// the token endpoint tested this, so disabling a decommissioned or
+	// compromised integration stopped it obtaining new tokens while leaving it
+	// able to introspect — and introspection is deliberately open to every
+	// confidential Client of the Realm, so its still-valid secret went on
+	// validating and reading out other Clients' tokens. No failure is counted
+	// against the limiter: the secret was right, and this is not somebody
+	// guessing.
+	if !client.Enabled {
+		return client, false, nil
 	}
 	// Only the client's own bucket is cleared. A successful authentication
 	// says nothing about the other clients sharing this address.
@@ -615,8 +643,12 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	var client *domain.Client
 	if hint := values.Get("id_token_hint"); hint != "" {
+		// Enabled is tested in both branches. It was tested only in the one
+		// below, so naming a switched-off Client by client_id was refused
+		// while presenting its ID token was not — and what this Client
+		// decides is whether a post-logout redirect target is allowed.
 		if verified, verifyErr := s.oidc.Verify(r.Context(), realm, hint, ""); verifyErr == nil {
-			if found, findErr := s.store.ClientByIdentifier(r.Context(), realm.ID, verified.Extra.AuthorizedParty); findErr == nil {
+			if found, findErr := s.store.ClientByIdentifier(r.Context(), realm.ID, verified.Extra.AuthorizedParty); findErr == nil && found.Enabled {
 				client = &found
 			}
 		}
