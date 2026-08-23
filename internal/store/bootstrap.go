@@ -57,9 +57,25 @@ func (s *Store) Bootstrap(ctx context.Context, adminUsername, adminPassword stri
 	if err != nil {
 		return BootstrapResult{}, fmt.Errorf("ensure bootstrap administrator: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `UPDATE users SET platform_admin=true, enabled=true
-        WHERE id=$1`, result.AdminUserID); err != nil {
-		return BootstrapResult{}, fmt.Errorf("ensure bootstrap privileges: %w", err)
+	// The privileges are granted with the account and not re-applied after
+	// that. This used to run on every start, so a restart undid an
+	// administrator's decisions: an operator who disabled the bootstrap
+	// account after creating named administrators — ordinary practice — found
+	// it enabled again, with its original password, the next time the
+	// container came up, and nothing said so. Revoking platform_admin came
+	// back the same way.
+	//
+	// It also meant that pointing BOOTSTRAP_ADMIN at the name of an existing
+	// ordinary user promoted them to platform administrator on the next start.
+	//
+	// Getting back in when the last administrator is locked out is what
+	// `admin recover` is for: it is deliberate, it is audited, and it revokes
+	// the sessions and keys of the account it restores.
+	if result.Created {
+		if _, err := tx.Exec(ctx, `UPDATE users SET platform_admin=true, enabled=true
+	        WHERE id=$1`, result.AdminUserID); err != nil {
+			return BootstrapResult{}, fmt.Errorf("ensure bootstrap privileges: %w", err)
+		}
 	}
 
 	for _, role := range []struct{ name, description string }{

@@ -3797,3 +3797,93 @@ func TestIntegrationSchemaAheadOfThisBuildIsReported(t *testing.T) {
 		t.Errorf("migrating against a schema ahead of this build failed: %v", err)
 	}
 }
+
+// Bootstrap is meant to be idempotent, and it says so: it never resets an
+// existing administrator's password, so a restart cannot become a password
+// reset. But it re-applied platform_admin and enabled on every start, so a
+// restart undid an administrator's decisions instead — an operator who
+// disabled the bootstrap account after creating named administrators, which is
+// ordinary practice, found it enabled again with its original password and
+// nothing to say so.
+//
+// The same line meant that pointing BOOTSTRAP_ADMIN at an existing ordinary
+// user promoted them to platform administrator on the next start.
+func TestIntegrationBootstrapDoesNotUndoAnAdministratorsDecisions(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	first, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Created {
+		t.Fatal("the first bootstrap did not create the administrator")
+	}
+	state := func() (enabled, platformAdmin bool) {
+		t.Helper()
+		if err := data.Pool.QueryRow(ctx, `SELECT enabled, platform_admin FROM users WHERE id=$1`,
+			first.AdminUserID).Scan(&enabled, &platformAdmin); err != nil {
+			t.Fatal(err)
+		}
+		return enabled, platformAdmin
+	}
+	if enabled, admin := state(); !enabled || !admin {
+		t.Fatalf("the account it created is enabled=%v platform_admin=%v", enabled, admin)
+	}
+
+	if _, err := data.UpdateUser(ctx, first.AdminUserID, UpdateUserInput{
+		DisplayName: "Bootstrap Administrator", Email: "", Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET platform_admin=false WHERE id=$1`,
+		first.AdminUserID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The container restarts with the same environment.
+	again, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Created || again.AdminUserID != first.AdminUserID {
+		t.Fatalf("a restart did not find the existing account: %+v", again)
+	}
+	if enabled, admin := state(); enabled || admin {
+		t.Errorf("a restart restored the account: enabled=%v platform_admin=%v", enabled, admin)
+	}
+
+	// Naming an ordinary user in the environment must not promote them.
+	ordinary, err := data.CreateUser(ctx, first.RealmID, CreateUserInput{
+		Username: "alice", Password: "alice-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Bootstrap(ctx, "alice", "unused-password-1234"); err != nil {
+		t.Fatal(err)
+	}
+	var promoted bool
+	if err := data.Pool.QueryRow(ctx, `SELECT platform_admin FROM users WHERE id=$1`,
+		ordinary.ID).Scan(&promoted); err != nil {
+		t.Fatal(err)
+	}
+	if promoted {
+		t.Error("naming an existing user in BOOTSTRAP_ADMIN made them a platform administrator")
+	}
+
+	// And it still does its job on an empty database: the guarantee this
+	// change must not break is that a first start produces a usable
+	// administrator.
+	fresh := openIntegrationStore(t, integrationSealer(t))
+	created, err := fresh.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var enabled, admin bool
+	if err := fresh.Pool.QueryRow(ctx, `SELECT enabled, platform_admin FROM users WHERE id=$1`,
+		created.AdminUserID).Scan(&enabled, &admin); err != nil {
+		t.Fatal(err)
+	}
+	if !created.Created || !enabled || !admin {
+		t.Errorf("a first start did not produce a usable administrator: %+v enabled=%v admin=%v",
+			created, enabled, admin)
+	}
+}
