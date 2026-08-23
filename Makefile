@@ -1,5 +1,15 @@
 .PHONY: lint test test-services test-services-stop build web image release
 
+# Recipes run under bash with pipefail. `make test` pipes the test output
+# through tee to keep a log, and read the status of that pipeline with $?,
+# which under a POSIX shell is tee's — always zero. So a failing `go test`
+# printed its FAIL, the recipe carried on to the next line, and the only reason
+# the build ever stopped was something later failing on its own. The comment
+# above that target is about a run that looks clean when it is not; the line
+# under it was the clearest way to produce one.
+SHELL := /bin/bash
+.SHELLFLAGS := -o pipefail -c
+
 VERSION ?= v0.5.0-dev
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
