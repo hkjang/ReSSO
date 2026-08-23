@@ -1450,14 +1450,27 @@ func TestIntegrationDisabledRealmAndClientAreRefusedEverywhere(t *testing.T) {
 	base := server.URL + "/realms/master/protocol/openid-connect"
 
 	// Revocation consumes the token it is given, so every probe gets its own.
-	freshToken := func() string {
-		t.Helper()
+	// They are all minted here, while the Realm and the Client are still
+	// running, because a token already in somebody's hands is exactly what
+	// this is about — and issuing one is itself refused once the Realm is
+	// suspended, which the token endpoint covers.
+	minted := make([]string, 0, 12)
+	for range cap(minted) {
 		issued, issueErr := service.IssueUserTokens(ctx, realm, rs.Client, user, session.Session.ID,
 			[]string{"openid"}, "", false)
 		if issueErr != nil {
 			t.Fatal(issueErr)
 		}
-		return issued.AccessToken
+		minted = append(minted, issued.AccessToken)
+	}
+	freshToken := func() string {
+		t.Helper()
+		if len(minted) == 0 {
+			t.Fatal("the test ran out of pre-minted access tokens")
+		}
+		token := minted[0]
+		minted = minted[1:]
+		return token
 	}
 	clientForm := func() url.Values {
 		return url.Values{"token": {freshToken()}, "client_id": {"suspendable-rs"},
@@ -1574,5 +1587,167 @@ func TestIntegrationDisabledRealmAndClientAreRefusedEverywhere(t *testing.T) {
 	defer logout.Body.Close()
 	if location := logout.Header.Get("Location"); strings.Contains(location, "rs.example.test/bye") {
 		t.Errorf("a switched-off Client's post-logout redirect was honoured: %q", location)
+	}
+}
+
+// Suspending a Realm is an operator taking a tenant offline. It stopped new
+// logins and nothing else: everybody already signed in kept their console
+// session, and every personal API key its people held went on working —
+// the REST API and, through MCP, the directory itself. A key outlives the
+// session that issued it, so "log everyone out and wait" was not a workaround
+// either.
+//
+// The guard against suspending your own Realm is part of the same change, not
+// a separate nicety: once suspension reaches sessions and keys, applying it to
+// the Realm you are signed in to ends the request making it and every
+// credential that could undo it, and the only way back is the database.
+func TestIntegrationSuspendingARealmReachesSessionsAndKeys(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := data.CreatePersonalAPIKey(ctx, bootstrap.AdminUserID, "agent",
+		[]string{"api:read", "mcp:read", "admin:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := &http.Client{Jar: jar}
+	response := postIntegrationLogin(t, browser, server.URL, "admin", "bootstrap-password-123")
+	var session struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&session); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if session.CSRFToken == "" {
+		t.Fatal("logging in returned no CSRF token")
+	}
+
+	get := func(client *http.Client, bearer string) int {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodGet, server.URL+"/api/admin/v1/realms", nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		if bearer != "" {
+			request.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		result, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer result.Body.Close()
+		return result.StatusCode
+	}
+	withCookie := func() int { return get(browser, "") }
+	withKey := func() int { return get(server.Client(), key.Secret) }
+	mcpReadsDirectory := func() bool {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodPost, server.URL+"/mcp", strings.NewReader(
+			`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resso_search_users","arguments":{"query":"ad"}}}`))
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Authorization", "Bearer "+key.Secret)
+		request.Header.Set("Content-Type", "application/json")
+		result, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer result.Body.Close()
+		body, _ := io.ReadAll(result.Body)
+		return result.StatusCode == http.StatusOK && strings.Contains(string(body), `"username":"admin"`)
+	}
+
+	if withCookie() != http.StatusOK || withKey() != http.StatusOK || !mcpReadsDirectory() {
+		t.Fatal("the Realm did not work to begin with")
+	}
+
+	// Suspending the Realm the administrator is signed in to is refused, and
+	// refused before anything is written.
+	policy := store.UpdateRealmInput{DisplayName: realm.DisplayName, IssuerURL: realm.IssuerURL,
+		Enabled: false, AccessTokenTTLSeconds: realm.AccessTokenTTLSeconds,
+		RefreshTokenTTLSeconds: realm.RefreshTokenTTLSeconds, SessionTTLSeconds: realm.SessionTTLSeconds,
+		PasswordMinLength: realm.PasswordMinLength, MaxLoginAttempts: realm.MaxLoginAttempts,
+		LockoutSeconds: realm.LockoutSeconds}
+	encoded, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPut,
+		server.URL+"/api/admin/v1/realms/"+realm.ID.String(), bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-CSRF-Token", session.CSRFToken)
+	refusal, err := browser.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refusalBody map[string]any
+	_ = json.NewDecoder(refusal.Body).Decode(&refusalBody)
+	_ = refusal.Body.Close()
+	if refusal.StatusCode != http.StatusConflict || refusalBody["error"] != "realm_self_disable" {
+		t.Errorf("suspending one's own Realm answered %d %v", refusal.StatusCode, refusalBody)
+	}
+	if reloaded, reloadErr := data.RealmByID(ctx, realm.ID); reloadErr != nil || !reloaded.Enabled {
+		t.Fatalf("the refused request still wrote: enabled=%v err=%v", reloaded.Enabled, reloadErr)
+	}
+	if withCookie() != http.StatusOK {
+		t.Error("the refusal ended the administrator's own session")
+	}
+
+	// Suspended from outside — which is how a tenant is actually taken
+	// offline — everything the Realm's people hold stops.
+	if _, err := data.UpdateRealm(ctx, realm.ID, policy); err != nil {
+		t.Fatal(err)
+	}
+	if status := withCookie(); status != http.StatusUnauthorized {
+		t.Errorf("a console session of a suspended Realm answered %d", status)
+	}
+	if status := withKey(); status != http.StatusUnauthorized {
+		t.Errorf("an API key of a suspended Realm answered %d", status)
+	}
+	if mcpReadsDirectory() {
+		t.Error("an API key of a suspended Realm read the directory through MCP")
+	}
+	// Logging in was already refused, and stays refused.
+	fresh := postIntegrationLogin(t, &http.Client{}, server.URL, "admin", "bootstrap-password-123")
+	_ = fresh.Body.Close()
+	if fresh.StatusCode != http.StatusUnauthorized {
+		t.Errorf("logging in to a suspended Realm answered %d", fresh.StatusCode)
+	}
+
+	// Suspension filters rather than revokes, so lifting it gives the tenant
+	// back what had not expired on its own. That is the opposite of disabling
+	// an account, which ends its sessions for good — suspending a tenant is a
+	// state the whole Realm is in and is routinely temporary, and there is no
+	// individual whose session is the reason for it. The console says as much
+	// next to the switch, so it is asserted here rather than assumed.
+	policy.Enabled = true
+	if _, err := data.UpdateRealm(ctx, realm.ID, policy); err != nil {
+		t.Fatal(err)
+	}
+	if status := withCookie(); status != http.StatusOK {
+		t.Errorf("lifting the suspension did not restore an unexpired session: %d", status)
+	}
+	if status := withKey(); status != http.StatusOK {
+		t.Errorf("lifting the suspension did not restore an unexpired API key: %d", status)
 	}
 }

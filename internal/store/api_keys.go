@@ -86,6 +86,11 @@ func (s *Store) ListPersonalAPIKeys(ctx context.Context, userID uuid.UUID) ([]Pe
 	return keys, rows.Err()
 }
 
+// AuthenticateAPIKey resolves a personal API key to the principal it acts for.
+//
+// The Realm is joined for its enabled flag, not for any column: a key outlives
+// the session that created it, so suspending a Realm left every key its people
+// held still working — the REST API and, through MCP, the directory itself.
 func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (domain.Principal, error) {
 	dot := strings.IndexByte(raw, '.')
 	if dot < 4 || dot > 40 {
@@ -97,9 +102,9 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (domain.Prin
 	err := s.Pool.QueryRow(ctx, `SELECT u.id,u.realm_id,u.username,u.platform_admin,
 		EXISTS(SELECT 1 FROM user_roles ur JOIN roles r ON r.id=ur.role_id
 		    WHERE ur.user_id=u.id AND r.name='realm-admin'),k.scopes,k.secret_hash
-        FROM personal_api_keys k JOIN users u ON u.id=k.user_id
+        FROM personal_api_keys k JOIN users u ON u.id=k.user_id JOIN realms rlm ON rlm.id=u.realm_id
         WHERE k.prefix=$1 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>now())
-        AND u.enabled=true`, prefix).Scan(&principal.UserID, &principal.RealmID, &principal.Username,
+        AND u.enabled=true AND rlm.enabled`, prefix).Scan(&principal.UserID, &principal.RealmID, &principal.Username,
 		&principal.PlatformAdmin, &principal.RealmAdmin, &principal.Scopes, &expected)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !s.Sealer.MatchDigest(raw, expected)) {
 		return domain.Principal{}, ErrNotFound

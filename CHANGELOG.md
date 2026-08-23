@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Realm을 정지시켜도 이미 들어와 있는 사람은 계속 쓸 수 있던 문제**를 수정했습니다. 새 로그인만 막혔고, 열려 있는 콘솔 세션도 개인 API 키도 그대로 동작했습니다. API 키는 세션보다 오래 살아남으므로 "전원 로그아웃시키고 기다린다"로 대체할 수도 없었고, 같은 키로 **MCP를 통해 디렉터리를 계속 읽을 수 있었습니다.** 세션 판정(`sessionIsLive`)과 API 키 인증이 Realm 상태를 보도록 했습니다 — 세션 쪽은 이미 Realm을 조인하고 있었으므로 한 단어가 모든 경로를 덮습니다.
+- **자신이 로그인한 Realm은 비활성화할 수 없습니다.** 위 수정과 같은 변경에 포함해야 하는 항목입니다. 정지가 세션과 API 키까지 미치게 되면, 자기가 속한 Realm에 적용하는 순간 요청을 보내는 세션과 되돌릴 수 있는 모든 자격 증명이 함께 끊겨 데이터베이스를 직접 고치는 것 말고는 복구 수단이 없어집니다. 지금까지는 아무 방지 장치도 없었고 `master`도 예외가 아니었습니다. 다른 Realm 정지는 그대로 가능합니다.
+- Realm 정지는 **폐기가 아니라 차단**입니다. 다시 활성화하면 만료되지 않은 세션과 API 키가 그대로 다시 동작합니다. 계정 비활성화가 세션을 영구 종료하는 것과 의도적으로 다르며 — 테넌트 정지는 보통 일시적이고 특정 개인의 세션이 원인인 상황이 아닙니다 — 콘솔과 문서에 그렇게 적었고 테스트가 확인합니다.
+
 - **Realm이나 Client를 비활성화해도 일부 endpoint가 계속 응답하던 문제**를 수정했습니다. Realm을 조회하는 8개 endpoint 중 Discovery·JWKS·인가·Token만 `enabled`를 확인했고, userinfo·Introspection·Revocation·RP-Initiated Logout은 같은 헬퍼를 쓰면서 확인하지 않았습니다. 그래서 **정지시킨 테넌트가 사용자의 claim을 계속 내주고 Resource Server에게 Token이 유효하다고 계속 답했습니다.** Client도 마찬가지로 Token endpoint만 확인했고, Introspection과 Revocation은 확인하지 않았습니다. Introspection은 Resource Server 패턴을 위해 **같은 Realm의 모든 Confidential Client에게 열려 있으므로**, 폐기했거나 침해된 연동을 비활성화해도 그 Client의 Secret은 남의 Token을 검증하고 내용(`sub`·`username`·`scope`·`azp`)을 읽어내는 데 그대로 쓸 수 있었습니다. 두 검사를 각 호출부가 아니라 헬퍼에서 강제하도록 옮겼습니다 — 8개 중 4개, 3개 중 1개만 기억하고 있었다는 것이 호출부에 두는 방식의 결과입니다.
 - RP-Initiated Logout이 Client를 두 가지 방법으로 찾으면서 **한쪽만 `enabled`를 확인하던 문제**를 함께 수정했습니다. `client_id`로 지정하면 거절됐지만 그 Client의 ID Token을 `id_token_hint`으로 제시하면 통과했고, 이 Client가 결정하는 것은 `post_logout_redirect_uri`를 허용할지 여부입니다.
 - 비활성화된 Client가 이미 발급받은 Access Token은 서명 만료까지 유효합니다. 이번 수정은 Client의 **자격 증명**을 막는 것이고, 발급된 Token을 소급해서 무효화하지는 않습니다. Refresh 교환은 Token endpoint에서 이미 거절되므로 갱신되지는 않습니다.

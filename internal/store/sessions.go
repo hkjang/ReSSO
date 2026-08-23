@@ -18,7 +18,12 @@ import (
 // forgotten: the absolute lifetime was enforced in four places and an idle
 // timeout added to only some of them would let a stale session keep issuing
 // tokens. `s` must alias sso_sessions and `r` the owning realm.
-const sessionIsLive = `s.revoked_at IS NULL AND s.expires_at>now()
+//
+// A suspended Realm is included here for the same reason. Suspending one
+// stopped new logins and nothing else, so everybody already signed in kept
+// their console session and went on working — the tenant was off at the front
+// door and open to everyone already inside.
+const sessionIsLive = `s.revoked_at IS NULL AND s.expires_at>now() AND r.enabled
         AND (r.idle_timeout_seconds = 0 OR s.last_access > now()-make_interval(secs => r.idle_timeout_seconds))`
 
 type NewSession struct {

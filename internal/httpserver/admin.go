@@ -200,12 +200,22 @@ func (s *Server) adminUpdateRealm(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
+	principal, _ := principalFrom(r.Context())
+	// Suspending a Realm now stops its sessions and its API keys, not just new
+	// logins. Applied to the Realm the administrator is signed in to, that
+	// ends the very session making the request and every key that could undo
+	// it, leaving no way back except editing the database by hand. Other
+	// Realms can still be suspended, which is what the flag is for.
+	if !input.Enabled && id == principal.RealmID {
+		writeError(w, r, http.StatusConflict, "realm_self_disable",
+			"자신이 로그인한 Realm은 비활성화할 수 없습니다. 비활성화하면 이 Realm의 모든 세션과 API 키가 중단되어 되돌릴 수단이 남지 않습니다.")
+		return
+	}
 	realm, err := s.store.UpdateRealm(r.Context(), id, input)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "realm_update_failed", err.Error())
 		return
 	}
-	principal, _ := principalFrom(r.Context())
 	s.audit(r, &id, &principal.UserID, principal.Username, "REALM_UPDATE", "SUCCESS", "realm", id.String(), map[string]any{"approval_enabled": realm.ApprovalEnabled})
 	writeJSON(w, http.StatusOK, realm)
 }

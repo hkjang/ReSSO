@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import { useParams } from 'react-router-dom'
-import { Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, Stack, Switch, TextField, Typography } from '@mui/material'
+import { Alert, Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, Stack, Switch, TextField, Typography } from '@mui/material'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, jsonBody } from '../lib/api'
 import { useAuth } from '../lib/auth-context'
@@ -85,6 +85,9 @@ export function RealmsPage() {
           <TextField label="표시 이름" required value={form.display_name} onChange={(e) => setForm({ ...form, display_name: e.target.value })} />
           <TextField label="Issuer URL" type="url" required value={form.issuer_url} onChange={(e) => setForm({ ...form, issuer_url: e.target.value })} />
           <FormControlLabel control={<Switch checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} />} label="Realm 활성" />
+          {!form.enabled && (form.id === me?.user.realm_id
+            ? <Alert severity="error">자신이 로그인한 Realm은 비활성화할 수 없습니다. 비활성화하면 이 Realm의 세션과 API 키가 함께 중단되어 되돌릴 수단이 남지 않습니다.</Alert>
+            : <Alert severity="warning">저장하면 새 로그인뿐 아니라 이 Realm의 열려 있는 콘솔 세션과 개인 API 키(MCP 포함)도 즉시 중단됩니다. 다시 활성화하면 만료되지 않은 세션은 계속 사용할 수 있습니다.</Alert>)}
           <Box sx={{ p: 2, bgcolor: '#f9fafb', borderRadius: 1.5, border: '1px solid', borderColor: 'divider' }}>
             <FormControlLabel control={<Switch checked={form.approval_enabled} onChange={(e) => setForm({ ...form, approval_enabled: e.target.checked })} />} label="팀장 검토·승인 프로세스 사용" />
             <Typography variant="body2" color="text.secondary">끄면 사용자 화면과 관리자 메뉴에서 요청·승인·반려 과정이 제외됩니다.</Typography>
