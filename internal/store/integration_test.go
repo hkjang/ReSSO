@@ -4825,3 +4825,41 @@ func TestIntegrationAProviderChangeThatCannotSignPeopleOutSaysSo(t *testing.T) {
 	}
 	t.Error("a sign-out shortfall was reported as a conflict")
 }
+
+// What signs and what is published come from two queries. They agree today,
+// and they could not disagree at all until retirement started being decided by
+// retire_at rather than by the status column — the active key was simply never
+// RETIRED. Now a row could be active with its retirement behind it, and that
+// combination signs tokens with a key the JWKS omits: every relying party
+// refuses them, and it reads as the signature being wrong rather than as a key
+// that is missing.
+func TestIntegrationSigningRefusesAKeyTheJWKSOmits(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := data.ActivePrivateKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatalf("a healthy Realm could not sign: %v", err)
+	}
+
+	// The combination the two queries would read differently.
+	if _, err := data.Pool.Exec(ctx, `UPDATE signing_keys SET retire_at=now()-interval '1 minute'
+		WHERE realm_id=$1 AND status='ACTIVE'`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	data.InvalidateSigningKeys(bootstrap.RealmID)
+
+	_, _, err := data.ActivePrivateKey(ctx, bootstrap.RealmID)
+	if err == nil {
+		t.Fatal("signing went ahead with a key the JWKS does not publish")
+	}
+	if !strings.Contains(err.Error(), "not published") {
+		t.Errorf("the refusal does not say what is wrong: %v", err)
+	}
+	published, err := data.PublishedSigningKeys(ctx, bootstrap.RealmID)
+	if err == nil {
+		t.Errorf("the JWKS was served anyway, from %d key(s)", len(published))
+	}
+}

@@ -86,6 +86,19 @@ func (s *Store) loadSigningKeys(ctx context.Context, realmID uuid.UUID) (signing
 	// crypto/rsa mutates the key on first use otherwise, which would be a data
 	// race between concurrent signers sharing the cached pointer.
 	privateKey.Precompute()
+	// The set that is published and the key that signs come from two queries,
+	// and they have to agree: signing with a key the JWKS omits produces tokens
+	// that every relying party refuses, which looks like the signature being
+	// wrong rather than like a key that is missing. The two could not disagree
+	// until retirement started being decided by retire_at — the active key was
+	// simply never RETIRED — so this closes what that opened. Refusing here is
+	// the better failure: it names the key, in one place, instead of appearing
+	// as every token being rejected everywhere.
+	if _, found := findSigningKey(published, active.KID); !found {
+		return signingKeyEntry{}, fmt.Errorf(
+			"signing key %s of Realm %s is active but not published; refusing to sign with a key the JWKS omits",
+			active.KID, realmID)
+	}
 	entry.privateKey, entry.active = privateKey, active
 	return entry, nil
 }
