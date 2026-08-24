@@ -4102,3 +4102,80 @@ func TestIntegrationWaitingApprovalsSurviveTheListingCap(t *testing.T) {
 		t.Errorf("the waiting request is not at the top of the reviewer's list")
 	}
 }
+
+// Ending one of your own sessions has to end that one and no other. The
+// ownership check used to list up to five hundred of the caller's sessions and
+// search for the identifier, which was right only because that number exceeds
+// the hundred the page shows — a session somebody could see was always inside
+// the window the check happened to read. It is decided by the revoking
+// statement now.
+func TestIntegrationRevokingOwnSessionTouchesNobodyElses(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	other, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "someone-else", Password: "someone-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "ownership-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := data.CreateSession(ctx, bootstrap.RealmID, other.ID, time.Hour,
+		"127.0.0.1", "ownership-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := func(id uuid.UUID) bool {
+		t.Helper()
+		var alive bool
+		if err := data.Pool.QueryRow(ctx,
+			`SELECT revoked_at IS NULL FROM sso_sessions WHERE id=$1`, id).Scan(&alive); err != nil {
+			t.Fatal(err)
+		}
+		return alive
+	}
+
+	// Somebody else's session is reported as absent, and left alone.
+	if err := data.RevokeOwnedSession(ctx, theirs.Session.ID, bootstrap.AdminUserID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("revoking another person's session returned %v, want not found", err)
+	}
+	if !live(theirs.Session.ID) {
+		t.Error("another person's session was ended")
+	}
+	// A session that does not exist answers the same way, so the response says
+	// nothing about whether it does.
+	if err := data.RevokeOwnedSession(ctx, uuid.New(), bootstrap.AdminUserID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("revoking a session that does not exist returned %v, want not found", err)
+	}
+	// And your own ends, with the refresh tokens issued from it.
+	userID, sessionID := bootstrap.AdminUserID, mine.Session.ID
+	client, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "own-session-rp", Name: "RP", Type: "confidential",
+		RedirectURIs: []string{"https://rp.example.test/cb"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: bootstrap.RealmID,
+		ClientID: client.Client.ID, UserID: &userID, SessionID: &sessionID,
+		Scope: []string{"openid"}, ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.RevokeOwnedSession(ctx, sessionID, userID); err != nil {
+		t.Fatalf("ending my own session failed: %v", err)
+	}
+	if live(sessionID) {
+		t.Error("my own session survived")
+	}
+	var liveTokens int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM refresh_tokens WHERE session_id=$1 AND revoked_at IS NULL`,
+		sessionID).Scan(&liveTokens); err != nil {
+		t.Fatal(err)
+	}
+	if liveTokens != 0 {
+		t.Errorf("%d refresh tokens outlived the session they came from", liveTokens)
+	}
+}

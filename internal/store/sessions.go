@@ -193,6 +193,31 @@ func (s *Store) notifyRevoked(sessions []RevokedSession) {
 	}
 }
 
+// RevokeOwnedSession ends one session, and only if it belongs to the given
+// person.
+//
+// The caller used to establish that by listing up to five hundred of their
+// sessions and searching for the identifier, which was right only because that
+// number is larger than the hundred the page displays — a session somebody
+// could see was always inside the window the check happened to read. Two caps
+// standing in an unstated relationship is not where ownership should be
+// decided, and asking the database costs one predicate.
+func (s *Store) RevokeOwnedSession(ctx context.Context, id, ownerID uuid.UUID) error {
+	var revoked RevokedSession
+	err := s.Pool.QueryRow(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())
+        WHERE id=$1 AND user_id=$2 RETURNING realm_id,id,user_id`, id, ownerID).Scan(
+		&revoked.RealmID, &revoked.SessionID, &revoked.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	_, _ = s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE session_id=$1`, id)
+	s.notifyRevoked([]RevokedSession{revoked})
+	return nil
+}
+
 func (s *Store) RevokeSession(ctx context.Context, id uuid.UUID) error {
 	var revoked RevokedSession
 	err := s.Pool.QueryRow(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())

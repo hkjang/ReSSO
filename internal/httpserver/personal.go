@@ -186,20 +186,14 @@ func (s *Server) revokeMySession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid_id", "세션 ID가 올바르지 않습니다.")
 		return
 	}
-	sessions, err := s.store.ListSessions(r.Context(), nil, &principal.UserID, 500)
-	if err != nil {
-		writeStoreError(w, r, err)
-		return
-	}
-	owned := false
-	for _, session := range sessions {
-		owned = owned || session.ID == id
-	}
-	if !owned {
-		writeError(w, r, http.StatusNotFound, "not_found", "세션을 찾을 수 없습니다.")
-		return
-	}
-	if err := s.store.RevokeSession(r.Context(), id); err != nil {
+	// Ownership is decided by the revoking statement itself. A session that is
+	// not this person's is reported as absent rather than refused, so the
+	// answer says nothing about whether it exists.
+	if err := s.store.RevokeOwnedSession(r.Context(), id, principal.UserID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, r, http.StatusNotFound, "not_found", "세션을 찾을 수 없습니다.")
+			return
+		}
 		writeStoreError(w, r, err)
 		return
 	}
