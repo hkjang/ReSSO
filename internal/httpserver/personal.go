@@ -117,12 +117,16 @@ func (s *Server) changeMyPassword(w http.ResponseWriter, r *http.Request) {
 // account, was told the other sessions were gone while they were still live —
 // and the console states that promise on the page.
 func (s *Server) endOtherSessions(r *http.Request, userID uuid.UUID, except *uuid.UUID) (bool, map[string]any) {
-	if err := s.store.RevokeAllUserSessions(r.Context(), userID, except); err != nil {
-		s.logger.Error("other sessions could not be ended after a password change",
-			"trace_id", traceIDFrom(r.Context()), "user_id", userID, "error", err)
-		return false, map[string]any{"other_sessions_ended": false, "error": err.Error()}
+	err := s.store.RevokeAllUserSessions(r.Context(), userID, except)
+	if err == nil {
+		return true, nil
 	}
-	return true, nil
+	s.logger.Error("other sessions could not be fully ended after a password change",
+		"trace_id", traceIDFrom(r.Context()), "user_id", userID, "error", err)
+	if errors.Is(err, store.ErrRefreshTokensNotRevoked) {
+		return false, map[string]any{"other_sessions_ended": true, "refresh_tokens_revoked": false, "error": err.Error()}
+	}
+	return false, map[string]any{"other_sessions_ended": false, "error": err.Error()}
 }
 
 // endSession revokes one session and reports whether it worked.
@@ -141,12 +145,20 @@ func (s *Server) endOtherSessions(r *http.Request, userID uuid.UUID, except *uui
 // reads PARTIAL and names the session, so an administrator can end it from the
 // console and knows to look at the relying parties.
 func (s *Server) endSession(r *http.Request, sessionID uuid.UUID) (bool, map[string]any) {
-	if err := s.store.RevokeSession(r.Context(), sessionID); err != nil {
-		s.logger.Error("session could not be revoked on logout",
-			"trace_id", traceIDFrom(r.Context()), "session_id", sessionID, "error", err)
-		return false, map[string]any{"session_revoked": false, "error": err.Error()}
+	err := s.store.RevokeSession(r.Context(), sessionID)
+	if err == nil {
+		return true, nil
 	}
-	return true, nil
+	s.logger.Error("session could not be fully revoked on logout",
+		"trace_id", traceIDFrom(r.Context()), "session_id", sessionID, "error", err)
+	// Which half failed decides what the trail is entitled to say. Recording
+	// session_revoked:false for a session that was revoked would send whoever
+	// reads it to end a session that is already gone, while the refresh tokens
+	// that are still live go unmentioned.
+	if errors.Is(err, store.ErrRefreshTokensNotRevoked) {
+		return false, map[string]any{"session_revoked": true, "refresh_tokens_revoked": false, "error": err.Error()}
+	}
+	return false, map[string]any{"session_revoked": false, "error": err.Error()}
 }
 
 // partialIfNot names an outcome that is neither a clean success nor a failure:

@@ -193,6 +193,13 @@ func (s *Store) notifyRevoked(sessions []RevokedSession) {
 	}
 }
 
+// ErrRefreshTokensNotRevoked reports that a session was ended but the refresh
+// tokens issued from it were not. The two halves fail separately and mean
+// different things to whoever is told: the browser cookie is dead either way,
+// and a relying party holding a refresh token is not. A caller that cannot
+// tell them apart has to describe one of them wrongly.
+var ErrRefreshTokensNotRevoked = errors.New("the session ended but its refresh tokens were not revoked")
+
 // RevokeOwnedSession ends one session, and only if it belongs to the given
 // person.
 //
@@ -224,7 +231,7 @@ func (s *Store) RevokeOwnedSession(ctx context.Context, id, ownerID uuid.UUID) e
 	_, refreshErr := s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE session_id=$1`, id)
 	s.notifyRevoked([]RevokedSession{revoked})
 	if refreshErr != nil {
-		return fmt.Errorf("revoke the refresh tokens of the session: %w", refreshErr)
+		return fmt.Errorf("%w: %v", ErrRefreshTokensNotRevoked, refreshErr)
 	}
 	return nil
 }
@@ -242,7 +249,7 @@ func (s *Store) RevokeSession(ctx context.Context, id uuid.UUID) error {
 	_, refreshErr := s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE session_id=$1`, id)
 	s.notifyRevoked([]RevokedSession{revoked})
 	if refreshErr != nil {
-		return fmt.Errorf("revoke the refresh tokens of the session: %w", refreshErr)
+		return fmt.Errorf("%w: %v", ErrRefreshTokensNotRevoked, refreshErr)
 	}
 	return nil
 }
@@ -262,7 +269,7 @@ func (s *Store) RevokeAllUserSessions(ctx context.Context, userID uuid.UUID, exc
         WHERE user_id=$1 AND ($2::uuid IS NULL OR session_id<>$2)`, userID, except)
 	s.notifyRevoked(revoked)
 	if refreshErr != nil {
-		return fmt.Errorf("revoke the refresh tokens of the sessions: %w", refreshErr)
+		return fmt.Errorf("%w: %v", ErrRefreshTokensNotRevoked, refreshErr)
 	}
 	return nil
 }

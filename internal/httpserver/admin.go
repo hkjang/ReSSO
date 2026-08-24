@@ -736,12 +736,17 @@ func (s *Server) adminRevokeSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusForbidden, "insufficient_permission", "플랫폼 관리자 세션은 플랫폼 관리자만 종료할 수 있습니다.")
 		return
 	}
-	if err := s.store.RevokeSession(r.Context(), sessionID); err != nil {
-		writeStoreError(w, r, err)
-		return
-	}
-	s.audit(r, &realmID, &principal.UserID, principal.Username, "ADMIN_FORCE_LOGOUT", "SUCCESS", "session", sessionID.String(), nil)
-	w.WriteHeader(http.StatusNoContent)
+	// Every other sign-out in the service goes through this helper, which
+	// tells apart a session that did not end from one that ended while its
+	// refresh tokens survived. Calling the store directly and answering the
+	// error meant an administrator who ended a session that really did end got
+	// a failure, and the trail got no entry at all for it — the one record
+	// saying that session was forced out.
+	ended, detail := s.endSession(r, sessionID)
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "ADMIN_FORCE_LOGOUT",
+		partialIfNot(ended), "session", sessionID.String(), detail)
+	writeSessionsEnded(w, ended,
+		"세션은 종료했지만 이 세션의 Refresh Token을 폐기하지 못했습니다. 연동 애플리케이션에서 계속 사용될 수 있습니다.")
 }
 
 func (s *Server) adminListKeys(w http.ResponseWriter, r *http.Request) {

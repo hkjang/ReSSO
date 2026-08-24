@@ -2799,3 +2799,118 @@ func TestIntegrationRevokingAnAccessTokenStopsItBeingAccepted(t *testing.T) {
 		t.Error("the trail does not name the token it revoked")
 	}
 }
+
+// An administrator forcing a session out is the one record saying it happened.
+// The handler called the store directly and answered its error, so once the
+// store began reporting refresh tokens it could not revoke, a session that
+// really did end came back as a failure with no entry in the trail at all.
+// Which half failed also decides what the entry may say: the session is gone,
+// and calling it unrevoked would send whoever reads it to end a session that
+// no longer exists while the live refresh tokens go unmentioned.
+func TestIntegrationForcingASessionOutIsRecordedEvenWhenHalfOfItFails(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "forced-out", Name: "RP", Type: "confidential",
+		RedirectURIs: []string{"https://rp.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "forced", Password: "forced-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, victim.ID, time.Hour, "127.0.0.1", "forced", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := session.Session.ID
+	if _, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: client.Client.ID,
+		UserID: &victim.ID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	adminSession, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "admin", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at TO revoked_at_moved"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at_moved TO revoked_at"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(restore)
+
+	request, err := http.NewRequest(http.MethodDelete,
+		server.URL+"/api/admin/v1/realms/"+realm.ID.String()+"/sessions/"+sessionID.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: "resso_session", Value: adminSession.Token})
+	request.Header.Set("X-CSRF-Token", adminSession.CSRFToken)
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	restore()
+
+	if response.StatusCode >= 500 {
+		t.Errorf("a session that really ended answered %d", response.StatusCode)
+	}
+	// The session did end, which is why losing the record matters.
+	var revoked bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT revoked_at IS NOT NULL FROM sso_sessions WHERE id=$1", sessionID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Fatal("the session was not revoked, so this is not measuring what it claims")
+	}
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "ADMIN_FORCE_LOGOUT", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("a forced sign-out left %d entries in the trail", len(page.Items))
+	}
+	if page.Items[0].Result != "PARTIAL" {
+		t.Errorf("the trail records result=%s for a sign-out that half worked", page.Items[0].Result)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(page.Items[0].Detail, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail["session_revoked"] != true {
+		t.Errorf("the trail says the session was not revoked, and it was: %v", detail)
+	}
+	if detail["refresh_tokens_revoked"] != false {
+		t.Errorf("the trail does not record the refresh tokens that survived: %v", detail)
+	}
+}
