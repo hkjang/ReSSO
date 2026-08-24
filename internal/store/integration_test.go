@@ -4683,3 +4683,59 @@ func TestIntegrationUnlinkingAProviderSignsItsPeopleOutEverywhere(t *testing.T) 
 			unlinked.Enabled, unlinked.FederationID)
 	}
 }
+
+// Rotating the data encryption keyring means rewrapping everything sealed with
+// the old key and then removing that key. A sealed column the rewrap does not
+// know about survives the rotation still on the old key, and the moment the
+// operator completes the documented procedure by removing it, that data cannot
+// be read again — a signing key that no longer opens takes its Realm's token
+// issuance with it, and a bind credential takes the directory connection.
+//
+// The rewrap reports success either way, because it only reports what it
+// visited. So the guard is that it visits everything: the schema is asked which
+// columns hold sealed values, rather than trusting a list written beside the
+// code that seals them. docs/operations.md names the same two under
+// "Data Encryption·Digest Keyring 회전", and tells the operator to remove the
+// old key once rewrap reports success.
+func TestIntegrationRewrapCoversEveryEncryptedColumn(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	rows, err := data.Pool.Query(ctx, `SELECT table_name,column_name FROM information_schema.columns
+		WHERE table_schema=current_schema() AND data_type='bytea' AND column_name LIKE '%\_cipher'
+		ORDER BY table_name,column_name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := map[string]bool{}
+	for rows.Next() {
+		var table, column string
+		if err := rows.Scan(&table, &column); err != nil {
+			t.Fatal(err)
+		}
+		found[table+"."+column] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	// What RewrapEncryptedSecrets reads and writes.
+	rewrapped := map[string]bool{
+		"signing_keys.private_key_cipher":         true,
+		"user_federations.bind_credential_cipher": true,
+	}
+	if len(found) == 0 {
+		t.Fatal("the schema holds no sealed columns, so this guard is checking nothing")
+	}
+	for column := range found {
+		if !rewrapped[column] {
+			t.Errorf("%s holds sealed values that RewrapEncryptedSecrets does not rewrap; "+
+				"a keyring rotation would leave it on the removed key", column)
+		}
+	}
+	for column := range rewrapped {
+		if !found[column] {
+			t.Errorf("RewrapEncryptedSecrets rewraps %s, which the schema no longer has", column)
+		}
+	}
+}
