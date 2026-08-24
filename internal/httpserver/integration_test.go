@@ -3643,3 +3643,136 @@ func TestIntegrationFederationRoutesRefuseAProviderFromAnotherRealm(t *testing.T
 		t.Errorf("the provider was modified from another Realm: %+v", after)
 	}
 }
+
+// The tenant boundary for the rest of the administrative API, in the shape that
+// can actually reach it: a Realm the caller may act on, paired with a resource
+// belonging to another Realm. The middleware checks the first half only, so
+// every one of these handlers has to check that the pair belongs together.
+//
+// Thirteen routes carry such a pair. Counting checks by reading them is what
+// this replaces — the question is whether the resource is still untouched
+// afterwards, which is asserted here for each kind.
+func TestIntegrationAdminRoutesRefuseResourcesFromAnotherRealm(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine := bootstrap.RealmID
+	theirs, err := data.CreateRealm(ctx, store.CreateRealmInput{
+		Name: "tenant-b", DisplayName: "Tenant B", IssuerURL: "https://b.example.test/realms/tenant-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirUser, err := data.CreateUser(ctx, theirs.ID, store.CreateUserInput{
+		Username: "theirs", Password: "their-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirClient, err := data.CreateClient(ctx, theirs.ID, store.CreateClientInput{
+		ClientID: "their-client", Name: "Theirs", Type: "confidential",
+		RedirectURIs: []string{"https://b.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirRole, err := data.CreateRole(ctx, theirs.ID, "their-role", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirClientRole, err := data.CreateClientRole(ctx, theirs.ID, theirClient.Client.ID, "their-client-role", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirSession, err := data.CreateSession(ctx, theirs.ID, theirUser.ID, time.Hour, "127.0.0.1", "theirs", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	admin, err := data.CreateSession(ctx, mine, bootstrap.AdminUserID, time.Hour, "127.0.0.1", "admin", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := "/api/admin/v1/realms/" + mine.String()
+	user := base + "/users/" + theirUser.ID.String()
+	client := base + "/clients/" + theirClient.Client.ID.String()
+	for _, attempt := range []struct{ method, path, body string }{
+		{http.MethodPut, user, `{"email":"","display_name":"taken","enabled":true,"email_verified":false}`},
+		{http.MethodPut, user + "/password", `{"new_password":"taken-password-1234"}`},
+		{http.MethodPost, user + "/unlock", ""},
+		{http.MethodGet, user + "/role-mappings", ""},
+		{http.MethodPut, user + "/role-mappings", `{"realm_role_ids":[],"client_role_ids":[]}`},
+		{http.MethodPut, client, `{"name":"taken","redirect_uris":["https://b.example.test/cb"],` +
+			`"grant_types":["authorization_code"],"default_scopes":["openid"],"require_pkce":true,` +
+			`"enabled":true,"access_token_ttl_seconds":300,"refresh_token_ttl_seconds":1800}`},
+		{http.MethodPost, client + "/rotate-secret", ""},
+		{http.MethodGet, client + "/roles", ""},
+		{http.MethodPost, client + "/roles", `{"name":"taken","description":""}`},
+		{http.MethodDelete, client + "/roles/" + theirClientRole.ID.String(), ""},
+		{http.MethodPut, base + "/roles/" + theirRole.ID.String(), `{"name":"taken","description":""}`},
+		{http.MethodDelete, base + "/roles/" + theirRole.ID.String(), ""},
+		{http.MethodDelete, base + "/sessions/" + theirSession.Session.ID.String(), ""},
+	} {
+		var body io.Reader
+		if attempt.body != "" {
+			body = strings.NewReader(attempt.body)
+		}
+		request, requestErr := http.NewRequest(attempt.method, server.URL+attempt.path, body)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.AddCookie(&http.Cookie{Name: "resso_session", Value: admin.Token})
+		request.Header.Set("X-CSRF-Token", admin.CSRFToken)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode < 400 {
+			t.Errorf("%s %s answered %d for another Realm's resource",
+				attempt.method, attempt.path, response.StatusCode)
+		}
+	}
+
+	// Nothing of theirs moved.
+	if after, err := data.UserByID(ctx, theirUser.ID); err != nil || after.DisplayName == "taken" {
+		t.Errorf("their account was changed: %+v (%v)", after, err)
+	}
+	if after, err := data.ClientByID(ctx, theirClient.Client.ID); err != nil || after.Name == "taken" {
+		t.Errorf("their Client was changed: %+v (%v)", after, err)
+	}
+	roles, err := data.ListRoles(ctx, theirs.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, role := range roles {
+		if role.Name == "their-role" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("their Realm Role was removed or renamed")
+	}
+	clientRoles, err := data.ListClientRoles(ctx, theirs.ID, theirClient.Client.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clientRoles) != 1 || clientRoles[0].Name != "their-client-role" {
+		t.Errorf("their Client Roles changed: %+v", clientRoles)
+	}
+	var revoked bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT revoked_at IS NOT NULL FROM sso_sessions WHERE id=$1", theirSession.Session.ID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if revoked {
+		t.Error("their session was ended from another Realm")
+	}
+}
