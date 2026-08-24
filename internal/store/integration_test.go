@@ -5075,3 +5075,61 @@ func TestIntegrationSigningKeyAgeComesFromTheDatabase(t *testing.T) {
 		t.Errorf("the dashboard counts %d aged keys while the listing reports %d days", counted, aged[0].AgeDays)
 	}
 }
+
+// The authorization endpoint requires openid among a Client's allowed scopes,
+// so a Client configured without it was accepted, displayed as configured, and
+// then failed every authorization request with invalid_scope. The administrator
+// learns about it from the relying party, which cannot say which setting is
+// wrong. A Client that only uses client_credentials never reaches that endpoint
+// and is unaffected.
+func TestIntegrationAClientThatCouldNeverLogAnyoneInIsRefused(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+
+	_, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "no-openid", Name: "No OpenID", Type: "public",
+		RedirectURIs:  []string{"https://rp.example.test/cb"},
+		GrantTypes:    []string{"authorization_code"},
+		DefaultScopes: []string{"profile", "email"},
+	})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("a Client that cannot complete a login was accepted: %v", err)
+	}
+	var messaged *MessagedError
+	if !errors.As(err, &messaged) || !strings.Contains(messaged.Message, "openid") {
+		t.Errorf("the refusal does not name the missing scope: %v", err)
+	}
+
+	// Machine-to-machine Clients never reach the authorization endpoint.
+	machine, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "machine", Name: "Machine", Type: "confidential",
+		GrantTypes: []string{"client_credentials"}, DefaultScopes: []string{"api:read"},
+	})
+	if err != nil {
+		t.Fatalf("a client_credentials Client was refused for want of openid: %v", err)
+	}
+
+	// And the same rule applies to an edit, or the Client is only correct until
+	// somebody changes the scope field.
+	usable, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "usable", Name: "Usable", Type: "public",
+		RedirectURIs: []string{"https://rp.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(usable.Client.DefaultScopes, "openid") {
+		t.Fatalf("the default scopes lost openid: %v", usable.Client.DefaultScopes)
+	}
+	_, err = data.UpdateClient(ctx, usable.Client.ID, UpdateClientInput{
+		Name: "Usable", RedirectURIs: usable.Client.RedirectURIs,
+		GrantTypes: []string{"authorization_code"}, DefaultScopes: []string{"profile"},
+		AccessTokenTTLSeconds: 300, RefreshTokenTTLSeconds: 1800, Enabled: true,
+	})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("editing openid away was accepted: %v", err)
+	}
+	_ = machine
+}

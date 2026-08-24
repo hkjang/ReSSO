@@ -111,6 +111,9 @@ func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClie
 	if strings.TrimSpace(input.Name) == "" {
 		return domain.Client{}, errors.New("client name is required")
 	}
+	if err := requireOpenIDForLogins(input.GrantTypes, input.DefaultScopes); err != nil {
+		return domain.Client{}, err
+	}
 	if err := validateURIs(input.RedirectURIs, false); err != nil {
 		return domain.Client{}, fmt.Errorf("redirect_uris: %w", err)
 	}
@@ -167,6 +170,9 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 	if len(input.DefaultScopes) == 0 {
 		input.DefaultScopes = []string{"openid", "profile", "email", "roles"}
 	}
+	if err := requireOpenIDForLogins(input.GrantTypes, input.DefaultScopes); err != nil {
+		return CreatedClient{}, err
+	}
 	if err := validateURIs(input.RedirectURIs, false); err != nil {
 		return CreatedClient{}, fmt.Errorf("redirect_uris: %w", err)
 	}
@@ -220,6 +226,24 @@ func nonNilStrings(values []string) []string {
 		return []string{}
 	}
 	return values
+}
+
+// requireOpenIDForLogins refuses a Client that could never complete a login.
+//
+// The authorization endpoint requires openid among a Client's allowed scopes,
+// so one configured without it is accepted, shown as configured, and then
+// fails every authorization request with invalid_scope. The refusal belongs
+// here, where somebody is looking at the field they just edited, rather than
+// at a relying party that cannot say which setting is wrong. Clients that only
+// use client_credentials never reach that endpoint and are left alone.
+func requireOpenIDForLogins(grantTypes, scopes []string) error {
+	if !slices.Contains(grantTypes, "authorization_code") {
+		return nil
+	}
+	if slices.Contains(scopes, "openid") {
+		return nil
+	}
+	return invalidf("로그인에 쓰이는 Client의 허용 Scope에는 openid가 있어야 합니다. 없으면 모든 인가 요청이 invalid_scope로 거절됩니다.")
 }
 
 func validateURIs(values []string, allowFragment bool) error {
