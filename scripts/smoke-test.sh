@@ -31,6 +31,19 @@ for empty_email_index in 1 2; do
     "$base_url/api/admin/v1/realms/$realm_id/users" | jq -e '.id != null' >/dev/null
 done
 
+# An account is created with the Realm's user Role. That assignment used to be
+# a statement whose outcome was discarded, so an account could exist carrying no
+# Role at all — ordinary on screen, refused by every relying party that checks
+# for one. The two are written together now, and this is where that shows.
+created_user_id="$(curl -fsS -b "$cookie_jar" "$base_url/api/admin/v1/realms/$realm_id/users?q=empty-email-1-$suffix" \
+  | jq -er --arg username "empty-email-1-$suffix" '.items[] | select(.username == $username) | .id')"
+curl -fsS -b "$cookie_jar" "$base_url/api/admin/v1/realms/$realm_id/users/$created_user_id/role-mappings" \
+  | jq -e '[.available_realm_roles[] | select(.name == "user") | .id] as $user
+      | ($user | length) == 1 and (.realm_role_ids | index($user[0])) != null' >/dev/null || {
+  echo "a newly created account does not hold the Realm's user Role" >&2
+  exit 1
+}
+
 client_identifier="smoke-$suffix"
 client_payload="$(jq -nc --arg client "$client_identifier" '{client_id:$client,name:"Smoke test",type:"public",redirect_uris:["http://localhost:9999/callback"],post_logout_redirect_uris:["http://localhost:9999/logout"],web_origins:["http://localhost:9999"],grant_types:["authorization_code","refresh_token"],default_scopes:["openid","profile","email","roles"],require_pkce:true,backchannel_logout_uri:""}')"
 curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' -d "$client_payload" "$base_url/api/admin/v1/realms/$realm_id/clients" | jq -e '.client.client_id != null' >/dev/null
@@ -192,6 +205,22 @@ mcp_request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVe
 curl -fsS -H "Authorization: Bearer $api_key" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d "$mcp_request" "$base_url/mcp" | jq -e '.result.serverInfo.name == "ReSSO"' >/dev/null
 curl -fsS -H "Authorization: Bearer $api_key" "$base_url/api/v1/me" | jq -e --arg admin "$admin" '.user.username == $admin' >/dev/null
 curl -fsS -H "Authorization: Bearer $api_key" "$base_url/api/admin/v1/realms" | jq -e '.items | length > 0' >/dev/null
+
+# Rotating a key replaces it and retires the original, both or neither. The two
+# writes used to stand alone, so a failed revocation left a second live key
+# whose secret nobody received. Only the ends are observable from here, and they
+# are what an operator relies on: the new secret works and the old one stops.
+rotate_key_id="$(curl -fsS -b "$cookie_jar" "$base_url/api/v1/me/api-keys" \
+  | jq -er --arg prefix "$(echo "$api_key" | cut -d. -f1)" '.items[] | select(.prefix == $prefix) | .id')"
+rotated_key="$(curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -X POST \
+  "$base_url/api/v1/me/api-keys/$rotate_key_id/rotate" | jq -er '.secret')"
+curl -fsS -H "Authorization: Bearer $rotated_key" "$base_url/api/v1/me" >/dev/null
+retired_status="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $api_key" "$base_url/api/v1/me")"
+[ "$retired_status" = "401" ] || { echo "a rotated-away API key still authenticates ($retired_status)" >&2; exit 1; }
+live_named="$(curl -fsS -b "$cookie_jar" "$base_url/api/v1/me/api-keys" \
+  | jq '[.items[] | select(.name == "Smoke MCP and REST" and .active)] | length')"
+[ "$live_named" = "1" ] || { echo "rotation left $live_named live keys of that name, expected 1" >&2; exit 1; }
+api_key="$rotated_key"
 
 # The MCP tools that read people and relying parties are gated on admin:read.
 # Checking only the handshake left that boundary unverified end to end, which
