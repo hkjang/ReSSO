@@ -1882,6 +1882,22 @@ func TestIntegrationPasswordChangeAdmitsWhenSessionsSurvive(t *testing.T) {
 		"admin", "second-replacement-1234"); err != nil {
 		t.Fatal(err)
 	}
+	// Both changes are audited, and reading "the last one" is only meaningful
+	// if the second is there. Audit writes are best effort — the handler logs
+	// and carries on if one fails — so a missing second entry makes this read
+	// the first change's, which is SUCCESS with an empty detail: the exact
+	// shape this test failed with twice. Blocking an audit write reproduces it
+	// precisely, so the count is checked before the contents and a missing
+	// record says so in its own words.
+	var written int
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM audit_events WHERE event_type='PASSWORD_CHANGE'").Scan(&written); err != nil {
+		t.Fatal(err)
+	}
+	if written != 2 {
+		t.Fatalf("%d PASSWORD_CHANGE entries, want 2: the second change's record never landed, "+
+			"so what follows would be reading the first change's", written)
+	}
 	result, detail := lastAudit()
 	if result != "PARTIAL" || detail["other_sessions_ended"] != false || detail["error"] == nil {
 		// This has failed intermittently, twice, and "SUCCESS with an empty
@@ -1893,7 +1909,7 @@ func TestIntegrationPasswordChangeAdmitsWhenSessionsSurvive(t *testing.T) {
 		// survived forty consecutive runs. That points at something another
 		// test in the package leaves behind, and the counts below are what
 		// would show it.
-		var liveNow, blockedByTrigger int
+		var liveNow, blockedByTrigger, auditEntries int
 		if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM sso_sessions
 			WHERE user_id=$1 AND revoked_at IS NULL`, bootstrap.AdminUserID).Scan(&liveNow); err != nil {
 			t.Fatal(err)
@@ -1902,8 +1918,19 @@ func TestIntegrationPasswordChangeAdmitsWhenSessionsSurvive(t *testing.T) {
 			WHERE tgname='block_revocation' AND NOT tgisinternal`).Scan(&blockedByTrigger); err != nil {
 			t.Fatal(err)
 		}
-		t.Errorf("audit=%s detail=%v; live sessions before the change=%d, now=%d, trigger present=%d",
-			result, detail, liveBeforeChange, liveNow, blockedByTrigger)
+		// How many entries there are separates the two remaining explanations.
+		// Audit writes are best effort — the handler logs and carries on if one
+		// fails — so a single entry means the second change's record never
+		// landed and this read the first change's, which is SUCCESS with an
+		// empty detail. Two entries would mean the revocation really did
+		// succeed against the trigger.
+		if err := data.Pool.QueryRow(ctx,
+			"SELECT count(*) FROM audit_events WHERE event_type='PASSWORD_CHANGE'").Scan(&auditEntries); err != nil {
+			t.Fatal(err)
+		}
+		t.Errorf("audit=%s detail=%v; PASSWORD_CHANGE entries=%d (2 expected); "+
+			"live sessions before the change=%d, now=%d, trigger present=%d",
+			result, detail, auditEntries, liveBeforeChange, liveNow, blockedByTrigger)
 	}
 }
 
