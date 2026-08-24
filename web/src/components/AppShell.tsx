@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link as RouterLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import AccountCircleRoundedIcon from '@mui/icons-material/AccountCircleRounded'
 import AdminPanelSettingsRoundedIcon from '@mui/icons-material/AdminPanelSettingsRounded'
@@ -18,9 +18,10 @@ import SearchRoundedIcon from '@mui/icons-material/SearchRounded'
 import SecurityRoundedIcon from '@mui/icons-material/SecurityRounded'
 import SettingsRoundedIcon from '@mui/icons-material/SettingsRounded'
 import VpnKeyRoundedIcon from '@mui/icons-material/VpnKeyRounded'
-import { Avatar, Box, Button, Chip, Dialog, DialogContent, Divider, Drawer, IconButton, InputAdornment, List, ListItemButton, ListItemIcon, ListItemText, Menu, MenuItem, Stack, TextField, Tooltip, Typography, useMediaQuery } from '@mui/material'
+import { Avatar, Box, Button, Chip, Dialog, DialogContent, DialogTitle, Divider, Drawer, IconButton, InputAdornment, List, ListItemButton, ListItemIcon, ListItemText, Menu, MenuItem, Stack, TextField, Tooltip, Typography, useMediaQuery } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
 import { useTheme } from '@mui/material/styles'
+import { visuallyHidden } from '@mui/utils'
 import { api } from '../lib/api'
 import { useAuth } from '../lib/auth-context'
 import type { Realm } from '../types'
@@ -61,6 +62,15 @@ export function AppShell() {
   const [mobileOpen, setMobileOpen] = useState(false)
   const [profileAnchor, setProfileAnchor] = useState<HTMLElement | null>(null)
   const [paletteOpen, setPaletteOpen] = useState(false)
+  const mainRef = useRef<HTMLElement>(null)
+  const settled = useRef(false)
+  // 라우팅은 화면만 갈아끼우기 때문에, 포커스를 옮겨주지 않으면 스크린 리더 사용자는
+  // 방금 누른 메뉴 항목에 그대로 머문 채 새 화면이 열린 사실을 알 수 없다.
+  // 첫 렌더에서는 옮기지 않는다 — 사용자가 이동을 요청한 것이 아니기 때문.
+  useEffect(() => {
+    if (!settled.current) { settled.current = true; return }
+    mainRef.current?.focus()
+  }, [location.pathname])
   const isAdmin = location.pathname.startsWith('/admin')
   const realms = useQuery({
     queryKey: ['realms'],
@@ -102,7 +112,7 @@ export function AppShell() {
   const drawer = (
     <Stack sx={{ width: drawerWidth, height: '100%', bgcolor: '#101828', color: '#d0d5dd', overflow: 'hidden' }}>
       <Stack direction="row" alignItems="center" spacing={1.2} sx={{ px: 2.5, height: 68, flex: '0 0 auto' }}>
-        <Box sx={{ width: 34, height: 34, borderRadius: 1.4, bgcolor: '#2f6fed', color: '#fff', display: 'grid', placeItems: 'center', fontWeight: 850 }}>R</Box>
+        <Box sx={{ width: 34, height: 34, borderRadius: 1.4, bgcolor: 'primary.main', color: 'common.white', display: 'grid', placeItems: 'center', fontWeight: 850 }}>R</Box>
         <Box><Typography color="#fff" fontWeight={800} lineHeight={1.15}>ReSSO</Typography><Typography variant="caption" color="#98a2b3">Identity control plane</Typography></Box>
       </Stack>
       <Box sx={{ px: 1.5, pb: 1.5 }}>
@@ -135,6 +145,20 @@ export function AppShell() {
 
   return (
     <Box sx={{ display: 'flex', minHeight: '100vh' }}>
+      <Box
+        component="a"
+        href="#main-content"
+        onClick={(event) => { event.preventDefault(); mainRef.current?.focus() }}
+        sx={{
+          position: 'fixed', left: 12, top: -60, zIndex: 1400,
+          px: 2, py: 1.2, borderRadius: 1, fontWeight: 700, textDecoration: 'none',
+          bgcolor: 'primary.main', color: 'common.white',
+          transition: 'top .15s ease-in',
+          '&:focus': { top: 12 },
+        }}
+      >
+        본문으로 건너뛰기
+      </Box>
       {desktop ? <Box component="aside" sx={{ position: 'fixed', inset: '0 auto 0 0', zIndex: 1200 }}>{drawer}</Box> : <Drawer open={mobileOpen} onClose={() => setMobileOpen(false)} ModalProps={{ keepMounted: true }}>{drawer}</Drawer>}
       <Box sx={{ flex: 1, minWidth: 0, ml: { lg: `${drawerWidth}px` } }}>
         <Stack component="header" direction="row" alignItems="center" spacing={1.5} sx={{ height: 68, px: { xs: 2, md: 3 }, position: 'sticky', top: 0, zIndex: 1100, bgcolor: 'rgba(255,255,255,.94)', backdropFilter: 'blur(12px)', borderBottom: '1px solid', borderColor: 'divider' }}>
@@ -155,7 +179,7 @@ export function AppShell() {
             <MenuItem onClick={() => void logout()} sx={{ color: 'error.main' }}><ListItemIcon><LogoutRoundedIcon color="error" fontSize="small" /></ListItemIcon>로그아웃</MenuItem>
           </Menu>
         </Stack>
-        <Box component="main" sx={{ p: { xs: 2, sm: 3, xl: 4 }, maxWidth: 1680, mx: 'auto' }}><Outlet /></Box>
+        <Box component="main" id="main-content" ref={mainRef} tabIndex={-1} sx={{ p: { xs: 2, sm: 3, xl: 4 }, maxWidth: 1680, mx: 'auto', outline: 'none' }}><Outlet /></Box>
       </Box>
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} items={navItems} admin={Boolean(me?.permissions.admin)} />
     </Box>
@@ -182,7 +206,13 @@ function CommandPalette({ open, onClose, items, admin }: { open: boolean; onClos
   const go = (path: string) => { onClose(); navigate(path) }
   return (
     <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth PaperProps={{ sx: { position: 'fixed', top: { xs: 8, sm: 72 }, m: 1, maxHeight: 'min(680px, calc(100vh - 32px))' } }}>
+      {/* MUI는 DialogTitle이 없어도 aria-labelledby를 붙이므로, 제목을 렌더하지 않으면
+          없는 id를 가리켜 이름 없는 대화 상자가 된다. 디자인상 제목을 보이지 않으므로
+          시각적으로만 감춘다. */}
+      <DialogTitle sx={visuallyHidden}>빠른 이동 및 검색</DialogTitle>
+      {/* placeholder는 접근 가능한 이름이 아니고, 입력을 시작하면 사라진다. */}
       <TextField autoFocus placeholder="메뉴, 사용자, Client 검색…" value={query} onChange={(e) => setQuery(e.target.value)}
+        inputProps={{ 'aria-label': '메뉴, 사용자, Client 검색' }}
         InputProps={{ startAdornment: <InputAdornment position="start"><SearchRoundedIcon /></InputAdornment> }} sx={{ '& fieldset': { border: 0 }, px: 1, pt: 1 }} />
       <Divider />
       <DialogContent sx={{ p: 1, overflowY: 'auto' }}>

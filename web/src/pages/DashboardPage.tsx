@@ -10,6 +10,7 @@ import { useQuery } from '@tanstack/react-query'
 import { api } from '../lib/api'
 import { PageHeader, ContentCard } from '../components/Page'
 import { ErrorAlert, PageLoading } from '../components/Feedback'
+import { theme } from '../theme'
 
 interface DashboardData { realms: number; users: number; clients: number; active_sessions: number; pending_approvals: number; readiness: { issuer_https: boolean; signing_keys_ready: boolean; federation_failures: number; locked_users: number; expiring_api_keys: number; aging_signing_keys: number; signing_key_advisory_days: number; clock_skew_seconds: number; clock_skew_round_trip_ms: number; clock_skew_advisory_seconds: number } }
 
@@ -18,11 +19,11 @@ export function DashboardPage() {
   if (query.isLoading) return <PageLoading />
   if (query.error) return <ErrorAlert error={query.error} onRetry={() => void query.refetch()} />
   const cards = [
-    { label: 'Realm', value: query.data?.realms ?? 0, icon: DnsRoundedIcon, color: '#2f6fed', to: '/admin/realms' },
-    { label: '사용자', value: query.data?.users ?? 0, icon: GroupsRoundedIcon, color: '#12a594', to: '/admin/users' },
+    { label: 'Realm', value: query.data?.realms ?? 0, icon: DnsRoundedIcon, color: theme.palette.primary.main, to: '/admin/realms' },
+    { label: '사용자', value: query.data?.users ?? 0, icon: GroupsRoundedIcon, color: theme.palette.secondary.main, to: '/admin/users' },
     { label: 'OIDC Client', value: query.data?.clients ?? 0, icon: VpnKeyRoundedIcon, color: '#7f56d9', to: '/admin/clients' },
     { label: '활성 세션', value: query.data?.active_sessions ?? 0, icon: SecurityRoundedIcon, color: '#f79009', to: '/admin/sessions' },
-    { label: '승인 대기', value: query.data?.pending_approvals ?? 0, icon: ApprovalRoundedIcon, color: '#d92d20', to: '/admin/approvals' },
+    { label: '승인 대기', value: query.data?.pending_approvals ?? 0, icon: ApprovalRoundedIcon, color: theme.palette.error.main, to: '/admin/approvals' },
   ]
   // Each readiness row links to the screen that can fix it. Reporting "3개 실패"
   // with no way to reach the failing provider left the operator to hunt for it.
