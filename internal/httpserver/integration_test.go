@@ -2476,3 +2476,103 @@ func TestIntegrationRevocationThatCannotBePerformedIsNotReportedAsDone(t *testin
 		t.Errorf("the token was not actually left live, so this test is not measuring what it claims")
 	}
 }
+
+// The login succeeded, the session exists and its cookies are in the browser —
+// only the authorization code failed. Returning at that point recorded nothing:
+// no entry in the trail saying anyone logged in, and no movement on the counter
+// operators are told to watch, so a database that had stopped taking writes
+// looked like a quiet minute while sessions were being handed out.
+func TestIntegrationALoginThatCannotMintItsCodeIsStillRecorded(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "code-failure", Name: "Code Failure", Type: "public",
+		RedirectURIs: []string{"https://rp.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "coder", Password: "coder-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestToken, err := data.CreateAuthorizationRequest(ctx, store.AuthorizationRequest{
+		RealmID: realm.ID, ClientID: client.Client.ID, RedirectURI: "https://rp.example.test/cb",
+		ResponseType: "code", Scope: []string{"openid"}, State: "xyz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The code cannot be written.
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE authorization_codes RENAME COLUMN code_hash TO code_hash_moved"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(),
+			"ALTER TABLE authorization_codes RENAME COLUMN code_hash_moved TO code_hash")
+	})
+
+	metrics := observability.NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	body := fmt.Sprintf(`{"realm":"master","username":"coder","password":"coder-password-1234","request":%q}`, requestToken)
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/auth/login", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusInternalServerError)
+	}
+
+	// The session really was handed out — which is why the silence mattered.
+	var sessions int
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM sso_sessions WHERE user_id=$1 AND revoked_at IS NULL", user.ID).Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 1 {
+		t.Fatalf("live sessions = %d, want the one the login created", sessions)
+	}
+
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "LOGIN_SUCCESS", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("a live session was handed out with %d entries in the trail", len(page.Items))
+	}
+	if page.Items[0].Result != "PARTIAL" {
+		t.Errorf("the trail records result=%s; the login happened but the code did not",
+			page.Items[0].Result)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(page.Items[0].Detail, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail["error"] == nil {
+		t.Errorf("the trail gives no reason: %v", detail)
+	}
+
+	var exported strings.Builder
+	metrics.WritePrometheus(&exported)
+	if !strings.Contains(exported.String(), `resso_login_attempts_total{result="error"} 1`) {
+		t.Errorf("the failure left the counter flat, which is what a quiet minute looks like:\n%s",
+			exported.String())
+	}
+}

@@ -171,8 +171,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			// Failing to do so leaves one live that its owner cannot see,
 			// because the cookies go on the next line, so it is worth a log
 			// line even though the caller is being refused either way.
-			_, _ = s.endSession(r, newSession.Session.ID)
+			ended, detail := s.endSession(r, newSession.Session.ID)
 			s.clearBrowserCookies(w, r)
+			if !ended {
+				s.logger.Error("a session created for a spent login request could not be taken back",
+					"trace_id", traceIDFrom(r.Context()), "session_id", newSession.Session.ID, "detail", detail)
+			}
 			writeError(w, r, http.StatusConflict, "request_already_used", "로그인 요청이 이미 처리되었습니다.")
 			return
 		}
@@ -182,7 +186,21 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			Nonce: consumed.Nonce, CodeChallenge: consumed.CodeChallenge, CodeChallengeMethod: consumed.CodeChallengeMethod,
 		})
 		if err != nil {
-			writeError(w, r, http.StatusInternalServerError, "internal_error", "인가 코드를 생성하지 못했습니다.")
+			// The session is real, its cookies are already in the browser and
+			// the person is signed in — only the code failed. Returning here
+			// used to leave exactly that: a live session with no entry in the
+			// trail saying anyone logged in, and no movement on the counter
+			// operators are told to watch, so the failure looked like a quiet
+			// minute. The session is deliberately kept: retrying from the
+			// relying party finds it and completes without asking again.
+			s.logger.Error("authorization code could not be created after a successful login",
+				"trace_id", traceIDFrom(r.Context()), "realm", realm.Name,
+				"session_id", newSession.Session.ID, "error", err)
+			s.metrics.Add(metricLogins, 1, "error")
+			s.audit(r, &realm.ID, &result.User.ID, result.User.Username, "LOGIN_SUCCESS", "PARTIAL",
+				"session", newSession.Session.ID.String(),
+				map[string]any{"authorization_code": "not_issued", "error": err.Error()})
+			writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인은 되었지만 인가 코드를 생성하지 못했습니다. 애플리케이션에서 다시 시도하세요.")
 			return
 		}
 		response["redirect_to"] = authorizationRedirect(consumed.RedirectURI, code, consumed.State, realm.IssuerURL, newSession.Session.ID)
