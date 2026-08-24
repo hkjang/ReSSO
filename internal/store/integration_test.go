@@ -2943,8 +2943,21 @@ func createDirectoryGroup(t *testing.T, branch, groupDN, memberDN string) {
 	group.Attribute("objectClass", []string{"groupOfNames"})
 	group.Attribute("cn", []string{strings.SplitN(strings.TrimPrefix(groupDN, "cn="), ",", 2)[0]})
 	group.Attribute("member", []string{memberDN})
-	if err := connection.Add(group); err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
-		t.Fatal(err)
+	if err := connection.Add(group); err != nil {
+		if !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
+			t.Fatal(err)
+		}
+		// Tolerating the group already being there is not the same as
+		// tolerating whatever it happens to contain. A group left behind by an
+		// earlier run holds that run's member, so the member this test just
+		// created never gets memberOf and the test measures somebody else's
+		// setup — which fails as "membership did not grant the role", pointing
+		// at the code rather than at the directory.
+		modify := ldap.NewModifyRequest(groupDN, nil)
+		modify.Replace("member", []string{memberDN})
+		if err := connection.Modify(modify); err != nil {
+			t.Fatalf("setting the membership of an existing group failed: %v", err)
+		}
 	}
 	t.Cleanup(func() { removeDirectoryBranch(t, branch) })
 }
