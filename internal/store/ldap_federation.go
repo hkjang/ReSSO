@@ -269,7 +269,14 @@ func (s *Store) UpdateLDAPFederation(ctx context.Context, id uuid.UUID, input LD
 			return domain.LDAPFederation{}, linkedErr
 		}
 		if err := s.EndSessionsOfDisabledUsers(ctx, linked); err != nil {
-			return domain.LDAPFederation{}, fmt.Errorf("end sessions of the disabled provider's users: %w", err)
+			// The provider is already disabled; only the sign-out fell short.
+			// Reported as a failed update it would describe a change that
+			// happened as one that did not, and leave no record of it.
+			updated, loadErr := s.LDAPFederationByID(ctx, id)
+			if loadErr != nil {
+				return domain.LDAPFederation{}, loadErr
+			}
+			return updated, fmt.Errorf("%w: %v", ErrUsersNotSignedOut, err)
 		}
 	}
 	return s.LDAPFederationByID(ctx, id)
@@ -339,7 +346,9 @@ func (s *Store) DeleteLDAPFederation(ctx context.Context, id uuid.UUID, unlinkUs
 	// transaction, with each statement's outcome discarded and no relying
 	// party told, which left everyone signed in wherever they had used ReSSO.
 	if err := s.EndSessionsOfDisabledUsers(ctx, linked); err != nil {
-		return fmt.Errorf("end sessions of the unlinked provider's users: %w", err)
+		// The provider is gone and its accounts are unlinked and disabled;
+		// what did not finish is signing them out everywhere.
+		return fmt.Errorf("%w: %v", ErrUsersNotSignedOut, err)
 	}
 	return nil
 }
@@ -597,6 +606,13 @@ func describeSyncFailures(failures []string, total int) string {
 	}
 	return described
 }
+
+// ErrUsersNotSignedOut reports that a provider change landed but signing its
+// people out did not finish. The change itself is done — the provider is
+// disabled, or gone and its accounts unlinked — so reporting it as a failed
+// request describes something that did happen as something that did not, and
+// leaves no record of it.
+var ErrUsersNotSignedOut = errors.New("the provider changed but its people were not signed out everywhere")
 
 // ErrSyncReadNothing reports a sync that saw no users at all in a directory
 // that is known to hold some.

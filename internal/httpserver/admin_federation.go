@@ -77,7 +77,12 @@ func (s *Server) adminUpdateLDAPFederation(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	item, err := s.store.UpdateLDAPFederation(r.Context(), federationID, input)
-	if err != nil {
+	// Disabling a provider signs its people out, and that can fall short after
+	// the provider is already disabled. Answering a failure for it would
+	// describe a change that happened as one that did not, and leave the trail
+	// without the entry saying the provider was switched off.
+	signedOut := !errors.Is(err, store.ErrUsersNotSignedOut)
+	if err != nil && signedOut {
 		if errors.Is(err, store.ErrConflict) {
 			writeStoreError(w, r, err)
 			return
@@ -85,9 +90,16 @@ func (s *Server) adminUpdateLDAPFederation(w http.ResponseWriter, r *http.Reques
 		writeError(w, r, http.StatusBadRequest, "ldap_federation_update_failed", err.Error())
 		return
 	}
+	detail := map[string]any{"enabled": item.Enabled, "edit_mode": item.EditMode}
+	if !signedOut {
+		s.logger.Error("a disabled LDAP provider's people were not signed out everywhere",
+			"trace_id", traceIDFrom(r.Context()), "federation_id", federationID, "error", err)
+		detail["users_signed_out"] = false
+		detail["error"] = err.Error()
+	}
 	principal, _ := principalFrom(r.Context())
-	s.audit(r, &realmID, &principal.UserID, principal.Username, "LDAP_FEDERATION_UPDATE", "SUCCESS",
-		"user_federation", item.ID.String(), map[string]any{"enabled": item.Enabled, "edit_mode": item.EditMode})
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "LDAP_FEDERATION_UPDATE",
+		partialIfNot(signedOut), "user_federation", item.ID.String(), detail)
 	writeJSON(w, http.StatusOK, item)
 }
 
@@ -102,13 +114,36 @@ func (s *Server) adminDeleteLDAPFederation(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	unlinkUsers := r.URL.Query().Get("unlink_users") == "true"
-	if err := s.store.DeleteLDAPFederation(r.Context(), federationID, unlinkUsers); err != nil {
-		writeError(w, r, http.StatusConflict, "ldap_federation_in_use", "가져온 사용자가 남아 있어 삭제할 수 없습니다. 공급자를 비활성화하거나 연결된 사용자를 먼저 정리하세요.")
+	err = s.store.DeleteLDAPFederation(r.Context(), federationID, unlinkUsers)
+	// Only a conflict means what this message says. Answering it for every
+	// failure told an administrator to clear the imported users when that was
+	// not the problem — and clearing them is a destructive step to take on a
+	// wrong diagnosis.
+	switch {
+	case errors.Is(err, store.ErrConflict):
+		writeError(w, r, http.StatusConflict, "ldap_federation_in_use",
+			"가져온 사용자가 남아 있어 삭제할 수 없습니다. 공급자를 비활성화하거나 연결된 사용자를 먼저 정리하세요.")
+		return
+	case err != nil && !errors.Is(err, store.ErrUsersNotSignedOut):
+		writeStoreError(w, r, err)
 		return
 	}
+	signedOut := err == nil
+	detail := map[string]any{"name": item.Name, "users_unlinked": unlinkUsers}
+	if !signedOut {
+		s.logger.Error("an unlinked LDAP provider's people were not signed out everywhere",
+			"trace_id", traceIDFrom(r.Context()), "federation_id", federationID, "error", err)
+		detail["users_signed_out"] = false
+		detail["error"] = err.Error()
+	}
 	principal, _ := principalFrom(r.Context())
-	s.audit(r, &realmID, &principal.UserID, principal.Username, "LDAP_FEDERATION_DELETE", "SUCCESS",
-		"user_federation", federationID.String(), map[string]any{"name": item.Name, "users_unlinked": unlinkUsers})
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "LDAP_FEDERATION_DELETE",
+		partialIfNot(signedOut), "user_federation", federationID.String(), detail)
+	if !signedOut {
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "users_signed_out": false,
+			"message": "공급자는 삭제했지만 연결된 계정을 모든 애플리케이션에서 로그아웃시키지 못했습니다. 관리 → 세션에서 확인하세요."})
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

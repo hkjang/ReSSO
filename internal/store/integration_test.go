@@ -4739,3 +4739,89 @@ func TestIntegrationRewrapCoversEveryEncryptedColumn(t *testing.T) {
 		}
 	}
 }
+
+// Signing the provider's people out happens after the change has landed, so it
+// can fall short on its own. Reported as a failed request it would describe a
+// change that happened as one that did not: the provider really is disabled,
+// or really is gone with its accounts unlinked.
+func TestIntegrationAProviderChangeThatCannotSignPeopleOutSaysSo(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "ou=partial-signout,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "worker")
+	credential := "adminpassword"
+	input := LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	}
+	provider, err := data.CreateLDAPFederation(ctx, realm.ID, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at TO revoked_at_moved"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at_moved TO revoked_at"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(restore)
+
+	input.Enabled = false
+	updated, updateErr := data.UpdateLDAPFederation(ctx, provider.ID, input)
+	if !errors.Is(updateErr, ErrUsersNotSignedOut) {
+		t.Fatalf("disabling reported %v, want it to name the sign-out that fell short", updateErr)
+	}
+	// The change itself landed, and the caller is handed it.
+	if updated.Enabled {
+		t.Error("the returned provider is still enabled, so the caller cannot see what happened")
+	}
+	stored, err := data.LDAPFederationByID(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Enabled {
+		t.Error("the provider was not disabled, so this is not measuring what it claims")
+	}
+
+	deleteErr := data.DeleteLDAPFederation(ctx, provider.ID, true)
+	if !errors.Is(deleteErr, ErrUsersNotSignedOut) {
+		t.Fatalf("unlinking reported %v, want it to name the sign-out that fell short", deleteErr)
+	}
+	restore()
+	if _, err := data.LDAPFederationByID(ctx, provider.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("the provider survived a delete that reported only the sign-out: %v", err)
+	}
+	// A conflict still has to be its own answer, or the caller is told to
+	// clear the imported users when that was never the problem.
+	if !errors.Is(deleteErr, ErrConflict) {
+		return
+	}
+	t.Error("a sign-out shortfall was reported as a conflict")
+}
