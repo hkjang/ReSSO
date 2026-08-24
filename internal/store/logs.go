@@ -70,6 +70,16 @@ func (s *Store) WriteSystemLogs(ctx context.Context, entries []SystemLogEntry) e
 	return err
 }
 
+// ListSystemLogs pages through the mirrored records, newest first.
+//
+// The order has to be total, not just newest-first: records arrive in bursts
+// and share a timestamp constantly, and with only occurred_at to sort by, two
+// rows of the same instant may come back in either order. Paging through with
+// an offset then shows one twice and never shows another — the reader is
+// looking for the line that explains an incident and it is the one that got
+// skipped. The audit listing already sorts by its identifier for this reason;
+// here the identifier is a bigserial, so it also puts tied records in the order
+// they arrived.
 func (s *Store) ListSystemLogs(ctx context.Context, level, query string, limit, offset int) ([]SystemLog, error) {
 	if limit < 1 || limit > 1000 {
 		limit = 200
@@ -77,7 +87,7 @@ func (s *Store) ListSystemLogs(ctx context.Context, level, query string, limit, 
 	rows, err := s.Pool.Query(ctx, `SELECT id,occurred_at,level,component,message,trace_id,attributes
         FROM system_logs WHERE ($1='' OR level=$1) AND ($2='' OR message ILIKE '%' || $2 || '%'
         OR component ILIKE '%' || $2 || '%' OR trace_id ILIKE '%' || $2 || '%')
-        ORDER BY occurred_at DESC LIMIT $3 OFFSET $4`, level, query, limit, offset)
+        ORDER BY occurred_at DESC, id DESC LIMIT $3 OFFSET $4`, level, query, limit, offset)
 	if err != nil {
 		return nil, err
 	}

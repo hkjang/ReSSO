@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -4861,5 +4862,54 @@ func TestIntegrationSigningRefusesAKeyTheJWKSOmits(t *testing.T) {
 	published, err := data.PublishedSigningKeys(ctx, bootstrap.RealmID)
 	if err == nil {
 		t.Errorf("the JWKS was served anyway, from %d key(s)", len(published))
+	}
+}
+
+// Log records arrive in bursts and share a timestamp constantly. Ordering by
+// occurred_at alone leaves ties in an arbitrary order, so paging with an offset
+// can return one record twice and never return another — and the one that gets
+// skipped is as likely as any to be the line explaining the incident somebody
+// is paging through the log to understand.
+func TestIntegrationSystemLogPagingReturnsEachRecordOnce(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	// One instant, many records: the case the order has to settle.
+	const burst = 25
+	for index := 0; index < burst; index++ {
+		if _, err := data.Pool.Exec(ctx, `INSERT INTO system_logs(occurred_at,level,component,message)
+			VALUES(timestamptz '2026-08-24 09:00:00+00','INFO','burst',$1)`,
+			fmt.Sprintf("record-%02d", index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seen := map[string]int{}
+	const page = 7
+	for offset := 0; offset < burst; offset += page {
+		records, err := data.ListSystemLogs(ctx, "", "record-", page, offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, record := range records {
+			seen[record.Message]++
+		}
+	}
+	if len(seen) != burst {
+		t.Errorf("paging returned %d distinct records of %d; the order is not total", len(seen), burst)
+	}
+	for message, count := range seen {
+		if count != 1 {
+			t.Errorf("%s came back %d times", message, count)
+		}
+	}
+
+	// Tied records come back newest-arrived first, which is the only order a
+	// reader can make sense of when the timestamps are equal.
+	first, err := data.ListSystemLogs(ctx, "", "record-", 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 3 || first[0].Message != "record-24" || first[1].Message != "record-23" {
+		t.Errorf("the newest tied records did not come first: %v", first)
 	}
 }
