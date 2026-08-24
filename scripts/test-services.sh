@@ -61,10 +61,44 @@ start_postgres() {
   log "PostgreSQL never accepted CREATE EXTENSION pg_trgm"; exit 1
 }
 
+# seed_directory writes the fixture accounts, retrying until they are there.
+#
+# Waiting for the directory to answer is not the same as it staying up. Adding
+# the overlay makes the server reload, and a readiness probe that runs before
+# the reload has begun passes against the process that is about to go away — so
+# the write lands in the gap and fails. CI hit exactly that: "ldapadd reported
+# an error", then "seeded 0 accounts, expected 2", on a commit that changed no
+# Go code. Retrying the write is what actually closes that window, because it
+# does not depend on guessing when the restart starts.
+#
+# -c keeps going past an entry that is already there, so a retry after a
+# partial write finishes the rest instead of stopping on the first conflict.
+# The count below decides the outcome either way.
 seed_directory() {
   local container="$1"
-  docker exec -i "$container" ldapadd -x -H ldap://localhost \
-    -D "cn=admin,dc=example,dc=test" -w adminpassword >/dev/null 2>&1 <<'LDIF' || log "ldapadd reported an error in $container"
+  local attempt seeded
+  # The condition is the accounts being there, not what ldapadd returned. On an
+  # already-seeded directory every entry conflicts and ldapadd exits non-zero
+  # with nothing wrong, so judging by exit code would retry fifteen times and
+  # then complain about a directory that was correct all along.
+  for attempt in $(seq 1 15); do
+    seed_directory_once "$container" || true
+    # grep -c exits non-zero when it counts nothing, which under set -e ends
+    # the script before it can say what went wrong. The count is taken without
+    # letting that decide the exit status.
+    seeded="$(docker exec "$container" ldapsearch -x -H ldap://localhost \
+      -b "ou=people,dc=example,dc=test" -D "cn=admin,dc=example,dc=test" -w adminpassword \
+      "(objectClass=inetOrgPerson)" uid 2>/dev/null | grep -c '^uid:' || true)"
+    test "${seeded:-0}" -eq 2 && return
+    sleep 1
+  done
+  log "seeded ${seeded:-0} accounts in $container, expected 2"; exit 1
+}
+
+seed_directory_once() {
+  local container="$1"
+  docker exec -i "$container" ldapadd -c -x -H ldap://localhost \
+    -D "cn=admin,dc=example,dc=test" -w adminpassword >/dev/null 2>&1 <<'LDIF'
 dn: ou=people,dc=example,dc=test
 objectClass: organizationalUnit
 ou: people
@@ -87,14 +121,6 @@ givenName: Bob
 mail: bob@example.test
 userPassword: bob-pass-1234
 LDIF
-  # grep -c exits non-zero when it counts nothing, which under set -e ends the
-  # script before it can say what went wrong. The count is taken without
-  # letting that decide the exit status.
-  local seeded
-  seeded="$(docker exec "$container" ldapsearch -x -H ldap://localhost \
-    -b "ou=people,dc=example,dc=test" -D "cn=admin,dc=example,dc=test" -w adminpassword \
-    "(objectClass=inetOrgPerson)" uid 2>/dev/null | grep -c '^uid:' || true)"
-  test "${seeded:-0}" -eq 2 || { log "seeded ${seeded:-0} accounts in $container, expected 2"; exit 1; }
 }
 
 # Group membership only reaches an entry's memberOf through this overlay, and
