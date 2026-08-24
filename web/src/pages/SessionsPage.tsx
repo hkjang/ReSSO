@@ -8,6 +8,7 @@ import { useRealms, useRealmSelection } from '../lib/realms'
 import type { Session } from '../types'
 import { formatDate, shortId } from '../lib/format'
 import { RealmPicker } from '../components/RealmPicker'
+import { useToast } from '../components/toast-context'
 import { ContentCard, PageHeader, StatusChip } from '../components/Page'
 import { EmptyState, ErrorAlert, PageLoading } from '../components/Feedback'
 import { CopyButton } from '../components/CopyField'
@@ -15,12 +16,27 @@ import { describeDevice } from '../lib/device'
 
 export function SessionsPage() {
   const queryClient = useQueryClient()
+  const { notify } = useToast()
   const realms = useRealms()
   const selection = useRealmSelection(realms.data?.items)
   const [target, setTarget] = useState<Session | null>(null)
   const [search, setSearch] = useState('')
   const sessions = useQuery({ queryKey: ['sessions', selection.realmID], queryFn: () => api<{ items: Session[] }>(`/api/admin/v1/realms/${selection.realmID}/sessions?limit=500`), enabled: Boolean(selection.realmID), refetchInterval: 20_000 })
-  const revoke = useMutation({ mutationFn: () => api<void>(`/api/admin/v1/realms/${selection.realmID}/sessions/${target!.id}`, { method: 'DELETE' }), onSuccess: async () => { setTarget(null); await queryClient.invalidateQueries({ queryKey: ['sessions', selection.realmID] }) } })
+  // The dialog promises this revokes the refresh tokens linked to the session,
+  // and that is the half that can fail on its own after the session has ended.
+  // Closing quietly leaves the operator believing the promise was kept while a
+  // relying party holding one of those tokens carries on.
+  const revoke = useMutation({
+    mutationFn: () => api<{ refresh_tokens_revoked?: boolean; message?: string } | undefined>(
+      `/api/admin/v1/realms/${selection.realmID}/sessions/${target!.id}`, { method: 'DELETE' }),
+    onSuccess: async (result) => {
+      setTarget(null)
+      if (result?.refresh_tokens_revoked === false) {
+        notify(result.message ?? '세션은 종료했지만 Refresh Token을 폐기하지 못했습니다.', 'warning')
+      }
+      await queryClient.invalidateQueries({ queryKey: ['sessions', selection.realmID] })
+    },
+  })
   const term = search.trim().toLowerCase()
   // Answering "which sessions does this user have open" previously meant
   // scrolling the whole Realm.
