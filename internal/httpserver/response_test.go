@@ -105,3 +105,42 @@ func TestUnroutedPathsKeepTheErrorContract(t *testing.T) {
 		}
 	}
 }
+
+// Nothing is broken here today; this holds a hazard shut. /api/v1/meta is
+// registered on the parent router and /api/v1 is mounted as a subtree
+// afterwards, and mounting a subtree is the kind of change that can take a
+// sibling route with it. The route it would take is the one the smoke test
+// calls first, and the one release-image.sh documents as how somebody holding
+// an archive finds the commit it was built from.
+//
+// TestOpenAPICoversEveryRegisteredRoute cannot see this: it walks the router,
+// so a route the router still lists but no longer serves looks present. This
+// asks the handler instead, which is what a caller does.
+func TestPublicRoutesAreReachableAndNotShadowed(t *testing.T) {
+	handler := New(nil, slog.New(slog.DiscardHandler), nil, nil).Handler()
+	for _, unauthenticated := range []struct {
+		path string
+		want int
+	}{
+		// Reachable without credentials and without a store.
+		{"/api/openapi.json", http.StatusOK},
+		// Registered on the parent router beside a mounted subtree.
+		{"/api/v1/meta", http.StatusOK},
+	} {
+		request := httptest.NewRequest(http.MethodGet, unauthenticated.path, nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != unauthenticated.want {
+			t.Errorf("GET %s = %d, want %d; a route the router reports is not one a caller can reach",
+				unauthenticated.path, response.Code, unauthenticated.want)
+		}
+	}
+	// The mounted subtree still answers: it refuses for want of credentials
+	// rather than for want of a route.
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Errorf("GET /api/v1/me = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
