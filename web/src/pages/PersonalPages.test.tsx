@@ -2,7 +2,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, test, vi } from 'vitest'
-import { PersonalSecurityPage, ProfilePage } from './PersonalPages'
+import { APIKeysPage, PersonalSecurityPage, ProfilePage } from './PersonalPages'
+import { ToastProvider } from '../components/Toast'
 
 const auth = vi.hoisted(() => ({
   me: {
@@ -69,4 +70,44 @@ test('the submit button stays disabled until every Realm requirement is met', as
   await user.type(next, 'abcdef')
   await user.type(screen.getByLabelText('새 비밀번호 확인 *', { selector: 'input' }), 'abcdef')
   expect(submit).toBeEnabled()
+})
+
+// A rotation that fails used to change nothing and say nothing: the dialog
+// carrying the new secret simply did not appear, which reads as a click that
+// did not register. Every other mutation on the page shows its error.
+test('a failed key rotation says so instead of appearing to do nothing', async () => {
+  const key = {
+    id: '00000000-0000-0000-0000-0000000000aa',
+    name: 'agent',
+    prefix: 'resso_ab',
+    scopes: ['api:read'],
+    active: true,
+    created_at: '2026-08-21T00:00:00Z',
+  }
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url.endsWith('/rotate')) {
+      return new Response(JSON.stringify({ error: 'conflict', message: '키를 회전하지 못했습니다.' }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } })
+    }
+    if (url.includes('/api/v1/me/api-keys')) {
+      return new Response(JSON.stringify({ items: [key] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    void init
+    return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  render(
+    <QueryClientProvider client={queryClient}>
+      <ToastProvider>
+        <APIKeysPage />
+      </ToastProvider>
+    </QueryClientProvider>,
+  )
+  const rotateButton = await screen.findByRole('button', { name: 'agent 키 회전' })
+  await userEvent.click(rotateButton)
+  expect(await screen.findByText('키를 회전하지 못했습니다.')).toBeTruthy()
+  vi.unstubAllGlobals()
 })

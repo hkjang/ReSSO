@@ -10,6 +10,7 @@ import { RealmPicker } from '../components/RealmPicker'
 import { PageHeader, ContentCard, StatusChip } from '../components/Page'
 import { DetailDrawer } from '../components/DetailDrawer'
 import { EmptyState, ErrorAlert, PageLoading } from '../components/Feedback'
+import { useToast } from '../components/toast-context'
 import { CopyButton } from '../components/CopyField'
 import { SortableCell } from '../components/SortableTable'
 import { sortRows, type SortState } from '../lib/sort'
@@ -20,6 +21,7 @@ const blankClient = { client_id: '', name: '', type: 'public' as const, redirect
 
 export function ClientsPage() {
   const queryClient = useQueryClient()
+  const { notify } = useToast()
   const realms = useRealms()
   const selection = useRealmSelection(realms.data?.items)
   const [createOpen, setCreateOpen] = useState(false)
@@ -59,9 +61,14 @@ export function ClientsPage() {
     mutationFn: () => api<ClientRole>(`/api/admin/v1/realms/${selection.realmID}/clients/${selected!.id}/roles`, { method: 'POST', ...jsonBody({ name: roleName, description: roleDescription }) }),
     onSuccess: async () => { setRoleName(''); setRoleDescription(''); await queryClient.invalidateQueries({ queryKey: ['client-roles', selection.realmID, selected?.id] }) },
   })
+  // A deletion that fails leaves the row where it was and, without this, said
+  // nothing — which reads as a click that did not register, so the next thing
+  // an administrator does is click again. Every other mutation on this page
+  // shows its error.
   const deleteRole = useMutation({
     mutationFn: (role: ClientRole) => api<void>(`/api/admin/v1/realms/${selection.realmID}/clients/${selected!.id}/roles/${role.id}`, { method: 'DELETE' }),
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ['client-roles', selection.realmID, selected?.id] }),
+    onError: (error: Error) => notify(error.message, 'error'),
   })
   const term = search.trim().toLowerCase()
   const visibleClients = sortRows(
