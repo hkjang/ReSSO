@@ -48,6 +48,10 @@ export interface User {
 }
 
 export interface LDAPFederation {
+  // Present only when the change landed but signing the provider's people out
+  // did not finish, so the screen can say so instead of reporting plain
+  // success. Absent on every ordinary response.
+  message?: string
   id: string
   realm_id: string
   name: string

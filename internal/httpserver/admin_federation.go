@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/hkjang/ReSSO/internal/domain"
 	"github.com/hkjang/ReSSO/internal/store"
 )
 
@@ -100,7 +102,31 @@ func (s *Server) adminUpdateLDAPFederation(w http.ResponseWriter, r *http.Reques
 	principal, _ := principalFrom(r.Context())
 	s.audit(r, &realmID, &principal.UserID, principal.Username, "LDAP_FEDERATION_UPDATE",
 		partialIfNot(signedOut), "user_federation", item.ID.String(), detail)
+	if !signedOut {
+		// The provider's own fields stay exactly as they were, with the
+		// shortfall added beside them: a screen that reads the item keeps
+		// working, and one that looks for the message can say what happened.
+		writeJSON(w, http.StatusOK, withFederationWarning(item,
+			"공급자는 비활성화했지만 연결된 계정을 모든 애플리케이션에서 로그아웃시키지 못했습니다. 관리 → 세션에서 확인하세요."))
+		return
+	}
 	writeJSON(w, http.StatusOK, item)
+}
+
+// withFederationWarning renders a provider with a note about what did not
+// finish, keeping every field the caller already reads.
+func withFederationWarning(item domain.LDAPFederation, message string) map[string]any {
+	encoded, err := json.Marshal(item)
+	if err != nil {
+		return map[string]any{"users_signed_out": false, "message": message}
+	}
+	fields := map[string]any{}
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return map[string]any{"users_signed_out": false, "message": message}
+	}
+	fields["users_signed_out"] = false
+	fields["message"] = message
+	return fields
 }
 
 func (s *Server) adminDeleteLDAPFederation(w http.ResponseWriter, r *http.Request) {

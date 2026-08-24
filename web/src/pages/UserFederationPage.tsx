@@ -140,7 +140,15 @@ export function UserFederationPage() {
       : `/api/admin/v1/realms/${selection.realmID}/user-federations`, {
       method: editing ? 'PUT' : 'POST', ...jsonBody(requestBody(form, Boolean(editing))),
     }),
-    onSuccess: async (saved) => { setEditing(saved); setForm(toForm(saved)); await invalidate() },
+    // Disabling a provider signs its people out, and that can fall short after
+    // the provider is already disabled. The item comes back either way, with
+    // the shortfall beside it, so a plain success here would hide it.
+    onSuccess: async (saved) => {
+      setEditing(saved)
+      setForm(toForm(saved))
+      if (saved.message) notify(saved.message, 'warning')
+      await invalidate()
+    },
   })
   const testConnection = useMutation({
     mutationFn: () => api<{ connected: boolean; duration_ms: number }>(`/api/admin/v1/realms/${selection.realmID}/user-federations/${editing!.id}/test-connection`, { method: 'POST' }),
@@ -156,8 +164,14 @@ export function UserFederationPage() {
     onSettled: () => setTestPassword(''),
   })
   const remove = useMutation({
-    mutationFn: () => api<void>(`/api/admin/v1/realms/${selection.realmID}/user-federations/${editing!.id}${unlinkUsers ? '?unlink_users=true' : ''}`, { method: 'DELETE' }),
-    onSuccess: async () => { setDeleteOpen(false); setUnlinkUsers(false); setDrawerOpen(false); setEditing(null); await invalidate() },
+    mutationFn: () => api<{ message?: string } | undefined>(`/api/admin/v1/realms/${selection.realmID}/user-federations/${editing!.id}${unlinkUsers ? '?unlink_users=true' : ''}`, { method: 'DELETE' }),
+    onSuccess: async (result) => {
+      setDeleteOpen(false); setUnlinkUsers(false); setDrawerOpen(false); setEditing(null)
+      // A body means the deletion happened but signing the accounts out did
+      // not finish; a 204 carries none.
+      if (result?.message) notify(result.message, 'warning')
+      await invalidate()
+    },
   })
   const liveEditing = providers.data?.items.find((item) => item.id === editing?.id) ?? editing
   // The server reconciles this against how long ago the run reported in: a

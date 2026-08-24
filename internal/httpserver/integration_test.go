@@ -3138,3 +3138,143 @@ func TestIntegrationAPasswordChangeSaysWhichHalfFellShort(t *testing.T) {
 		t.Errorf("the message does not name what survived: %q", message)
 	}
 }
+
+// The two provider changes that sign people out report the change as done when
+// only the sign-out falls short, and the response has to carry that — the audit
+// entry alone is not somewhere the administrator making the change is looking.
+func TestIntegrationAProviderChangeCarriesAnUnfinishedSignOut(t *testing.T) {
+	// No directory is needed: what is under test is what happens after the
+	// provider changes, and the accounts it owns are what drive that.
+	const directory = "ldap://127.0.0.1:1"
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := "adminpassword"
+	input := store.LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	}
+	provider, err := data.CreateLDAPFederation(ctx, realm.ID, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An account the provider owns, with a session and a refresh token: this is
+	// what the sign-out has to reach.
+	owned, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "owned", Password: "owned-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, "UPDATE users SET federation_id=$2 WHERE id=$1",
+		owned.ID, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	client, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "federation-rp", Name: "RP", Type: "confidential",
+		RedirectURIs: []string{"https://rp.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedSession, err := data.CreateSession(ctx, realm.ID, owned.ID, time.Hour, "127.0.0.1", "owned", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedSessionID := ownedSession.Session.ID
+	if _, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: client.Client.ID,
+		UserID: &owned.ID, SessionID: &ownedSessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	admin, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "admin", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at TO revoked_at_moved"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at_moved TO revoked_at"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(restore)
+
+	call := func(method, path, body string) (int, map[string]any) {
+		t.Helper()
+		var reader io.Reader
+		if body != "" {
+			reader = strings.NewReader(body)
+		}
+		request, requestErr := http.NewRequest(method, server.URL+path, reader)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.AddCookie(&http.Cookie{Name: "resso_session", Value: admin.Token})
+		request.Header.Set("X-CSRF-Token", admin.CSRFToken)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		decoded := map[string]any{}
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		return response.StatusCode, decoded
+	}
+
+	base := "/api/admin/v1/realms/" + realm.ID.String() + "/user-federations/" + provider.ID.String()
+	disable := `{"name":"corp","vendor":"OTHER","connection_url":"` + directory + `",` +
+		`"bind_dn":"cn=admin,dc=example,dc=test","bind_credential":"adminpassword",` +
+		`"users_dn":"ou=people,dc=example,dc=test","username_ldap_attribute":"uid","rdn_ldap_attribute":"uid",` +
+		`"uuid_ldap_attribute":"entryUUID","user_object_classes":["inetOrgPerson"],"search_scope":"SUBTREE",` +
+		`"batch_size":100,"edit_mode":"READ_ONLY","missing_user_action":"KEEP","email_ldap_attribute":"mail",` +
+		`"display_name_ldap_attribute":"cn","import_enabled":true,"enabled":false}`
+	status, body := call(http.MethodPut, base, disable)
+	if status != http.StatusOK {
+		t.Fatalf("disabling answered %d, want the change reported as done", status)
+	}
+	if body["enabled"] != false {
+		t.Errorf("the response does not carry the provider it changed: %v", body["enabled"])
+	}
+	if body["message"] == nil || body["users_signed_out"] != false {
+		t.Errorf("the response does not mention the sign-out that did not finish: %v", body)
+	}
+
+	status, body = call(http.MethodDelete, base+"?unlink_users=true", "")
+	if status != http.StatusOK {
+		t.Fatalf("deleting answered %d, want the deletion reported as done", status)
+	}
+	if body["deleted"] != true || body["message"] == nil {
+		t.Errorf("the delete response does not say what happened: %v", body)
+	}
+	restore()
+	if _, err := data.LDAPFederationByID(ctx, provider.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the provider survived a delete reported as done: %v", err)
+	}
+}
