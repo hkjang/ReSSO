@@ -3776,3 +3776,84 @@ func TestIntegrationAdminRoutesRefuseResourcesFromAnotherRealm(t *testing.T) {
 		t.Error("their session was ended from another Realm")
 	}
 }
+
+// The personal endpoints take a resource identifier from the path and the owner
+// from the session, so the pairing question here is ownership rather than
+// Realm: one person's identifier arriving with another person's session. For an
+// API key that is a credential — rotating somebody else's would retire the key
+// they are using and hand the caller a working one on their own account, which
+// is a way to take an integration down and leave no sign of who did it.
+func TestIntegrationPersonalRoutesRefuseSomebodyElsesKeyOrSession(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm := bootstrap.RealmID
+	other, err := data.CreateUser(ctx, realm, store.CreateUserInput{
+		Username: "other", Password: "other-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirKey, err := data.CreatePersonalAPIKey(ctx, other.ID, "theirs", []string{"api:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirSession, err := data.CreateSession(ctx, realm, other.ID, time.Hour, "127.0.0.1", "theirs", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	mine, err := data.CreateSession(ctx, realm, bootstrap.AdminUserID, time.Hour, "127.0.0.1", "mine", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, attempt := range []struct{ method, path string }{
+		{http.MethodPost, "/api/v1/me/api-keys/" + theirKey.Key.ID.String() + "/rotate"},
+		{http.MethodDelete, "/api/v1/me/api-keys/" + theirKey.Key.ID.String()},
+		{http.MethodDelete, "/api/v1/me/sessions/" + theirSession.Session.ID.String()},
+	} {
+		request, requestErr := http.NewRequest(attempt.method, server.URL+attempt.path, nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.AddCookie(&http.Cookie{Name: "resso_session", Value: mine.Token})
+		request.Header.Set("X-CSRF-Token", mine.CSRFToken)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			t.Errorf("%s %s answered %d for something belonging to somebody else",
+				attempt.method, attempt.path, response.StatusCode)
+		}
+	}
+
+	// Theirs still works, which is the half that matters: refusing loudly and
+	// retiring the key anyway would be the same outcome for them.
+	if _, err := data.AuthenticateAPIKey(ctx, theirKey.Secret); err != nil {
+		t.Errorf("their API key stopped working: %v", err)
+	}
+	var revoked bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT revoked_at IS NOT NULL FROM sso_sessions WHERE id=$1", theirSession.Session.ID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if revoked {
+		t.Error("their session was ended by somebody else's request")
+	}
+	// And no key was minted for the caller in the attempt.
+	keys, err := data.ListPersonalAPIKeys(ctx, bootstrap.AdminUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("the rotation attempt left %d key(s) on the caller's account", len(keys))
+	}
+}
