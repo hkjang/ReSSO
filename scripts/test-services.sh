@@ -185,7 +185,15 @@ start_directory() {
 }
 
 make_certificates() {
-  test -f "$certs/ca.crt" && return
+  # Every file the directory needs has to be there, not just the first one
+  # written. A run that stopped half way leaves the CA behind, and returning on
+  # that alone left the server certificate missing while reporting success:
+  # slapd then starts without one and the TLS readiness check blames the
+  # container. Verified by deleting ldap.crt and running again — it stayed
+  # deleted.
+  if test -f "$certs/ca.crt" && test -f "$certs/ldap.crt" && test -f "$certs/ldap.key"; then
+    return
+  fi
   mkdir -p "$certs"
   openssl req -x509 -newkey rsa:2048 -sha256 -days 30 -nodes \
     -keyout "$certs/ca.key" -out "$certs/ca.crt" -subj "/CN=ReSSO Test CA" \
