@@ -372,8 +372,9 @@ func (s *Server) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 	ended, detail := s.endOtherSessions(r, userID, nil)
 	s.audit(r, &realmID, &principal.UserID, principal.Username, "PASSWORD_RESET",
 		partialIfNot(ended), "user", userID.String(), detail)
-	writeSessionsEnded(w, ended,
-		"비밀번호는 재설정되었지만 이 계정의 세션을 종료하지 못했습니다. 세션 화면에서 직접 종료하세요.")
+	writeSessionsEnded(w, ended, detail,
+		"비밀번호는 재설정되었지만 이 계정의 세션을 종료하지 못했습니다. 세션 화면에서 직접 종료하세요.",
+		"비밀번호는 재설정되었고 이 계정의 세션도 종료했지만, 그 세션의 Refresh Token을 폐기하지 못했습니다. 연동 애플리케이션에서 계속 사용될 수 있습니다.")
 }
 
 func (s *Server) adminListClients(w http.ResponseWriter, r *http.Request) {

@@ -304,11 +304,12 @@ func openAPIUserSchemas() map[string]any {
 		},
 		"PartialSessionRevocation": map[string]any{
 			"type":        "object",
-			"description": "비밀번호는 바뀌었지만 세션 종료가 실패한 경우의 응답. 감사 이벤트는 PARTIAL로 기록됩니다.",
-			"required":    []string{"other_sessions_ended", "message"},
+			"description": "비밀번호는 바뀌었지만 세션 종료 또는 그 세션의 Refresh Token 폐기가 실패한 경우의 응답. other_sessions_ended가 true이면 세션은 종료됐고 Refresh Token만 남은 것입니다. 감사 이벤트는 PARTIAL로 기록됩니다.",
+			"required":    []string{"other_sessions_ended", "refresh_tokens_revoked", "message"},
 			"properties": map[string]any{
-				"other_sessions_ended": map[string]any{"type": "boolean", "enum": []any{false}},
-				"message":              map[string]any{"type": "string"},
+				"other_sessions_ended":   map[string]any{"type": "boolean"},
+				"refresh_tokens_revoked": map[string]any{"type": "boolean", "enum": []any{false}},
+				"message":                map[string]any{"type": "string"},
 			},
 		},
 	}

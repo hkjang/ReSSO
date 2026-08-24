@@ -101,8 +101,9 @@ func (s *Server) changeMyPassword(w http.ResponseWriter, r *http.Request) {
 	ended, detail := s.endOtherSessions(r, principal.UserID, principal.SessionID)
 	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "PASSWORD_CHANGE",
 		partialIfNot(ended), "user", principal.UserID.String(), detail)
-	writeSessionsEnded(w, ended,
-		"비밀번호는 변경되었지만 다른 기기의 세션을 종료하지 못했습니다. `내 세션`에서 직접 종료하세요.")
+	writeSessionsEnded(w, ended, detail,
+		"비밀번호는 변경되었지만 다른 기기의 세션을 종료하지 못했습니다. `내 세션`에서 직접 종료하세요.",
+		"비밀번호는 변경되었고 다른 기기의 세션도 종료했지만, 그 세션의 Refresh Token을 폐기하지 못했습니다. 연동 애플리케이션에서 계속 사용될 수 있습니다.")
 }
 
 // endOtherSessions ends the sessions a password change is meant to end and
@@ -187,12 +188,24 @@ func writeSessionEnded(w http.ResponseWriter, revokedTokens bool, message string
 		"session_ended": true, "refresh_tokens_revoked": false, "message": message})
 }
 
-func writeSessionsEnded(w http.ResponseWriter, ended bool, message string) {
+func writeSessionsEnded(w http.ResponseWriter, ended bool, detail map[string]any, notEnded, tokensSurvived string) {
 	if ended {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"other_sessions_ended": false, "message": message})
+	// The two ways this can fall short need different sentences, and saying
+	// the wrong one is worse than saying nothing. When the sessions did end
+	// and only their refresh tokens survived, "the other sessions could not be
+	// ended" sends somebody who changed their password because they think it
+	// is known to go looking for sessions to close, and find none — while what
+	// actually survived goes unmentioned.
+	sessionsEnded, _ := detail["other_sessions_ended"].(bool)
+	message := notEnded
+	if sessionsEnded {
+		message = tokensSurvived
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"other_sessions_ended": sessionsEnded, "refresh_tokens_revoked": false, "message": message})
 }
 
 func (s *Server) mySessions(w http.ResponseWriter, r *http.Request) {

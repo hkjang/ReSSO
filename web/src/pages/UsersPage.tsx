@@ -104,14 +104,13 @@ export function UsersPage() {
   // needs to hear that the sessions survived it.
   const [resetPartial, setResetPartial] = useState('')
   const reset = useMutation({
-    mutationFn: () => api<{ other_sessions_ended?: boolean; message?: string } | undefined>(
+    mutationFn: () => api<{ message?: string } | undefined>(
       `/api/admin/v1/realms/${selection.realmID}/users/${selected!.id}/password`,
       { method: 'PUT', ...jsonBody({ new_password: resetPassword }) }),
     onSuccess: (result) => {
       setResetPassword('')
-      setResetPartial(result?.other_sessions_ended === false
-        ? result.message ?? '비밀번호는 재설정되었지만 이 계정의 세션을 종료하지 못했습니다.'
-        : '')
+      // A body at all means something fell short; which half is in the message.
+      setResetPartial(result?.message ?? '')
     },
   })
   const unlock = useMutation({

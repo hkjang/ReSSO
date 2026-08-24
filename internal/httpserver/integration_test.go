@@ -3030,3 +3030,111 @@ func TestIntegrationEndingMyOwnSessionSurvivesRefreshTokensItCannotRevoke(t *tes
 		t.Errorf("the trail records result=%s for a sign-out that half worked", page.Items[0].Result)
 	}
 }
+
+// A password change falls short in two different ways and they need different
+// sentences. Saying "the other sessions could not be ended" when they were
+// ended, and only their refresh tokens survived, sends somebody who changed
+// their password because they believe it is known to go looking for sessions
+// to close — and find none, while what actually survived goes unmentioned.
+func TestIntegrationAPasswordChangeSaysWhichHalfFellShort(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "password-rp", Name: "RP", Type: "confidential",
+		RedirectURIs: []string{"https://rp.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "changer", Password: "changer-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	here, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "here", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	elsewhere, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "elsewhere", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID := elsewhere.Session.ID
+	if _, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: client.Client.ID,
+		UserID: &user.ID, SessionID: &otherID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at TO revoked_at_moved"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at_moved TO revoked_at"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(restore)
+
+	body := `{"current_password":"changer-password-1234","new_password":"changer-password-5678"}`
+	request, err := http.NewRequest(http.MethodPut, server.URL+"/api/v1/me/password", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.AddCookie(&http.Cookie{Name: "resso_session", Value: here.Token})
+	request.Header.Set("X-CSRF-Token", here.CSRFToken)
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	_ = json.NewDecoder(response.Body).Decode(&decoded)
+	_ = response.Body.Close()
+	restore()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 carrying what fell short", response.StatusCode)
+	}
+	// The other session really was ended; only its refresh tokens survived.
+	var revoked bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT revoked_at IS NOT NULL FROM sso_sessions WHERE id=$1", otherID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Fatal("the other session was not ended, so this is not measuring what it claims")
+	}
+	if decoded["other_sessions_ended"] != true {
+		t.Errorf("the response says the other sessions were not ended, and they were: %v", decoded)
+	}
+	if decoded["refresh_tokens_revoked"] != false {
+		t.Errorf("the response does not report the refresh tokens that survived: %v", decoded)
+	}
+	message, _ := decoded["message"].(string)
+	if strings.Contains(message, "세션을 종료하지 못했습니다") {
+		t.Errorf("the message sends the reader after sessions that are already gone: %q", message)
+	}
+	if !strings.Contains(message, "Refresh Token") {
+		t.Errorf("the message does not name what survived: %q", message)
+	}
+}
