@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -3443,5 +3444,108 @@ func TestIntegrationReadinessFollowsTheDatabase(t *testing.T) {
 	}
 	if status := statusOf("/health/live"); status != http.StatusOK {
 		t.Errorf("liveness answered %d, which would have the process restarted rather than taken out of rotation", status)
+	}
+}
+
+// An MCP client that is refused reads the challenge header to find out how to
+// authenticate: it names a metadata document and the scope to ask for. Three
+// things therefore have to agree — the path in the header has to be served,
+// the document has to name an authorization server that exists, and the scope
+// in the header has to be the one the endpoint actually requires. Nothing
+// checked any of them, and a client cannot recover from a pointer that does
+// not resolve; it simply cannot connect.
+func TestIntegrationMCPChallengePointsSomewhereThatWorks(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	refused, err := server.Client().Post(server.URL+"/mcp", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = refused.Body.Close()
+	if refused.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("an unauthenticated MCP call answered %d", refused.StatusCode)
+	}
+	challenge := refused.Header.Get("WWW-Authenticate")
+	if challenge == "" {
+		t.Fatal("the refusal carries no challenge, so a client is told nothing about how to proceed")
+	}
+	metadata := regexp.MustCompile(`resource_metadata="([^"]+)"`).FindStringSubmatch(challenge)
+	scope := regexp.MustCompile(`scope="([^"]+)"`).FindStringSubmatch(challenge)
+	if metadata == nil || scope == nil {
+		t.Fatalf("the challenge names no metadata document or scope: %q", challenge)
+	}
+
+	document, err := server.Client().Get(server.URL + metadata[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = document.Body.Close() }()
+	if document.StatusCode != http.StatusOK {
+		t.Fatalf("the challenge points at %s, which answers %d", metadata[1], document.StatusCode)
+	}
+	var described map[string]any
+	if err := json.NewDecoder(document.Body).Decode(&described); err != nil {
+		t.Fatal(err)
+	}
+	servers, _ := described["authorization_servers"].([]any)
+	if len(servers) != 1 || servers[0] != realm.IssuerURL {
+		t.Errorf("authorization_servers = %v, want the master Realm's issuer %q", servers, realm.IssuerURL)
+	}
+	// The scope the client is told to ask for has to be one the document says
+	// this resource accepts, or it asks for something it can never use.
+	advertised, _ := described["scopes_supported"].([]any)
+	found := false
+	for _, value := range advertised {
+		if value == scope[1] {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the challenge asks for scope %q, which the metadata does not list: %v", scope[1], advertised)
+	}
+	// And that scope is the one the endpoint enforces: a key holding every
+	// other advertised scope but not this one is still refused. The scope is
+	// taken from the challenge rather than written here, or the check passes
+	// whatever the challenge says — which is how the first version of it read.
+	withheld := make([]string, 0, len(advertised))
+	for _, value := range advertised {
+		if name, ok := value.(string); ok && name != scope[1] {
+			withheld = append(withheld, name)
+		}
+	}
+	if len(withheld) == 0 {
+		t.Fatal("the metadata advertises only the challenged scope, so this cannot be checked")
+	}
+	principal, err := data.CreatePersonalAPIKey(ctx, bootstrap.AdminUserID, "wrong-scope",
+		withheld, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/mcp", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+principal.Secret)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Errorf("a key without %s was accepted (%d), so the challenge asks for a scope that is not required",
+			scope[1], response.StatusCode)
 	}
 }
