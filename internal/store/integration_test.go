@@ -1778,7 +1778,14 @@ func TestIntegrationApprovalReviewerCannotBeSelfOrForeign(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legitimate, err := data.CreateRoleApprovalRequest(ctx, alice, role.ID, "still need it")
+	// A fresh request, raised after the manager was assigned so that it names
+	// them as reviewer. It asks for a different role because the first request
+	// is still waiting and a second for the same one is refused as a duplicate.
+	secondRole, err := data.CreateRole(ctx, alice.RealmID, "auditor-second", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legitimate, err := data.CreateRoleApprovalRequest(ctx, alice, secondRole.ID, "still need it")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1786,7 +1793,7 @@ func TestIntegrationApprovalReviewerCannotBeSelfOrForeign(t *testing.T) {
 		t.Fatalf("a manager could not approve their report's request: %v", err)
 	}
 	if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id=$1 AND role_id=$2)`,
-		alice.ID, role.ID).Scan(&granted); err != nil {
+		alice.ID, secondRole.ID).Scan(&granted); err != nil {
 		t.Fatal(err)
 	}
 	if !granted {
@@ -3950,5 +3957,85 @@ func TestIntegrationSearchIndexesAreAllAttempted(t *testing.T) {
 	}
 	if present() != 2 {
 		t.Errorf("%d of the two possible indexes exist; the run stopped at the failure", present())
+	}
+}
+
+// Asking twice for the same role adds nothing and shows the reviewer the same
+// row again — clicking a second time because nothing appeared to happen is the
+// ordinary way it arises. And approving a request whose role was granted in the
+// meantime, by an administrator or by a duplicate decided first, used to fail
+// with "approval target is no longer valid": the target was fine, and the
+// outcome the reviewer wanted already held.
+func TestIntegrationApprovalRequestsAreNotDuplicatedOrMisreported(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.UpdateRealm(ctx, realm.ID, UpdateRealmInput{
+		DisplayName: realm.DisplayName, IssuerURL: realm.IssuerURL, Enabled: true, ApprovalEnabled: true,
+		AccessTokenTTLSeconds: realm.AccessTokenTTLSeconds, RefreshTokenTTLSeconds: realm.RefreshTokenTTLSeconds,
+		SessionTTLSeconds: realm.SessionTTLSeconds, PasswordMinLength: realm.PasswordMinLength,
+		MaxLoginAttempts: realm.MaxLoginAttempts, LockoutSeconds: realm.LockoutSeconds}); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := data.CreateUser(ctx, realm.ID, CreateUserInput{
+		Username: "manager", Password: "manager-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateUser(ctx, realm.ID, CreateUserInput{
+		Username: "staff", Password: "staff-password-1234", Enabled: true, ManagerID: &manager.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staff, err := data.UserByID(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, err := data.CreateRole(ctx, realm.ID, "auditor", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := data.CreateRole(ctx, realm.ID, "reviewer", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := data.CreateRoleApprovalRequest(ctx, staff, role.ID, "please")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateRoleApprovalRequest(ctx, staff, role.ID, "please again"); !errors.Is(err, ErrConflict) {
+		t.Errorf("a second request for a role already waiting returned %v, want a conflict", err)
+	}
+	// A different role is a different question and must still be askable.
+	other, err := data.CreateRoleApprovalRequest(ctx, staff, second.ID, "and this one")
+	if err != nil {
+		t.Fatalf("a request for another role was refused: %v", err)
+	}
+
+	// An administrator grants the role while the request is still waiting.
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO user_roles(user_id,role_id) VALUES($1,$2)
+		ON CONFLICT DO NOTHING`, staff.ID, role.ID); err != nil {
+		t.Fatal(err)
+	}
+	decided, err := data.DecideApprovalRequest(ctx, first.ID, manager.ID, false, false, realm.ID, true, "ok")
+	if err != nil {
+		t.Fatalf("approving a role the person already holds failed: %v", err)
+	}
+	if decided.Status != "APPROVED" {
+		t.Errorf("the request was recorded as %s", decided.Status)
+	}
+
+	// A target that really has gone still fails, which is what that message
+	// was for: the role is deleted while its request waits.
+	if err := data.DeleteRole(ctx, realm.ID, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.DecideApprovalRequest(ctx, other.ID, manager.ID, false, false, realm.ID, true, "ok"); err == nil {
+		t.Error("approving a request whose role was deleted succeeded")
 	}
 }

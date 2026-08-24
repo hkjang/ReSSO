@@ -299,6 +299,21 @@ func (s *Store) CreateRoleApprovalRequest(ctx context.Context, requester domain.
 	if err := s.Pool.QueryRow(ctx, "SELECT realm_id FROM roles WHERE id=$1", roleID).Scan(&roleRealm); err != nil || roleRealm != requester.RealmID {
 		return domain.ApprovalRequest{}, errors.New("requested role is not in the user's realm")
 	}
+	// A second request for a role already waiting on the same reviewer asks
+	// nothing new, and the reviewer sees the same row twice. Clicking again
+	// because nothing appeared to happen is the ordinary way this arises. Two
+	// requests racing here would both pass this check, which costs a duplicate
+	// row and no more, so it is left as a check rather than a constraint that
+	// an upgraded database with existing duplicates could not accept.
+	var alreadyWaiting bool
+	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM approval_requests
+        WHERE requester_id=$1 AND status='PENDING' AND kind='ROLE_ASSIGNMENT'
+        AND payload->>'role_id'=$2::text)`, requester.ID, roleID.String()).Scan(&alreadyWaiting); err != nil {
+		return domain.ApprovalRequest{}, err
+	}
+	if alreadyWaiting {
+		return domain.ApprovalRequest{}, conflictf("이 Role은 이미 승인 대기 중입니다.")
+	}
 	payload, _ := json.Marshal(roleAssignmentPayload{UserID: requester.ID, RoleID: roleID})
 	request := domain.ApprovalRequest{ID: uuid.New(), RealmID: requester.RealmID, RequesterID: requester.ID,
 		ReviewerID: requester.ManagerID, Kind: "ROLE_ASSIGNMENT", Payload: payload, Reason: strings.TrimSpace(reason),
@@ -415,11 +430,25 @@ func (s *Store) DecideApprovalRequest(ctx context.Context, requestID, reviewerID
 			if err := json.Unmarshal(request.Payload, &payload); err != nil {
 				return domain.ApprovalRequest{}, fmt.Errorf("decode approval payload: %w", err)
 			}
-			command, err := tx.Exec(ctx, `INSERT INTO user_roles(user_id,role_id)
-                SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM users u JOIN roles r ON r.realm_id=u.realm_id
-                WHERE u.id=$1 AND r.id=$2 AND u.realm_id=$3) ON CONFLICT DO NOTHING`, payload.UserID, payload.RoleID, request.RealmID)
-			if err != nil || command.RowsAffected() == 0 {
+			// Whether the pairing still exists is asked separately from
+			// whether a row was written. Reading no rows written as "no
+			// longer valid" made approving a request whose role had already
+			// been granted — by an administrator, or by a duplicate request
+			// decided first — fail with a message about a target that was
+			// perfectly fine. The reviewer wanted the person to hold the
+			// role, and they do.
+			var targetExists bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM users u JOIN roles r ON r.realm_id=u.realm_id
+                WHERE u.id=$1 AND r.id=$2 AND u.realm_id=$3)`,
+				payload.UserID, payload.RoleID, request.RealmID).Scan(&targetExists); err != nil {
+				return domain.ApprovalRequest{}, err
+			}
+			if !targetExists {
 				return domain.ApprovalRequest{}, errors.New("approval target is no longer valid")
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO user_roles(user_id,role_id)
+                VALUES($1,$2) ON CONFLICT DO NOTHING`, payload.UserID, payload.RoleID); err != nil {
+				return domain.ApprovalRequest{}, err
 			}
 		}
 	}
