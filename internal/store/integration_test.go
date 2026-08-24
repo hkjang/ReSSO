@@ -4913,3 +4913,61 @@ func TestIntegrationSystemLogPagingReturnsEachRecordOnce(t *testing.T) {
 		t.Errorf("the newest tied records did not come first: %v", first)
 	}
 }
+
+// One bare conflict covered both reasons a deletion can be refused, and the
+// generic sentence for a conflict is "an identical item already exists" — which
+// says nothing true about a deletion. An administrator removing the built-in
+// user Role read that, and so did one working from a stale screen whose Role
+// somebody else had already removed.
+func TestIntegrationDeletingARoleSaysWhyItWasRefused(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+
+	roles, err := data.ListRoles(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var builtin uuid.UUID
+	for _, role := range roles {
+		if role.Name == "user" {
+			builtin = role.ID
+		}
+	}
+	if builtin == uuid.Nil {
+		t.Fatal("the Realm has no built-in user Role, so this cannot be checked")
+	}
+
+	err = data.DeleteRole(ctx, bootstrap.RealmID, builtin)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("removing a built-in Role reported %v, want a conflict", err)
+	}
+	var messaged *MessagedError
+	if !errors.As(err, &messaged) || !strings.Contains(messaged.Message, "기본 Role") {
+		t.Errorf("the refusal does not say the Role is built in: %v", err)
+	}
+	// And it really is still there.
+	after, err := data.ListRoles(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(roles) {
+		t.Errorf("roles went from %d to %d despite the refusal", len(roles), len(after))
+	}
+
+	// A Role that is not there is absent, not conflicting: the reader is
+	// looking at a screen that is out of date, and telling them something
+	// already exists sends them to look for a duplicate that does not.
+	if err := data.DeleteRole(ctx, bootstrap.RealmID, uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Errorf("removing a Role that is not there reported %v, want not-found", err)
+	}
+
+	// An ordinary Role still goes.
+	created, err := data.CreateRole(ctx, bootstrap.RealmID, "removable", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.DeleteRole(ctx, bootstrap.RealmID, created.ID); err != nil {
+		t.Errorf("an ordinary Role could not be removed: %v", err)
+	}
+}

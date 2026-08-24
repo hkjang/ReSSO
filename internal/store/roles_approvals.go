@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -83,14 +84,28 @@ func (s *Store) UpdateRole(ctx context.Context, realmID, roleID uuid.UUID, descr
 // builtinRoleNames are created with every Realm and cannot be removed.
 var builtinRoleNames = []string{"user", "realm-admin", "offline_access"}
 
+// DeleteRole removes a Realm Role that the Realm did not come with.
+//
+// Why it was refused is asked separately from whether a row went, because one
+// bare conflict covered both reasons and the generic sentence for a conflict
+// is "an identical item already exists" — which says nothing true about a
+// deletion. An administrator removing the built-in user Role was told that,
+// and so was one working from a stale screen whose Role is already gone.
 func (s *Store) DeleteRole(ctx context.Context, realmID, roleID uuid.UUID) error {
-	command, err := s.Pool.Exec(ctx, `DELETE FROM roles WHERE id=$1 AND realm_id=$2
-		AND NOT (name = ANY($3::text[]))`, roleID, realmID, builtinRoleNames)
+	var name string
+	err := s.Pool.QueryRow(ctx, "SELECT name FROM roles WHERE id=$1 AND realm_id=$2",
+		roleID, realmID).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
 		return err
 	}
-	if command.RowsAffected() == 0 {
-		return ErrConflict
+	if slices.Contains(builtinRoleNames, name) {
+		return conflictf("%q은(는) Realm과 함께 만들어지는 기본 Role이라 삭제할 수 없습니다.", name)
+	}
+	if _, err := s.Pool.Exec(ctx, "DELETE FROM roles WHERE id=$1 AND realm_id=$2", roleID, realmID); err != nil {
+		return err
 	}
 	return nil
 }
