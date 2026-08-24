@@ -5282,3 +5282,90 @@ func TestIntegrationCreatingAUserAndItsRoleIsAllOrNothing(t *testing.T) {
 		t.Error("an ordinary account was created without the user Role")
 	}
 }
+
+// Deciding an approval grants a Role, so who may decide is an authorization
+// question. Two ways of not being entitled to were untested: somebody who is
+// simply not the reviewer, and an administrator of a different Realm — the
+// second being the cross-tenant shape, where holding realm-admin in one tenant
+// would otherwise settle another tenant's requests.
+func TestIntegrationOnlyTheReviewerOrTheRealmsOwnAdminCanDecide(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm := bootstrap.RealmID
+	current, err := data.RealmByID(ctx, realm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.UpdateRealm(ctx, realm, UpdateRealmInput{
+		DisplayName: current.DisplayName, IssuerURL: current.IssuerURL, Enabled: true, ApprovalEnabled: true,
+		AccessTokenTTLSeconds: current.AccessTokenTTLSeconds, RefreshTokenTTLSeconds: current.RefreshTokenTTLSeconds,
+		SessionTTLSeconds: current.SessionTTLSeconds, PasswordMinLength: current.PasswordMinLength,
+		MaxLoginAttempts: current.MaxLoginAttempts, LockoutSeconds: current.LockoutSeconds}); err != nil {
+		t.Fatal(err)
+	}
+	role, err := data.CreateRole(ctx, realm, "needs-approval", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := data.CreateUser(ctx, realm, CreateUserInput{
+		Username: "lead", Password: "lead-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester, err := data.CreateUser(ctx, realm, CreateUserInput{
+		Username: "report", Password: "report-password-1234", Enabled: true, ManagerID: &manager.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bystander, err := data.CreateUser(ctx, realm, CreateUserInput{
+		Username: "bystander", Password: "bystander-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := data.CreateRoleApprovalRequest(ctx, requester, role.ID, "need it")
+	if err != nil {
+		t.Fatal(err)
+	}
+	holdsRole := func() bool {
+		t.Helper()
+		var held bool
+		if err := data.Pool.QueryRow(ctx,
+			"SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id=$1 AND role_id=$2)",
+			requester.ID, role.ID).Scan(&held); err != nil {
+			t.Fatal(err)
+		}
+		return held
+	}
+
+	// Not the reviewer, not an administrator.
+	if _, err := data.DecideApprovalRequest(ctx, request.ID, bystander.ID, false, false, uuid.Nil, true, ""); err == nil {
+		t.Error("somebody who is not the reviewer decided the request")
+	}
+	if holdsRole() {
+		t.Fatal("the Role was granted by somebody not entitled to decide")
+	}
+
+	// An administrator of another Realm: realm-admin is scoped to the Realm it
+	// was granted in, and the request belongs to this one.
+	elsewhere, err := data.CreateRealm(ctx, CreateRealmInput{
+		Name: "elsewhere", DisplayName: "Elsewhere", IssuerURL: "https://elsewhere.example.test/realms/elsewhere"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.DecideApprovalRequest(ctx, request.ID, bystander.ID, false, true, elsewhere.ID, true, ""); err == nil {
+		t.Error("an administrator of another Realm decided this Realm's request")
+	}
+	if holdsRole() {
+		t.Fatal("the Role was granted from another Realm")
+	}
+
+	// The Realm's own administrator can, which is what makes the refusals above
+	// about the Realm rather than about administrators.
+	if _, err := data.DecideApprovalRequest(ctx, request.ID, bystander.ID, false, true, realm, true, "ok"); err != nil {
+		t.Fatalf("this Realm's administrator could not decide: %v", err)
+	}
+	if !holdsRole() {
+		t.Error("an approved request did not grant the Role")
+	}
+}
