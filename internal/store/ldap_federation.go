@@ -257,12 +257,41 @@ func (s *Store) UpdateLDAPFederation(ctx context.Context, id uuid.UUID, input LD
 		return domain.LDAPFederation{}, ErrNotFound
 	}
 	if current.Provider.Enabled && !provider.Enabled {
-		_, _ = s.Pool.Exec(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())
-            WHERE user_id IN (SELECT id FROM users WHERE federation_id=$1)`, id)
-		_, _ = s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
-            WHERE user_id IN (SELECT id FROM users WHERE federation_id=$1)`, id)
+		// Two statements written out here revoked the rows and stopped there:
+		// the outcome of each was discarded, so a failure was reported as a
+		// completed sign-out, and no relying party was ever told. Measured, it
+		// signed the people out of ReSSO and left them signed in everywhere
+		// they had used it — which is the gap the account-disable work closed
+		// for the console and for the DISABLE sweep by sending all of them
+		// through one call. This was the third place and did not go through it.
+		linked, linkedErr := s.federatedUserIDs(ctx, id)
+		if linkedErr != nil {
+			return domain.LDAPFederation{}, linkedErr
+		}
+		if err := s.EndSessionsOfDisabledUsers(ctx, linked); err != nil {
+			return domain.LDAPFederation{}, fmt.Errorf("end sessions of the disabled provider's users: %w", err)
+		}
 	}
 	return s.LDAPFederationByID(ctx, id)
+}
+
+// federatedUserIDs names the accounts a provider owns, so that signing them
+// out can go through the same call every other disable path uses.
+func (s *Store) federatedUserIDs(ctx context.Context, providerID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT id FROM users WHERE federation_id=$1`, providerID)
+	if err != nil {
+		return nil, fmt.Errorf("list the provider's users: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func (s *Store) DeleteLDAPFederation(ctx context.Context, id uuid.UUID, unlinkUsers bool) error {
@@ -271,20 +300,22 @@ func (s *Store) DeleteLDAPFederation(ctx context.Context, id uuid.UUID, unlinkUs
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var linked int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM users WHERE federation_id=$1`, id).Scan(&linked); err != nil {
+	// Who the provider owns has to be read before the unlink clears the
+	// column that says so, and kept for after the commit: signing them out is
+	// what tells the relying parties, and that cannot be done from inside this
+	// transaction.
+	linked, err := s.federatedUserIDsTx(ctx, tx, id)
+	if err != nil {
 		return err
 	}
-	if linked > 0 && !unlinkUsers {
+	if len(linked) > 0 && !unlinkUsers {
 		return ErrConflict
 	}
-	if linked > 0 {
-		_, _ = tx.Exec(ctx, `UPDATE sso_sessions SET revoked_at=COALESCE(revoked_at,now())
-            WHERE user_id IN (SELECT id FROM users WHERE federation_id=$1)`, id)
-		_, _ = tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
-            WHERE user_id IN (SELECT id FROM users WHERE federation_id=$1)`, id)
-		_, _ = tx.Exec(ctx, `DELETE FROM user_roles ur USING federation_role_assignments fra
-            WHERE fra.federation_id=$1 AND ur.user_id=fra.user_id AND ur.role_id=fra.role_id`, id)
+	if len(linked) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM user_roles ur USING federation_role_assignments fra
+            WHERE fra.federation_id=$1 AND ur.user_id=fra.user_id AND ur.role_id=fra.role_id`, id); err != nil {
+			return fmt.Errorf("remove the roles the provider granted: %w", err)
+		}
 		if _, err := tx.Exec(ctx, `UPDATE users SET enabled=false,federation_id=NULL,external_id=NULL,
             external_dn=NULL,federation_synced_at=NULL,failed_attempts=0,locked_until=NULL,updated_at=now()
             WHERE federation_id=$1`, id); err != nil {
@@ -298,7 +329,37 @@ func (s *Store) DeleteLDAPFederation(ctx context.Context, id uuid.UUID, unlinkUs
 	if command.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	// The accounts are disabled the moment that commit lands, and a disabled
+	// account's session is refused everywhere already, so nothing is open in
+	// the gap. What this adds is the durable revocation and the notification —
+	// the sessions and refresh tokens used to be revoked inside the
+	// transaction, with each statement's outcome discarded and no relying
+	// party told, which left everyone signed in wherever they had used ReSSO.
+	if err := s.EndSessionsOfDisabledUsers(ctx, linked); err != nil {
+		return fmt.Errorf("end sessions of the unlinked provider's users: %w", err)
+	}
+	return nil
+}
+
+// federatedUserIDsTx is federatedUserIDs inside a caller's transaction.
+func (s *Store) federatedUserIDsTx(ctx context.Context, tx pgx.Tx, providerID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := tx.Query(ctx, `SELECT id FROM users WHERE federation_id=$1`, providerID)
+	if err != nil {
+		return nil, fmt.Errorf("list the provider's users: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func normalizeLDAPInput(id, realmID uuid.UUID, input LDAPFederationInput, credential string, creating bool) (domain.LDAPFederation, string, error) {

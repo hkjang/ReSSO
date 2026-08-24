@@ -4480,3 +4480,193 @@ func TestIntegrationEndingASessionReportsRefreshTokensItCouldNotRevoke(t *testin
 		}
 	}
 }
+
+// Disabling a provider is the third place an account stops being usable, and
+// the only one that did not go through the call the other two share. It wrote
+// the two revocations out by hand, discarded the outcome of each, and told no
+// relying party — so it signed people out of ReSSO and left them signed in
+// everywhere they had used it, while reporting a completed sign-out either way.
+func TestIntegrationDisablingAProviderSignsItsPeopleOutEverywhere(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "ou=provider-disable,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "worker")
+	credential := "adminpassword"
+	input := LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	}
+	provider, err := data.CreateLDAPFederation(ctx, realm.ID, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	people, err := data.ListUsers(ctx, realm.ID, "worker", UserSort{}, 5, 0)
+	if err != nil || len(people) != 1 {
+		t.Fatalf("imported users = %d (%v)", len(people), err)
+	}
+	worker := people[0]
+	client, err := data.CreateClient(ctx, realm.ID, CreateClientInput{
+		ClientID: "provider-rp", Name: "RP", Type: "confidential",
+		RedirectURIs: []string{"https://rp.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, worker.ID, time.Hour, "127.0.0.1", "provider", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: realm.ID, ClientID: client.Client.ID,
+		UserID: &worker.ID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var told []RevokedSession
+	data.OnSessionRevoked = func(revoked RevokedSession) { told = append(told, revoked) }
+	input.Enabled = false
+	if _, err := data.UpdateLDAPFederation(ctx, provider.ID, input); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(told) != 1 || told[0].SessionID != sessionID {
+		t.Errorf("relying parties told about the sign-out = %d, want the one open session", len(told))
+	}
+	var revoked bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT revoked_at IS NOT NULL FROM sso_sessions WHERE id=$1", sessionID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Error("the session survived the provider being disabled")
+	}
+	if _, active, inspectErr := data.InspectRefreshToken(ctx, raw); inspectErr != nil || active {
+		t.Errorf("the refresh token survived the provider being disabled: %v %v", active, inspectErr)
+	}
+
+	// And a sign-out that cannot finish is not reported as one that did.
+	input.Enabled = true
+	if _, err := data.UpdateLDAPFederation(ctx, provider.ID, input); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at TO revoked_at_moved"); err != nil {
+		t.Fatal(err)
+	}
+	input.Enabled = false
+	_, disableErr := data.UpdateLDAPFederation(ctx, provider.ID, input)
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at_moved TO revoked_at"); err != nil {
+		t.Fatal(err)
+	}
+	if disableErr == nil {
+		t.Error("a provider whose people could not be signed out reported a completed sign-out")
+	}
+}
+
+// Unlinking a provider is the same act by another route: the accounts stop
+// being usable, so the relying parties have to hear about it. It revoked the
+// rows inside its transaction, discarded the outcome of each and told nobody.
+func TestIntegrationUnlinkingAProviderSignsItsPeopleOutEverywhere(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "ou=provider-unlink,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "leaver")
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, realm.ID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	people, err := data.ListUsers(ctx, realm.ID, "leaver", UserSort{}, 5, 0)
+	if err != nil || len(people) != 1 {
+		t.Fatalf("imported users = %d (%v)", len(people), err)
+	}
+	leaver := people[0]
+	client, err := data.CreateClient(ctx, realm.ID, CreateClientInput{
+		ClientID: "unlink-rp", Name: "RP", Type: "confidential",
+		RedirectURIs: []string{"https://rp.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, leaver.ID, time.Hour, "127.0.0.1", "unlink", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, RefreshToken{RealmID: realm.ID, ClientID: client.Client.ID,
+		UserID: &leaver.ID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var told []RevokedSession
+	data.OnSessionRevoked = func(revoked RevokedSession) { told = append(told, revoked) }
+	if err := data.DeleteLDAPFederation(ctx, provider.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(told) != 1 || told[0].SessionID != sessionID {
+		t.Errorf("relying parties told about the sign-out = %d, want the one open session", len(told))
+	}
+	var revoked bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT revoked_at IS NOT NULL FROM sso_sessions WHERE id=$1", sessionID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Error("the session survived the provider being unlinked")
+	}
+	if _, active, inspectErr := data.InspectRefreshToken(ctx, raw); inspectErr != nil || active {
+		t.Errorf("the refresh token survived the provider being unlinked: %v %v", active, inspectErr)
+	}
+	// The unlink itself still did its job.
+	unlinked, err := data.UserByID(ctx, leaver.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unlinked.Enabled || unlinked.FederationID != nil {
+		t.Errorf("the account was not unlinked and disabled: enabled=%v federation=%v",
+			unlinked.Enabled, unlinked.FederationID)
+	}
+}
