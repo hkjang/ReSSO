@@ -4390,3 +4390,93 @@ func TestIntegrationAKeyIsOutOfEffectTheMomentItRetires(t *testing.T) {
 		t.Errorf("keys in effect = %d, want only the active one", len(listed))
 	}
 }
+
+// Ending a session is two writes: the session row, which stops the browser
+// cookie, and the refresh tokens, which are what keep a relying party going.
+// The second one's failure was dropped and the call returned success, so the
+// person looked signed out while every relying party holding a refresh token
+// went on minting access tokens — and the PARTIAL the callers were given for
+// exactly this could never fire, because nothing told them.
+func TestIntegrationEndingASessionReportsRefreshTokensItCouldNotRevoke(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := data.CreateClient(ctx, realm.ID, CreateClientInput{
+		ClientID: "still-running", Name: "RP", Type: "confidential",
+		RedirectURIs: []string{"https://rp.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	newToken := func(t *testing.T) (uuid.UUID, string) {
+		t.Helper()
+		session, sessionErr := data.CreateSession(ctx, realm.ID, userID, time.Hour, "127.0.0.1", "revoke", "password")
+		if sessionErr != nil {
+			t.Fatal(sessionErr)
+		}
+		sessionID := session.Session.ID
+		raw, tokenErr := data.CreateRefreshToken(ctx, RefreshToken{RealmID: realm.ID, ClientID: client.Client.ID,
+			UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+			ExpiresAt: time.Now().UTC().Add(time.Hour)})
+		if tokenErr != nil {
+			t.Fatal(tokenErr)
+		}
+		return sessionID, raw
+	}
+	byOwner, ownerToken := newToken(t)
+	bySession, sessionToken := newToken(t)
+	byUser, userToken := newToken(t)
+
+	// The refresh tokens cannot be revoked. The session rows still can, which
+	// is what made the failure look like a success.
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at TO revoked_at_moved"); err != nil {
+		t.Fatal(err)
+	}
+	failures := map[string]error{
+		"RevokeOwnedSession":    data.RevokeOwnedSession(ctx, byOwner, userID),
+		"RevokeSession":         data.RevokeSession(ctx, bySession),
+		"RevokeAllUserSessions": data.RevokeAllUserSessions(ctx, userID, nil),
+	}
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at_moved TO revoked_at"); err != nil {
+		t.Fatal(err)
+	}
+	for name, err := range failures {
+		if err == nil {
+			t.Errorf("%s reported success while its refresh tokens were left live", name)
+		}
+	}
+
+	// And they really were left live, which is why reporting matters.
+	for name, raw := range map[string]string{
+		"RevokeOwnedSession": ownerToken, "RevokeSession": sessionToken, "RevokeAllUserSessions": userToken,
+	} {
+		_, active, inspectErr := data.InspectRefreshToken(ctx, raw)
+		if inspectErr != nil {
+			t.Fatal(inspectErr)
+		}
+		if !active {
+			t.Errorf("%s: the token was not actually left live, so this is not measuring what it claims", name)
+		}
+	}
+	// The session rows went through, so the callers are reporting a partial
+	// outcome rather than a failed one.
+	for name, id := range map[string]uuid.UUID{
+		"RevokeOwnedSession": byOwner, "RevokeSession": bySession, "RevokeAllUserSessions": byUser,
+	} {
+		var revoked bool
+		if err := data.Pool.QueryRow(ctx,
+			"SELECT revoked_at IS NOT NULL FROM sso_sessions WHERE id=$1", id).Scan(&revoked); err != nil {
+			t.Fatal(err)
+		}
+		if !revoked {
+			t.Errorf("%s: the session row was not revoked either", name)
+		}
+	}
+}

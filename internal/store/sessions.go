@@ -213,8 +213,19 @@ func (s *Store) RevokeOwnedSession(ctx context.Context, id, ownerID uuid.UUID) e
 	if err != nil {
 		return err
 	}
-	_, _ = s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE session_id=$1`, id)
+	// The refresh tokens are the half that keeps working when it is skipped.
+	// Revoking the session row stops the browser cookie, so the person looks
+	// signed out, while every relying party holding a refresh token goes on
+	// minting access tokens. Dropping this error returned success for that,
+	// which also meant the PARTIAL the callers report could never fire for the
+	// half that actually failed. The notification still goes out: telling the
+	// relying parties to sign the person out is the part that worked, and some
+	// of them will act on it.
+	_, refreshErr := s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE session_id=$1`, id)
 	s.notifyRevoked([]RevokedSession{revoked})
+	if refreshErr != nil {
+		return fmt.Errorf("revoke the refresh tokens of the session: %w", refreshErr)
+	}
 	return nil
 }
 
@@ -228,8 +239,11 @@ func (s *Store) RevokeSession(ctx context.Context, id uuid.UUID) error {
 	if err != nil {
 		return err
 	}
-	_, _ = s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE session_id=$1`, id)
+	_, refreshErr := s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE session_id=$1`, id)
 	s.notifyRevoked([]RevokedSession{revoked})
+	if refreshErr != nil {
+		return fmt.Errorf("revoke the refresh tokens of the session: %w", refreshErr)
+	}
 	return nil
 }
 
@@ -244,9 +258,12 @@ func (s *Store) RevokeAllUserSessions(ctx context.Context, userID uuid.UUID, exc
 	if err != nil {
 		return err
 	}
-	_, _ = s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
+	_, refreshErr := s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
         WHERE user_id=$1 AND ($2::uuid IS NULL OR session_id<>$2)`, userID, except)
 	s.notifyRevoked(revoked)
+	if refreshErr != nil {
+		return fmt.Errorf("revoke the refresh tokens of the sessions: %w", refreshErr)
+	}
 	return nil
 }
 
