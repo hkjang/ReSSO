@@ -4266,3 +4266,70 @@ func TestIntegrationSyncNamesTheUsersItCouldNotImport(t *testing.T) {
 		t.Errorf("the failure does not say the DISABLE sweep was skipped: %q", syncErr)
 	}
 }
+
+// A rotation invalidates the cache of the instance that performed it and no
+// other. Every other instance kept a key set without the new identifier, so it
+// rejected the tokens the rotating instance had already started issuing — and
+// served that same stale set as its JWKS, which is what a relying party fetches
+// the moment it meets an identifier it does not know. A relying party that
+// fetched in that window could go on refusing the new key for as long as its
+// own cache lived, well past the window that caused it.
+func TestIntegrationRotationIsVisibleToInstancesThatDidNotRotate(t *testing.T) {
+	rotating := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, rotating)
+	ctx := context.Background()
+	if err := rotating.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	// A second process against the same database: its own cache, the same rows.
+	other := &Store{Pool: rotating.Pool, Sealer: rotating.Sealer}
+	if _, err := other.PublishedSigningKeys(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, err := rotating.RotateSigningKey(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Past the floor that keeps an invented identifier from forcing a read; a
+	// real deployment is past it long before a token from the new key arrives.
+	time.Sleep(minimumKeyReload + 50*time.Millisecond)
+
+	if _, err := other.SigningKeyByKID(ctx, bootstrap.RealmID, rotated.KID); err != nil {
+		t.Fatalf("an instance that did not rotate cannot verify the new key: %v", err)
+	}
+	published, err := other.PublishedSigningKeys(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := findSigningKey(published, rotated.KID); !found {
+		t.Errorf("the JWKS of an instance that did not rotate omits the new key")
+	}
+	if len(published) < 2 {
+		t.Errorf("published keys = %d, want the rotated key kept alongside the new one", len(published))
+	}
+}
+
+// The reload above turns a cache miss into a read, and the identifier comes off
+// a token the caller supplies. Without a floor, inventing identifiers is a
+// query per request against an endpoint that parses tokens.
+func TestIntegrationAnInventedKeyIdentifierDoesNotForceAReadPerRequest(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.PublishedSigningKeys(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	before := data.Pool.Stat().AcquireCount()
+	for i := 0; i < 100; i++ {
+		if _, err := data.SigningKeyByKID(ctx, bootstrap.RealmID, "rsa-invented-0000"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("SigningKeyByKID(invented) error = %v, want ErrNotFound", err)
+		}
+	}
+	if reads := data.Pool.Stat().AcquireCount() - before; reads > 2 {
+		t.Errorf("100 invented identifiers took %d connection acquisitions; the floor is not holding", reads)
+	}
+}

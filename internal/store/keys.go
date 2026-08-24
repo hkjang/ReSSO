@@ -24,6 +24,13 @@ import (
 // seconds cannot produce a token that fails verification.
 const signingKeyTTL = 30 * time.Second
 
+// minimumKeyReload floors how often an unrecognised key identifier may force a
+// read. The reload below turns a cache miss into a database query, and the
+// identifier comes off a token the caller supplies, so without a floor anyone
+// able to reach an endpoint that parses a token could ask for one query per
+// request by inventing identifiers.
+const minimumKeyReload = time.Second
+
 type signingKeyEntry struct {
 	privateKey *rsa.PrivateKey
 	active     domain.SigningKey
@@ -157,14 +164,63 @@ func (s *Store) ActivePrivateKey(ctx context.Context, realmID uuid.UUID) (*rsa.P
 	return entry.privateKey, entry.active, nil
 }
 
-// PublishedSigningKeys returns every non-retired key of a Realm for signature
-// verification and for the JWKS document, served from the same cache.
+// PublishedSigningKeys returns every non-retired key of a Realm for the JWKS
+// document, served from the same cache.
 func (s *Store) PublishedSigningKeys(ctx context.Context, realmID uuid.UUID) ([]domain.SigningKey, error) {
 	entry, err := s.cachedSigningKeys(ctx, realmID)
 	if err != nil {
 		return nil, err
 	}
 	return entry.published, nil
+}
+
+// SigningKeyByKID returns the published key a token names, reading through the
+// cache once when the identifier is one this instance has never seen.
+//
+// The cache was reasoned about in one direction only: an instance that keeps
+// signing with the key another instance just rotated away is safe, because the
+// old key stays published and accepted for two hours. The other direction was
+// the problem. A rotation on one instance invalidates that instance's cache
+// alone, so every other instance kept a key set that did not contain the new
+// identifier and rejected the tokens the first instance was issuing — for as
+// long as its cache had left. The same stale set is what those instances served
+// as their JWKS, so a relying party fetching in that window, which is exactly
+// what a relying party does when it meets an identifier it does not know, could
+// cache a set missing the new key for as long as its own cache lives — well
+// past the window that caused it.
+//
+// An identifier this instance has never seen is a precise signal that the set
+// may be out of date, so it is worth one read. Refreshing here also refreshes
+// what the JWKS endpoint serves, which is the same entry.
+func (s *Store) SigningKeyByKID(ctx context.Context, realmID uuid.UUID, kid string) (domain.SigningKey, error) {
+	entry, err := s.cachedSigningKeys(ctx, realmID)
+	if err != nil {
+		return domain.SigningKey{}, err
+	}
+	if key, found := findSigningKey(entry.published, kid); found {
+		return key, nil
+	}
+	if time.Since(entry.loadedAt) < minimumKeyReload {
+		return domain.SigningKey{}, ErrNotFound
+	}
+	refreshed, err := s.loadSigningKeys(ctx, realmID)
+	if err != nil {
+		return domain.SigningKey{}, err
+	}
+	s.signingKeys.Store(realmID, refreshed)
+	if key, found := findSigningKey(refreshed.published, kid); found {
+		return key, nil
+	}
+	return domain.SigningKey{}, ErrNotFound
+}
+
+func findSigningKey(keys []domain.SigningKey, kid string) (domain.SigningKey, bool) {
+	for _, key := range keys {
+		if key.KID == kid {
+			return key, true
+		}
+	}
+	return domain.SigningKey{}, false
 }
 
 func (s *Store) loadActivePrivateKey(ctx context.Context, realmID uuid.UUID) (*rsa.PrivateKey, domain.SigningKey, error) {

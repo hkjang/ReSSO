@@ -254,22 +254,19 @@ func (s *Service) parseSigned(ctx context.Context, realm domain.Realm, raw strin
 	if kid == "" {
 		return standard, extra, errors.New("token has no kid header")
 	}
-	keys, err := s.Store.PublishedSigningKeys(ctx, realm.ID)
+	// Ask for the named key rather than scanning what happens to be cached: a
+	// key rotated on another instance is unknown here until this instance
+	// reloads, and rejecting the tokens that instance is issuing is not an
+	// answer anyone can act on.
+	metadata, err := s.Store.SigningKeyByKID(ctx, realm.ID, kid)
 	if err != nil {
+		return standard, extra, errors.New("token signing key is unavailable")
+	}
+	var jwk jose.JSONWebKey
+	if err := json.Unmarshal(metadata.PublicJWK, &jwk); err != nil {
 		return standard, extra, err
 	}
-	var publicKey *rsa.PublicKey
-	for _, metadata := range keys {
-		if metadata.KID != kid {
-			continue
-		}
-		var jwk jose.JSONWebKey
-		if err := json.Unmarshal(metadata.PublicJWK, &jwk); err != nil {
-			return standard, extra, err
-		}
-		publicKey, _ = jwk.Key.(*rsa.PublicKey)
-		break
-	}
+	publicKey, _ := jwk.Key.(*rsa.PublicKey)
 	if publicKey == nil {
 		return standard, extra, errors.New("token signing key is unavailable")
 	}
