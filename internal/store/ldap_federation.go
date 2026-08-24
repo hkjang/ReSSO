@@ -468,15 +468,23 @@ func (s *Store) TestLDAPFederation(ctx context.Context, id uuid.UUID) error {
 	return federation.TestConnection(ctx, federation.RuntimeConfig{Provider: runtime.Provider, BindCredential: runtime.BindCredential})
 }
 
+// TestLDAPAuthentication reports whether the directory accepts a credential.
+//
+// Not being able to ask is separated from being told no, because this exists
+// to tell an administrator what is wrong. Both came back as "authentication
+// failed", so a directory that was unreachable, a bind account that had
+// stopped working and a keyring that could not open the stored credential all
+// read as the person's password being wrong — and the administrator goes and
+// resets a password that was never the problem.
 func (s *Store) TestLDAPAuthentication(ctx context.Context, id uuid.UUID, username, suppliedPassword string) (LDAPAuthenticationTestResult, error) {
 	runtime, err := s.ldapRuntimeByID(ctx, id)
 	if err != nil {
-		return LDAPAuthenticationTestResult{}, err
+		return LDAPAuthenticationTestResult{}, fmt.Errorf("%w: %v", ErrFederationOperation, err)
 	}
 	user, ok, err := federation.Authenticate(ctx,
 		federation.RuntimeConfig{Provider: runtime.Provider, BindCredential: runtime.BindCredential}, username, suppliedPassword)
 	if err != nil {
-		return LDAPAuthenticationTestResult{}, err
+		return LDAPAuthenticationTestResult{}, fmt.Errorf("%w: %v", ErrFederationOperation, err)
 	}
 	if !ok {
 		return LDAPAuthenticationTestResult{}, errors.New("LDAP credentials are invalid or the user is not unique")

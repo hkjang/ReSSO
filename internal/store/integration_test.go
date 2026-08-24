@@ -4971,3 +4971,60 @@ func TestIntegrationDeletingARoleSaysWhyItWasRefused(t *testing.T) {
 		t.Errorf("an ordinary Role could not be removed: %v", err)
 	}
 }
+
+// This endpoint exists to tell an administrator what is wrong, so being unable
+// to ask the directory and being told no by it have to be different answers.
+// Both came back as "authentication failed", which sends somebody to reset a
+// password when the directory is what stopped answering.
+func TestIntegrationLDAPAuthenticationTestSeparatesUnreachableFromRejected(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	credential := "adminpassword"
+	input := LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	}
+	reachable, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Told no: the directory answered and refused the credential.
+	_, err = data.TestLDAPAuthentication(ctx, reachable.ID, "alice", "not-alices-password")
+	if err == nil {
+		t.Fatal("a wrong password was accepted")
+	}
+	if errors.Is(err, ErrFederationOperation) {
+		t.Errorf("a rejected credential was reported as the directory being unavailable: %v", err)
+	}
+
+	// Right credential still works, so the refusal above is about the password.
+	if _, err := data.TestLDAPAuthentication(ctx, reachable.ID, "alice", "alice-pass-1234"); err != nil {
+		t.Fatalf("the correct credential was refused: %v", err)
+	}
+
+	// Cannot ask: nothing is listening there.
+	input.Name = "gone"
+	input.ConnectionURL = "ldap://127.0.0.1:1"
+	unreachable, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = data.TestLDAPAuthentication(ctx, unreachable.ID, "alice", "alice-pass-1234")
+	if err == nil {
+		t.Fatal("an unreachable directory reported a successful authentication")
+	}
+	if !errors.Is(err, ErrFederationOperation) {
+		t.Errorf("an unreachable directory was reported as a rejected credential: %v", err)
+	}
+}

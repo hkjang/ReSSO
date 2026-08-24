@@ -218,6 +218,15 @@ func (s *Server) adminTestLDAPAuthentication(w http.ResponseWriter, r *http.Requ
 	}
 	s.audit(r, &realmID, &principal.UserID, principal.Username, "LDAP_AUTHENTICATION_TEST", auditResult,
 		"user_federation", federationID.String(), map[string]any{"test_username": strings.TrimSpace(input.Username)})
+	if errors.Is(err, store.ErrFederationOperation) {
+		// The check could not be made. Saying the credential was rejected
+		// would send the administrator to reset a password when the directory
+		// is what is not answering — and this endpoint exists to tell them
+		// which it is.
+		writeError(w, r, http.StatusBadGateway, "ldap_authentication_unavailable",
+			"디렉터리에 확인할 수 없어 인증 여부를 판단하지 못했습니다: "+err.Error())
+		return
+	}
 	if err != nil {
 		writeError(w, r, http.StatusUnauthorized, "ldap_authentication_failed", "LDAP 사용자 인증에 실패했습니다.")
 		return
