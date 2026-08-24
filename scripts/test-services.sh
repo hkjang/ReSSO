@@ -130,13 +130,33 @@ add_memberof_overlay() {
   database="$(docker exec "$container" ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config \
     "(olcSuffix=dc=example,dc=test)" dn 2>/dev/null | awk '/^dn: / && !seen {print substr($0,5); seen=1}')"
   test -n "$database" || { log "the directory database was not found"; exit 1; }
-  docker exec -i "$container" ldapadd -Y EXTERNAL -H ldapi:/// >/dev/null 2>&1 <<OVERLAY || true
+  # Judged by the overlay being there, not by what ldapadd returned. Ignoring
+  # the exit code let a failed add pass silently, and nothing downstream
+  # notices: users still import, the directory still answers, and only the
+  # group-to-role tests fail — with "membership of the mapped group did not
+  # grant the role", which points at the mapping code rather than at a server
+  # that never populates memberOf. CI failed that way twice.
+  local attempt overlays
+  for attempt in $(seq 1 15); do
+    docker exec -i "$container" ldapadd -Y EXTERNAL -H ldapi:/// >/dev/null 2>&1 <<OVERLAY || true
 dn: olcOverlay=memberof,$database
 objectClass: olcOverlayConfig
 objectClass: olcMemberOf
 olcOverlay: memberof
 olcMemberOfRefint: TRUE
 OVERLAY
+    # The report is captured and then searched. Piping into `grep -q` under
+    # `set -o pipefail` reports the producer's status: grep stops reading at
+    # the first match, ldapsearch takes SIGPIPE, and a successful search comes
+    # back as 141. The same trap is noted further down for the TLS check.
+    overlays="$(docker exec "$container" ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config \
+      "(objectClass=olcMemberOf)" dn 2>/dev/null || true)"
+    case "$overlays" in
+      *"dn: olcOverlay="*) return ;;
+    esac
+    sleep 1
+  done
+  log "the memberof overlay never became active in $container"; exit 1
 }
 
 wait_for_directory() {
