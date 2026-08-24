@@ -98,8 +98,8 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}": map[string]any{
 				"parameters": []any{openAPIPathParameter("realmID"), openAPIPathParameter("federationID")},
 				"get":        openAPIReadOperation("User Federation", "LDAP 공급자 조회"),
-				"put":        openAPIOperation("User Federation", "LDAP 공급자 변경", true),
-				"delete":     openAPIOperation("User Federation", "LDAP 공급자 삭제", true),
+				"put":        withUnfinishedSignOut(openAPIOperation("User Federation", "LDAP 공급자 변경", true), "PartialProviderChange"),
+				"delete":     withUnfinishedSignOut(openAPIOperation("User Federation", "LDAP 공급자 삭제", true), "PartialProviderDeletion"),
 			},
 			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}/test-connection":     openAPIParameterizedPath("post", "User Federation", "LDAP 연결 테스트", true, "realmID", "federationID"),
 			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}/test-authentication": openAPIParameterizedPath("post", "User Federation", "LDAP 사용자 인증 테스트", true, "realmID", "federationID"),
@@ -292,6 +292,26 @@ func openAPIUserSchemas() map[string]any {
 				"new_password":     map[string]any{"type": "string", "format": "password", "minLength": 1},
 			},
 		},
+		"PartialProviderChange": map[string]any{
+			"type": "object",
+			"description": "공급자는 변경됐지만 그 공급자의 계정을 모든 애플리케이션에서 로그아웃시키지 못한 경우의 응답. " +
+				"공급자의 모든 필드를 그대로 담고 아래 두 항목이 더해집니다. 감사 이벤트는 PARTIAL로 기록됩니다.",
+			"required": []string{"users_signed_out", "message"},
+			"properties": map[string]any{
+				"users_signed_out": map[string]any{"type": "boolean", "enum": []any{false}},
+				"message":          map[string]any{"type": "string"},
+			},
+		},
+		"PartialProviderDeletion": map[string]any{
+			"type":        "object",
+			"description": "공급자는 삭제됐지만 연결된 계정을 모든 애플리케이션에서 로그아웃시키지 못한 경우의 응답. 감사 이벤트는 PARTIAL로 기록됩니다.",
+			"required":    []string{"deleted", "users_signed_out", "message"},
+			"properties": map[string]any{
+				"deleted":          map[string]any{"type": "boolean", "enum": []any{true}},
+				"users_signed_out": map[string]any{"type": "boolean", "enum": []any{false}},
+				"message":          map[string]any{"type": "string"},
+			},
+		},
 		"PartialTokenRevocation": map[string]any{
 			"type":        "object",
 			"description": "세션은 종료했지만 그 세션의 Refresh Token을 폐기하지 못한 경우의 응답. 감사 이벤트는 PARTIAL로 기록됩니다.",
@@ -320,6 +340,22 @@ func openAPIUserSchemas() map[string]any {
 // that step can fail on its own after the password is already changed — the
 // request is not refused, so a client that assumes 204 is a client that never
 // learns those sessions are still live.
+// withUnfinishedSignOut declares the second shape a provider change can answer
+// with. Disabling or unlinking a provider signs its accounts out, and that step
+// runs after the change has landed, so it can fall short on its own — the
+// change is done, and a client that assumes one shape never learns the accounts
+// are still signed in elsewhere.
+func withUnfinishedSignOut(operation map[string]any, schema string) map[string]any {
+	responses, _ := operation["responses"].(map[string]any)
+	responses["200"] = map[string]any{
+		"description": "The provider changed, but its accounts could not be signed out everywhere",
+		"content": map[string]any{"application/json": map[string]any{
+			"schema": map[string]any{"$ref": "#/components/schemas/" + schema},
+		}},
+	}
+	return operation
+}
+
 // withPartialTokenRevocation declares the second shape an endpoint that ends
 // one session can answer with. The session is gone either way; what can fail
 // on its own is revoking the refresh tokens issued from it, and a relying

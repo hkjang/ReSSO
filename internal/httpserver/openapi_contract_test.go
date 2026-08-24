@@ -217,3 +217,68 @@ func TestMethodLabelIsBounded(t *testing.T) {
 		}
 	}
 }
+
+// Six operations can finish having done what was asked while a second step
+// fell short — ending sessions, revoking the refresh tokens issued from them,
+// signing a provider's accounts out. Each answers 200 with a body describing
+// that instead of the 204 or the plain item a caller would otherwise expect,
+// and each records PARTIAL in the trail.
+//
+// This is the step that kept getting missed. The store learned to report the
+// shortfall, then the handlers, then the responses, then the screens — and the
+// document that clients are generated from was last each time. A client built
+// from a document that promises only 204 has no place to put the sentence
+// saying the accounts are still signed in elsewhere.
+func TestPartialOutcomesAreDeclaredWhereTheyCanHappen(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/openapi.json", nil)
+	response := httptest.NewRecorder()
+	(&Server{}).openAPISpec(response, request)
+	var document map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	paths, _ := document["paths"].(map[string]any)
+	components, _ := document["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+
+	for _, partial := range []struct{ path, method string }{
+		{"/api/v1/me/password", "put"},
+		{"/api/admin/v1/realms/{realmID}/users/{userID}/password", "put"},
+		{"/api/v1/me/sessions/{id}", "delete"},
+		{"/api/admin/v1/realms/{realmID}/sessions/{sessionID}", "delete"},
+		{"/api/admin/v1/realms/{realmID}/user-federations/{federationID}", "put"},
+		{"/api/admin/v1/realms/{realmID}/user-federations/{federationID}", "delete"},
+	} {
+		item, ok := paths[partial.path].(map[string]any)
+		if !ok {
+			t.Errorf("%s is not in the document at all", partial.path)
+			continue
+		}
+		operation, ok := item[partial.method].(map[string]any)
+		if !ok {
+			t.Errorf("%s %s is not in the document", partial.method, partial.path)
+			continue
+		}
+		responses, _ := operation["responses"].(map[string]any)
+		success, ok := responses["200"].(map[string]any)
+		if !ok {
+			t.Errorf("%s %s can answer 200 with what fell short, and the document does not say so",
+				partial.method, partial.path)
+			continue
+		}
+		content, ok := success["content"].(map[string]any)
+		if !ok {
+			t.Errorf("%s %s declares 200 without a body, so a client has nowhere to read the reason",
+				partial.method, partial.path)
+			continue
+		}
+		media, _ := content["application/json"].(map[string]any)
+		schema, _ := media["schema"].(map[string]any)
+		ref, _ := schema["$ref"].(string)
+		name, found := strings.CutPrefix(ref, "#/components/schemas/")
+		if !found || schemas[name] == nil {
+			t.Errorf("%s %s declares a 200 body the document does not define: %q",
+				partial.method, partial.path, ref)
+		}
+	}
+}
