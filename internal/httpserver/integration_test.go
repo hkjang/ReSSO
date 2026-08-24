@@ -3406,3 +3406,42 @@ func TestIntegrationDiscoveryAndJWKSDescribeWhatIsActuallyServed(t *testing.T) {
 		t.Errorf("the published key advertises alg=%v while the document promises RS256", key["alg"])
 	}
 }
+
+// Readiness decides whether an instance takes traffic: the rollout procedure
+// in docs/operations.md replaces one instance and checks this endpoint before
+// going on. Nothing tested it. An instance that answers ready while its
+// database is unreachable is put into rotation and fails every request it is
+// then given, and the check that was supposed to catch that is the one saying
+// it is fine.
+func TestIntegrationReadinessFollowsTheDatabase(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	statusOf := func(path string) int {
+		t.Helper()
+		response, err := server.Client().Get(server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+
+	if status := statusOf("/health/ready"); status != http.StatusOK {
+		t.Fatalf("a healthy instance answered %d", status)
+	}
+	if status := statusOf("/health/live"); status != http.StatusOK {
+		t.Fatalf("liveness answered %d", status)
+	}
+
+	// The database goes away. Liveness is about the process and must not
+	// change; readiness is about being able to serve and must.
+	data.Pool.Close()
+	if status := statusOf("/health/ready"); status != http.StatusServiceUnavailable {
+		t.Errorf("readiness answered %d with no database, so a broken instance would be given traffic", status)
+	}
+	if status := statusOf("/health/live"); status != http.StatusOK {
+		t.Errorf("liveness answered %d, which would have the process restarted rather than taken out of rotation", status)
+	}
+}
