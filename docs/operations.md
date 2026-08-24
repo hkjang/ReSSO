@@ -142,6 +142,18 @@ Realm 상세의 `Realm 활성`을 끄면 그 테넌트 전체가 즉시 멈춥�
 - 정지는 **폐기가 아니라 차단**입니다. 다시 활성화하면 그동안 만료되지 않은 세션과 API 키는 그대로 다시 동작합니다. 계정 비활성화가 세션을 영구히 종료하는 것과 다릅니다 — 테넌트 정지는 보통 일시적이고, 특정 개인의 세션이 원인인 상황이 아니기 때문입니다. 영구히 끊어야 한다면 정지와 별개로 세션을 폐기하세요.
 - 이미 발급된 Access Token은 서명 자체가 만료까지 유효하지만, Introspection과 userinfo가 거절하므로 이를 확인하는 RP는 즉시 차단합니다.
 
+## 데이터베이스 연결 풀
+
+기본값은 최대 20, 최소 2입니다. 이 서비스는 비밀번호 해싱이나 디렉터리 조회 동안 연결을 붙들지 않으므로 대부분의 설치에 충분합니다.
+
+바꿔야 한다면 `POSTGRES_DSN`에 pgx가 정의한 `pool_max_conns`·`pool_min_conns`를 넣으면 그대로 적용됩니다. 위 기본값은 지정하지 않았을 때만 쓰입니다.
+
+```text
+POSTGRES_DSN=postgres://resso:...@db:5432/resso?sslmode=require&pool_max_conns=40
+```
+
+PostgreSQL의 `max_connections`가 모든 인스턴스의 합보다 커야 합니다.
+
 ## Bootstrap 관리자 계정
 
 `BOOTSTRAP_ADMIN`·`BOOTSTRAP_ADMIN_PASSWORD`는 **비어 있는 데이터베이스에 첫 관리자를 만들 때만** 사용됩니다. 계정이 이미 있으면 Bootstrap은 비밀번호를 재설정하지 않으며, **활성 상태와 `platform_admin` 권한도 다시 부여하지 않습니다.**
