@@ -106,17 +106,19 @@ func TestUnroutedPathsKeepTheErrorContract(t *testing.T) {
 	}
 }
 
-// Nothing is broken here today; this holds a hazard shut. /api/v1/meta is
-// registered on the parent router and /api/v1 is mounted as a subtree
-// afterwards, and mounting a subtree is the kind of change that can take a
-// sibling route with it. The route it would take is the one the smoke test
-// calls first, and the one release-image.sh documents as how somebody holding
-// an archive finds the commit it was built from.
+// TestOpenAPICoversEveryRegisteredRoute walks the router, so it cannot tell a
+// route the router lists from one a caller can actually reach. This asks the
+// handler, which is what a caller does. The two routes below are the ones with
+// nothing else watching them: the OpenAPI document, and the endpoint the smoke
+// test calls first — the one release-image.sh documents as how somebody
+// holding an archive finds the commit it was built from.
 //
-// TestOpenAPICoversEveryRegisteredRoute cannot see this: it walks the router,
-// so a route the router still lists but no longer serves looks present. This
-// asks the handler instead, which is what a caller does.
-func TestPublicRoutesAreReachableAndNotShadowed(t *testing.T) {
+// An earlier version of this comment claimed mounting /api/v1 could take the
+// sibling /api/v1/meta with it. That was written after I misread a stale
+// server as a live one, and it is not true: registering the route after the
+// mount was tried, and chi serves both. What is left is the reachability
+// check, which does fail if the route goes away.
+func TestPublicRoutesAreReachable(t *testing.T) {
 	handler := New(nil, slog.New(slog.DiscardHandler), nil, nil).Handler()
 	for _, unauthenticated := range []struct {
 		path string
