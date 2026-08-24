@@ -276,6 +276,11 @@ func (s *Service) parseSigned(ctx context.Context, realm domain.Realm, raw strin
 	return standard, extra, nil
 }
 
+// ErrTokenStateUnavailable reports that a token could not be judged because
+// its revocation state could not be read. It is not a statement about the
+// token, which may be entirely valid.
+var ErrTokenStateUnavailable = errors.New("token revocation state is unavailable")
+
 func (s *Service) Verify(ctx context.Context, realm domain.Realm, raw string, expectedAudience string) (VerifiedToken, error) {
 	standard, extra, err := s.parseSigned(ctx, realm, raw)
 	if err != nil {
@@ -292,7 +297,11 @@ func (s *Service) Verify(ctx context.Context, realm domain.Realm, raw string, ex
 	if err == nil {
 		revoked, checkErr := s.Store.IsAccessJTIRevoked(ctx, jti)
 		if checkErr != nil {
-			return VerifiedToken{}, checkErr
+			// Distinguishable from an invalid token: the token may be
+			// perfectly good and simply unjudgeable right now. Callers that
+			// refuse are refusing safely; a caller that is being asked to
+			// *change* the token's state must not read this as "nothing to do".
+			return VerifiedToken{}, fmt.Errorf("%w: %v", ErrTokenStateUnavailable, checkErr)
 		}
 		if revoked {
 			return VerifiedToken{}, errors.New("token has been revoked")

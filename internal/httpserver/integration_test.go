@@ -2363,3 +2363,116 @@ func TestIntegrationDiscoveryAdvertisesWhatTheEndpointsDo(t *testing.T) {
 		t.Errorf("an unadvertised grant answered %v, want unsupported_grant_type", body)
 	}
 }
+
+// RFC 7009 answers 200 for a token the server does not recognise, and every
+// failure here was reported as exactly that. The caller got 200, the trail
+// recorded SUCCESS with revoked=none, and introspection went on answering
+// active=true for the token the caller had just been told was gone. Revocation
+// is what somebody reaches for when a token has leaked, so being told it worked
+// when it did not is the one outcome that matters. §2.2.1 covers this case:
+// 503, and the client is to assume the token still exists.
+func TestIntegrationRevocationThatCannotBePerformedIsNotReportedAsDone(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "revoke-unavailable", Name: "Revoker", Type: "confidential",
+		RedirectURIs: []string{"https://rs.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "leaked", Password: "leaked-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "revoke-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, client.Client, user, session.Session.ID,
+		[]string{"openid"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	// The record of revoked access tokens cannot be written or read.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE revoked_access_tokens RENAME COLUMN jti TO jti_moved"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(ctx, "ALTER TABLE revoked_access_tokens RENAME COLUMN jti_moved TO jti"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(restore)
+
+	form := url.Values{"token": {tokens.AccessToken}, "client_id": {"revoke-unavailable"},
+		"client_secret": {client.ClientSecret}}
+	response, err := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/revoke", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("a revocation that could not be performed answered %d, want %d so the caller knows the token is still live",
+			response.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "TOKEN_REVOKED", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(page.Items))
+	}
+	if page.Items[0].Result != "FAILURE" {
+		t.Errorf("the trail records result=%s for a revocation that did not happen", page.Items[0].Result)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(page.Items[0].Detail, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["error"] == nil {
+		t.Errorf("the trail gives no reason: %v", decoded)
+	}
+
+	// And the token really is still live, which is why the answer matters.
+	restore()
+	introspection := url.Values{"token": {tokens.AccessToken}, "client_id": {"revoke-unavailable"},
+		"client_secret": {client.ClientSecret}}
+	introspected, err := server.Client().PostForm(
+		server.URL+"/realms/master/protocol/openid-connect/token/introspect", introspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = introspected.Body.Close() }()
+	var report map[string]any
+	if err := json.NewDecoder(introspected.Body).Decode(&report); err != nil {
+		t.Fatal(err)
+	}
+	if active, _ := report["active"].(bool); !active {
+		t.Errorf("the token was not actually left live, so this test is not measuring what it claims")
+	}
+}

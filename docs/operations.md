@@ -74,7 +74,7 @@ ReSSO는 확장을 직접 설치하지 않습니다. 확장 설치는 데이터�
 | `LDAP_FEDERATION_SYNC` `result=FAILURE` | 동기화 실패. `DISABLE` 정책이면 계정 비활성화가 반영되지 않으며, 오류 문구가 그 사실을 함께 알립니다. 가져오지 못한 사용자는 이름과 사유가 `detail.failures`에 최대 5명까지 기록되고 그보다 많으면 남은 수를 함께 적습니다. 실행이 끝났는데도 이 이벤트가 **아예 없다면** 결과를 기록하지 못한 것입니다. 그때는 공급자의 동기화 상태도 이전 실행에 머물러 있으므로, 서버 로그에서 `outcome was not recorded`를 확인하세요. |
 | `result=PARTIAL` | 요청은 요구받은 일을 했고 그에 딸린 동작이 실패한 경우입니다. 비밀번호 변경·재설정에서 다른 세션 종료가 실패했거나, 로그아웃에서 세션 폐기가 실패한 경우가 여기에 해당합니다. 상세에 실패 사유가 들어 있습니다. **`result=FAILURE`만 걸어둔 알림은 이 항목을 놓칩니다.** 해당 세션은 살아 있으므로 관리 → 세션에서 직접 종료하세요. |
 | `MCP_TOOL_CALL` | 에이전트가 MCP로 사람 또는 Client의 기록을 조회했습니다. 상세의 `tool`이 어떤 도구인지, `result`가 허용 여부입니다. `FAILURE`는 권한이 없는 키가 시도했다는 뜻이므로 어떤 키인지 확인하세요. 서비스 상태 조회는 기록하지 않습니다. |
-| `TOKEN_REVOKED` | RP가 Revocation endpoint를 호출했습니다. 상세의 `revoked`가 실제 결과입니다 — `refresh_token`(계열 폐기, `family_id` 포함), `access_token`(`jti` 포함), `none`(일치하는 Token 없음). RFC 7009은 일치 여부와 무관하게 200을 반환하므로, Token이 실제로 폐기되었는지는 이 값으로만 알 수 있습니다. |
+| `TOKEN_REVOKED` | RP가 Revocation endpoint를 호출했습니다. 상세의 `revoked`가 실제 결과입니다 — `refresh_token`(계열 폐기, `family_id` 포함), `access_token`(`jti` 포함), `none`(일치하는 Token 없음). RFC 7009은 일치 여부와 무관하게 200을 반환하므로, Token이 실제로 폐기되었는지는 이 값으로만 알 수 있습니다. **`result=FAILURE`는 폐기하지 못한 경우**로, 상세의 `error`가 사유를 담고 호출자에게는 503이 나갑니다 — 이때 Token은 여전히 유효하므로 호출자는 재시도해야 합니다. |
 
 ## Back-Channel Logout
 

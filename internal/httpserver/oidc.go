@@ -627,14 +627,46 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	// was called leaves the one question an incident asks — is that token
 	// dead? — answered by implication rather than by the trail.
 	detail := map[string]any{"revoked": "none"}
-	if refresh, _, inspectErr := s.store.InspectRefreshToken(r.Context(), raw); inspectErr == nil && refresh.ClientID == client.ID {
-		if revokeErr := s.store.RevokeRefreshToken(r.Context(), raw); revokeErr == nil {
-			detail["revoked"] = "refresh_token"
-			detail["family_id"] = refresh.FamilyID.String()
+	// RFC 7009 answers 200 for a token the server does not recognise. A token
+	// it could not revoke is not the same thing, and every failure here used to
+	// be reported as that: the caller got 200, the trail recorded SUCCESS with
+	// revoked=none, and introspection went on answering active=true for the
+	// token the caller had just been told was gone. Revocation is what somebody
+	// reaches for when a token has leaked, so a silent failure is the one
+	// outcome that matters. §2.2.1 provides for it — 503, on which the client
+	// is to assume the token still exists and may retry.
+	unavailable := func(reason error, stage string) {
+		s.logger.Error("token revocation failed", "trace_id", traceIDFrom(r.Context()),
+			"realm", realm.Name, "client", client.ClientID, "stage", stage, "error", reason)
+		detail["error"] = stage + ": " + reason.Error()
+		s.audit(r, &realm.ID, nil, client.ClientID, "TOKEN_REVOKED", "FAILURE", "client", client.ClientID, detail)
+		writeOAuthError(w, http.StatusServiceUnavailable, "temporarily_unavailable",
+			"the token could not be revoked and is still valid; retry after a short delay")
+	}
+	refresh, _, inspectErr := s.store.InspectRefreshToken(r.Context(), raw)
+	switch {
+	case inspectErr != nil && !errors.Is(inspectErr, store.ErrNotFound):
+		unavailable(inspectErr, "look the token up")
+		return
+	case inspectErr == nil && refresh.ClientID == client.ID:
+		if revokeErr := s.store.RevokeRefreshToken(r.Context(), raw); revokeErr != nil {
+			unavailable(revokeErr, "revoke the refresh token")
+			return
 		}
-	} else if verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, client.ClientID); verifyErr == nil {
-		if jti, parseErr := uuid.Parse(verified.Claims.ID); parseErr == nil && verified.Claims.Expiry != nil {
-			if revokeErr := s.store.RevokeAccessJTI(r.Context(), jti, verified.Claims.Expiry.Time()); revokeErr == nil {
+		detail["revoked"] = "refresh_token"
+		detail["family_id"] = refresh.FamilyID.String()
+	default:
+		verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, client.ClientID)
+		if errors.Is(verifyErr, ressooidc.ErrTokenStateUnavailable) {
+			unavailable(verifyErr, "read the token state")
+			return
+		}
+		if verifyErr == nil {
+			if jti, parseErr := uuid.Parse(verified.Claims.ID); parseErr == nil && verified.Claims.Expiry != nil {
+				if revokeErr := s.store.RevokeAccessJTI(r.Context(), jti, verified.Claims.Expiry.Time()); revokeErr != nil {
+					unavailable(revokeErr, "record the revoked access token")
+					return
+				}
 				detail["revoked"] = "access_token"
 				detail["jti"] = jti.String()
 			}
