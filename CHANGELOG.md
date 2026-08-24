@@ -158,7 +158,8 @@ SELECT realm_id, kid, status, retire_at
 #### 동작이 바뀌는 변경
 
 - **Revocation endpoint가 503으로 답할 수 있습니다.** 폐기하지 못한 경우이며, RFC 7009 §2.2.1대로 호출자는 Token이 아직 살아 있다고 가정하고 재시도해야 합니다. 200만 정상으로 처리하는 RP 라이브러리는 이제 오류를 보게 됩니다 — **그것이 정확한 상태입니다.**
-- **204로 답하던 여섯 endpoint가 200에 본문을 실어 답할 수 있습니다.** 비밀번호 변경·재설정, 내 세션 종료, 관리자 세션 강제 종료, LDAP 공급자 변경·삭제입니다. 요청은 요구받은 일을 했고 그에 딸린 동작이 실패한 경우이며, 본문이 무엇이 남았는지 말합니다. **204를 단정하는 클라이언트는 200도 받아들이도록 고쳐야 합니다.** OpenAPI 문서에 여섯 경로 모두 기술되어 있습니다.
+- **204로 답하던 다섯 endpoint가 200에 본문을 실어 답할 수 있습니다.** 비밀번호 변경·재설정, 내 세션 종료, 관리자 세션 강제 종료, LDAP 공급자 삭제입니다. 요청은 요구받은 일을 했고 그에 딸린 동작이 실패한 경우이며, 본문이 무엇이 남았는지 말합니다. **204를 단정하는 클라이언트는 200도 받아들이도록 고쳐야 합니다.**
+- **LDAP 공급자 변경은 원래 200에 항목을 실어 답했고**, 이 경우에만 `users_signed_out`과 안내 문구 두 항목이 더해집니다. 상태 코드는 그대로이므로 기존 클라이언트는 영향받지 않습니다. 부분 실패로 끝날 수 있는 여섯 operation 모두 OpenAPI 문서에 기술되어 있습니다.
 - **`result=PARTIAL`이 나올 수 있는 감사 이벤트가 늘었습니다** — `LOGOUT`, `PASSWORD_CHANGE`, `PASSWORD_RESET`, `SESSION_REVOKE`, `ADMIN_FORCE_LOGOUT`, `LDAP_FEDERATION_UPDATE`, `LDAP_FEDERATION_DELETE`, `LOGIN_SUCCESS`. **`result=FAILURE`로만 알림을 걸어두면 전부 놓칩니다.**
 - **LDAP 공급자를 비활성화하거나 연결 해제하면 Back-Channel Logout이 나갑니다.** 지금까지 나가지 않았으므로, 해당 RP는 받아본 적 없는 로그아웃 통지를 받게 됩니다.
 - **지표가 하나 늘었습니다** — `resso_introspection_errors_total`. Resource Server의 질의에 답을 내지 못하는 상태를 나타내며, 응답은 `active=false`이므로 이 계열만이 "Token이 전부 죽은 것"과 구분해 줍니다. README와 권장 경보에 있습니다.
