@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/google/uuid"
@@ -3276,5 +3277,132 @@ func TestIntegrationAProviderChangeCarriesAnUnfinishedSignOut(t *testing.T) {
 	restore()
 	if _, err := data.LDAPFederationByID(ctx, provider.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("the provider survived a delete reported as done: %v", err)
+	}
+}
+
+// The discovery document and the JWKS are the two things every relying party
+// reads before it can do anything: one to configure itself, the other to
+// verify what it is given. Neither had its content checked anywhere — only
+// that discovery answers 200, and that it answers 404 for a suspended Realm.
+//
+// So the checks that matter are the ones tying the documents to reality: that
+// the endpoints they advertise are served rather than merely spelled, that the
+// signing algorithm they promise is the one tokens actually carry, and that the
+// key set holds the fields a relying party needs to verify with.
+func TestIntegrationDiscoveryAndJWKSDescribeWhatIsActuallyServed(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	response, err := server.Client().Get(server.URL + "/realms/master/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&document); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+
+	// OpenID Connect Discovery 1.0 section 3 marks these REQUIRED. A relying
+	// party missing any of them cannot configure itself at all.
+	for _, required := range []string{
+		"issuer", "authorization_endpoint", "token_endpoint", "jwks_uri",
+		"response_types_supported", "subject_types_supported",
+		"id_token_signing_alg_values_supported",
+	} {
+		if document[required] == nil {
+			t.Errorf("the discovery document omits %q, which the specification requires", required)
+		}
+	}
+
+	// Every advertised endpoint has to be served. Spelling one wrong is
+	// invisible here and fatal at the relying party.
+	//
+	// The router is asked rather than probed over HTTP. A wrong path under
+	// this subtree answers 405, not 404, because the CORS preflight is
+	// registered as a wildcard and matches the pattern while the method does
+	// not — and 405 is also the honest answer for asking the token endpoint
+	// for a GET. Probing could not tell those apart, so it passed for a
+	// deliberately mis-spelled endpoint when this was written that way.
+	routed := map[string]bool{}
+	router, ok := New(data, logger, nil, nil).Handler().(*chi.Mux)
+	if !ok {
+		t.Fatal("handler is not a chi router")
+	}
+	if walkErr := chi.Walk(router, func(_, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		routed[strings.Replace(strings.TrimSuffix(route, "/"), "{realm}", "master", 1)] = true
+		return nil
+	}); walkErr != nil {
+		t.Fatal(walkErr)
+	}
+	for _, advertised := range []string{
+		"authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri",
+		"end_session_endpoint", "introspection_endpoint", "revocation_endpoint",
+	} {
+		raw, _ := document[advertised].(string)
+		parsed, parseErr := url.Parse(raw)
+		if raw == "" || parseErr != nil {
+			t.Errorf("%s is not a URL: %v", advertised, document[advertised])
+			continue
+		}
+		if !routed[parsed.Path] {
+			t.Errorf("%s advertises %s, which the router does not serve", advertised, parsed.Path)
+		}
+	}
+
+	jwksURI, _ := document["jwks_uri"].(string)
+	parsed, err := url.Parse(jwksURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keysResponse, err := server.Client().Get(server.URL + parsed.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keySet struct {
+		Keys []map[string]any `json:"keys"`
+	}
+	if err := json.NewDecoder(keysResponse.Body).Decode(&keySet); err != nil {
+		t.Fatal(err)
+	}
+	_ = keysResponse.Body.Close()
+	if len(keySet.Keys) == 0 {
+		t.Fatal("the key set is empty, so nothing this Realm issues can be verified")
+	}
+	for _, key := range keySet.Keys {
+		for _, field := range []string{"kty", "kid", "use", "alg", "n", "e"} {
+			if key[field] == nil || key[field] == "" {
+				t.Errorf("a published key omits %q: %v", field, key)
+			}
+		}
+		if key["kty"] != "RSA" || key["use"] != "sig" {
+			t.Errorf("a published key is not an RSA signing key: %v", key)
+		}
+		// A private component reaching the JWKS would publish the Realm's
+		// signing key to anyone who asks.
+		for _, secret := range []string{"d", "p", "q", "dp", "dq", "qi"} {
+			if _, present := key[secret]; present {
+				t.Fatalf("the published key set carries the private component %q", secret)
+			}
+		}
+	}
+
+	// The algorithm the document promises has to be the one tokens carry.
+	algorithms, _ := document["id_token_signing_alg_values_supported"].([]any)
+	if len(algorithms) != 1 || algorithms[0] != "RS256" {
+		t.Fatalf("advertised signing algorithms = %v", algorithms)
+	}
+	if key := keySet.Keys[0]; key["alg"] != "RS256" {
+		t.Errorf("the published key advertises alg=%v while the document promises RS256", key["alg"])
 	}
 }
