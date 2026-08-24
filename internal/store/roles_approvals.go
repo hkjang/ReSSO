@@ -354,6 +354,12 @@ func (s *Store) ListApprovalRequests(ctx context.Context, realmID *uuid.UUID, re
 	// The role identifier inside the payload is compared as text: it is
 	// untrusted JSON, and casting it to uuid would fail the whole query on a
 	// malformed value rather than simply not matching.
+	//
+	// Waiting requests are ordered ahead of decided ones, because the cap
+	// below is applied before the console filters for the ones still waiting.
+	// Newest-first alone meant a request nobody had answered dropped out of
+	// the page once five hundred newer ones had been decided — the reviewer's
+	// queue read as empty while somebody waited, with nothing to page to.
 	rows, err := s.Pool.Query(ctx, `SELECT a.id,a.realm_id,a.requester_id,a.reviewer_id,a.kind,a.payload,a.reason,
         a.status,a.decision_note,a.created_at,a.decided_at,
         COALESCE(rl.name,''),COALESCE(u.username,''),COALESCE(u.display_name,''),
@@ -364,7 +370,8 @@ func (s *Store) ListApprovalRequests(ctx context.Context, realmID *uuid.UUID, re
         LEFT JOIN users rv ON rv.id=a.reviewer_id
         LEFT JOIN roles ro ON a.kind='ROLE_ASSIGNMENT' AND ro.id::text=a.payload->>'role_id'
         WHERE ($1::uuid IS NULL OR a.realm_id=$1) AND ($2::uuid IS NULL OR a.requester_id=$2)
-        AND ($3::uuid IS NULL OR a.reviewer_id=$3) ORDER BY a.created_at DESC LIMIT 500`, realmID, requesterID, reviewerID)
+        AND ($3::uuid IS NULL OR a.reviewer_id=$3)
+        ORDER BY (a.status='PENDING') DESC, a.created_at DESC LIMIT 500`, realmID, requesterID, reviewerID)
 	if err != nil {
 		return nil, err
 	}

@@ -4039,3 +4039,66 @@ func TestIntegrationApprovalRequestsAreNotDuplicatedOrMisreported(t *testing.T) 
 		t.Error("approving a request whose role was deleted succeeded")
 	}
 }
+
+// The approvals list is capped, and the console filters for the ones still
+// waiting after it arrives. Ordered newest-first alone, a request nobody had
+// answered dropped off the page once five hundred newer ones had been decided:
+// the reviewer's queue read as empty while somebody waited, and there is no
+// page to turn to.
+func TestIntegrationWaitingApprovalsSurviveTheListingCap(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	role, err := data.CreateRole(ctx, bootstrap.RealmID, "requested", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := func() string { return bootstrap.AdminUserID.String() }
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO approval_requests(
+		id,realm_id,requester_id,kind,payload,reason,status,created_at)
+		VALUES(gen_random_uuid(),$1,$2,'ROLE_ASSIGNMENT',
+		jsonb_build_object('user_id',$4::text,'role_id',$3::text),
+		'still waiting','PENDING', now()-interval '400 days')`,
+		bootstrap.RealmID, bootstrap.AdminUserID, role.ID, payload()); err != nil {
+		t.Fatal(err)
+	}
+	// More decided requests than the cap, all of them newer.
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO approval_requests(
+		id,realm_id,requester_id,kind,payload,reason,status,created_at,decided_at)
+		SELECT gen_random_uuid(),$1,$2,'ROLE_ASSIGNMENT',
+		jsonb_build_object('user_id',$4::text,'role_id',$3::text),
+		'decided ' || i,'APPROVED', now()-(i || ' minutes')::interval, now()
+		FROM generate_series(1,520) AS i`,
+		bootstrap.RealmID, bootstrap.AdminUserID, role.ID, payload()); err != nil {
+		t.Fatal(err)
+	}
+
+	realmID := bootstrap.RealmID
+	listed, err := data.ListApprovalRequests(ctx, &realmID, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := 0
+	for _, item := range listed {
+		if item.Status == "PENDING" {
+			waiting++
+		}
+	}
+	var inTheDatabase int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM approval_requests WHERE status='PENDING'`).Scan(&inTheDatabase); err != nil {
+		t.Fatal(err)
+	}
+	if waiting != inTheDatabase {
+		t.Errorf("the list carries %d waiting requests out of %d; one nobody answered is unreachable",
+			waiting, inTheDatabase)
+	}
+	// Decided requests still come back, newest first, so the page keeps its
+	// history — the cap is what bounds it, not the ordering.
+	if len(listed) != 500 {
+		t.Errorf("the list returned %d rows, want the cap of 500", len(listed))
+	}
+	if listed[0].Status != "PENDING" {
+		t.Errorf("the waiting request is not at the top of the reviewer's list")
+	}
+}
