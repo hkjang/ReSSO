@@ -267,7 +267,12 @@ func (s *Store) ReplaceUserRoleMappings(ctx context.Context, realmID, userID uui
 		return UserRoleMappings{}, err
 	}
 	if realmRoleCount != len(realmRoleIDs) || clientRoleCount != len(clientRoleIDs) {
-		return UserRoleMappings{}, errors.New("one or more role mappings do not belong to the Realm")
+		// Typed, so the caller can tell a request that named the wrong Roles
+		// from a database that would not take the write. Both used to come
+		// back as one untyped error, which the handler echoed verbatim: a
+		// failed write reached the administrator as its SQLSTATE, under a
+		// status saying they had sent something wrong.
+		return UserRoleMappings{}, invalidf("하나 이상의 Role이 이 Realm의 것이 아닙니다.")
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM user_roles ur WHERE ur.user_id=$1
 		AND NOT EXISTS(SELECT 1 FROM federation_role_assignments fra

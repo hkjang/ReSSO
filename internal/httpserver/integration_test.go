@@ -3857,3 +3857,91 @@ func TestIntegrationPersonalRoutesRefuseSomebodyElsesKeyOrSession(t *testing.T) 
 		t.Errorf("the rotation attempt left %d key(s) on the caller's account", len(keys))
 	}
 }
+
+// Only sentences the store wrote may reach a caller. This handler echoed
+// whatever came back, so a write that failed on our side arrived as its
+// SQLSTATE — "ERROR: ... (SQLSTATE P0001)" — under a 400 that blamed the
+// request. The administrator reads that they sent something wrong and goes
+// looking at what they typed.
+//
+// The collision paths were given this treatment already; this one was missed
+// because its failures are rarer than a taken name.
+func TestIntegrationRoleMappingFailuresDoNotLeakDatabaseText(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "mapped", Password: "mapped-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, err := data.CreateRole(ctx, bootstrap.RealmID, "mappable", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	admin, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "admin", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(body string) (int, map[string]any) {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodPut,
+			server.URL+"/api/admin/v1/realms/"+bootstrap.RealmID.String()+"/users/"+user.ID.String()+"/role-mappings",
+			strings.NewReader(body))
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.AddCookie(&http.Cookie{Name: "resso_session", Value: admin.Token})
+		request.Header.Set("X-CSRF-Token", admin.CSRFToken)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		decoded := map[string]any{}
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		return response.StatusCode, decoded
+	}
+
+	// A Role from nowhere is the caller's mistake, and is told so in words.
+	status, body := put(`{"realm_role_ids":["` + uuid.New().String() + `"],"client_role_ids":[]}`)
+	if status != http.StatusBadRequest {
+		t.Errorf("naming a Role that is not in the Realm answered %d", status)
+	}
+	message, _ := body["message"].(string)
+	if !strings.Contains(message, "Realm") {
+		t.Errorf("the refusal does not explain itself: %q", message)
+	}
+
+	// A write that fails is ours, and must not be described as a bad request
+	// or quoted back.
+	if _, err := data.Pool.Exec(ctx, `CREATE FUNCTION block_mapping() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'mapping blocked'; END $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `CREATE TRIGGER block_mapping BEFORE INSERT ON user_roles
+		FOR EACH ROW EXECUTE FUNCTION block_mapping()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "DROP TRIGGER IF EXISTS block_mapping ON user_roles")
+	})
+	status, body = put(`{"realm_role_ids":["` + role.ID.String() + `"],"client_role_ids":[]}`)
+	message, _ = body["message"].(string)
+	for _, trace := range []string{"SQLSTATE", "ERROR:", "mapping blocked"} {
+		if strings.Contains(message, trace) {
+			t.Errorf("the response carries database text (%q): %q", trace, message)
+		}
+	}
+	if status == http.StatusBadRequest {
+		t.Errorf("a write that failed on our side was reported as a bad request: %d %v", status, body)
+	}
+}

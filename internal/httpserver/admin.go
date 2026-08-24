@@ -695,7 +695,10 @@ func (s *Server) adminReplaceUserRoleMappings(w http.ResponseWriter, r *http.Req
 	}
 	mappings, err := s.store.ReplaceUserRoleMappings(r.Context(), realmID, userID, input.RealmRoleIDs, input.ClientRoleIDs)
 	if err != nil {
-		writeError(w, r, http.StatusBadRequest, "role_mapping_failed", err.Error())
+		// Only sentences the store wrote reach the caller. Echoing whatever
+		// came back put database text in the response, under a status that
+		// blamed the request for a write that failed on our side.
+		writeStoreError(w, r, err)
 		return
 	}
 	s.audit(r, &realmID, &principal.UserID, principal.Username, "USER_ROLE_MAPPING_UPDATE", "SUCCESS", "user", userID.String(),
