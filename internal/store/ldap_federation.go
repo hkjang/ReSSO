@@ -72,6 +72,12 @@ type LDAPSyncSummary struct {
 	Updated      int       `json:"updated"`
 	Failed       int       `json:"failed"`
 	Disabled     int64     `json:"disabled"`
+	// Failures names the users a run could not synchronize and why, up to
+	// namedSyncFailures of them. The count alone could not be acted on: the
+	// reason is known where it happens — a username already held by a local
+	// account, an address this Realm cannot store — and was discarded, leaving
+	// the operator a number and no way to learn which users or what to fix.
+	Failures []string `json:"failures,omitempty"`
 	// RecordError reports that the run finished but its outcome did not reach
 	// the provider row or the audit trail. Both writes used to be issued and
 	// discarded, so a sweep that deactivated accounts could return success
@@ -470,6 +476,9 @@ func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncS
 		added, upsertErr := s.upsertFederatedUser(ctx, runtime.Provider, external, summary.StartedAt)
 		if upsertErr != nil {
 			summary.Failed++
+			if len(summary.Failures) < namedSyncFailures {
+				summary.Failures = append(summary.Failures, fmt.Sprintf("%s: %v", external.Username, upsertErr))
+			}
 			continue
 		}
 		if added {
@@ -478,6 +487,13 @@ func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncS
 			summary.Updated++
 		}
 	}
+	// Skipping the sweep after a failed import is deliberate: the users that
+	// failed are exactly the ones whose federation_synced_at did not move, so
+	// sweeping now would deactivate people the directory still holds. The
+	// consequence is worth saying out loud rather than leaving to be inferred —
+	// while anything is failing, the DISABLE policy is not running at all, and
+	// the accounts of people who have left stay enabled until it is fixed.
+	sweepSkipped := summary.Failed > 0 && runtime.Provider.MissingUserAction == "DISABLE"
 	var sweepErr error
 	if summary.Failed == 0 && runtime.Provider.MissingUserAction == "DISABLE" {
 		summary.Disabled, sweepErr = s.disableUnseenFederatedUsers(ctx, id, summary.StartedAt, summary.Read)
@@ -491,10 +507,34 @@ func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncS
 	case errors.Is(sweepErr, ErrSyncReadNothing):
 		syncErr = sweepErr
 	case summary.Failed > 0:
-		syncErr = fmt.Errorf("%d LDAP users could not be synchronized", summary.Failed)
+		syncErr = fmt.Errorf("%d LDAP users could not be synchronized: %s",
+			summary.Failed, describeSyncFailures(summary.Failures, summary.Failed))
+		if sweepSkipped {
+			syncErr = fmt.Errorf("%w; accounts missing from the directory were left enabled until this is resolved", syncErr)
+		}
 	}
 	summary.RecordError = recordError(s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, syncErr))
 	return summary, syncErr
+}
+
+// namedSyncFailures bounds how many rejected users a run names. The reasons
+// repeat in practice — one misconfiguration produces the same sentence for
+// everybody it touches — so a handful is enough to act on, and the outcome
+// message is stored in a column and an audit detail that both have to stay a
+// reasonable size.
+const namedSyncFailures = 5
+
+// describeSyncFailures renders the named failures and says how many more there
+// were, so a truncated list never reads as the whole list.
+func describeSyncFailures(failures []string, total int) string {
+	if len(failures) == 0 {
+		return "no reason was recorded"
+	}
+	described := strings.Join(failures, "; ")
+	if remaining := total - len(failures); remaining > 0 {
+		described += fmt.Sprintf("; and %d more", remaining)
+	}
+	return described
 }
 
 // ErrSyncReadNothing reports a sync that saw no users at all in a directory
@@ -597,6 +637,9 @@ func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederati
 	realmID := provider.RealmID
 	detail := map[string]any{"provider": provider.Name, "read": summary.Read, "added": summary.Added,
 		"updated": summary.Updated, "failed": summary.Failed, "disabled": summary.Disabled}
+	if len(summary.Failures) > 0 {
+		detail["failures"] = summary.Failures
+	}
 	if message != "" {
 		detail["error"] = message
 	}

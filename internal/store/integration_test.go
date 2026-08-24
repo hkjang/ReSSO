@@ -4179,3 +4179,90 @@ func TestIntegrationRevokingOwnSessionTouchesNobodyElses(t *testing.T) {
 		t.Errorf("%d refresh tokens outlived the session they came from", liveTokens)
 	}
 }
+
+// A count is not a diagnosis. An administrator who made a local account before
+// the directory was connected produces exactly this: the sync knows the
+// username is already taken, says "1 LDAP users could not be synchronized", and
+// throws the sentence away. It matters more than one user, because any failure
+// switches off the DISABLE sweep — so one unresolvable collision leaves the
+// accounts of everybody who has left enabled indefinitely, and the message that
+// would explain why names nothing.
+func TestIntegrationSyncNamesTheUsersItCouldNotImport(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	branch := "ou=sync-collision,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "collides", "imports")
+	if _, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "collides", Email: "collides@local.test", Password: "LocalPassword!1", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "collide", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "DISABLE",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	summary, syncErr := data.SyncLDAPFederation(ctx, provider.ID)
+	if syncErr == nil {
+		t.Fatalf("a collision synchronised cleanly: %+v", summary)
+	}
+	if summary.Failed != 1 {
+		t.Fatalf("summary.Failed = %d, want 1 (%+v)", summary.Failed, summary)
+	}
+	for _, where := range []struct {
+		what string
+		text string
+	}{
+		{"the error returned to the caller", syncErr.Error()},
+		{"the summary", strings.Join(summary.Failures, "; ")},
+	} {
+		if !strings.Contains(where.text, "collides") {
+			t.Errorf("%s does not name the user: %q", where.what, where.text)
+		}
+		if !strings.Contains(where.text, "already belongs") {
+			t.Errorf("%s does not give the reason: %q", where.what, where.text)
+		}
+	}
+
+	// The console reads the provider row, and the audit trail is what an
+	// operator is told to consult about a DISABLE policy. Both have to carry it.
+	var recorded string
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT last_sync_error FROM user_federations WHERE id=$1", provider.ID).Scan(&recorded); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(recorded, "collides") || !strings.Contains(recorded, "already belongs") {
+		t.Errorf("the provider row records %q, which an operator cannot act on", recorded)
+	}
+	var detail string
+	if err := data.Pool.QueryRow(ctx, `SELECT detail::text FROM audit_events
+        WHERE event_type='LDAP_FEDERATION_SYNC' AND target_id=$1 ORDER BY occurred_at DESC LIMIT 1`,
+		provider.ID.String()).Scan(&detail); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(detail, "collides") || !strings.Contains(detail, "already belongs") {
+		t.Errorf("the audit detail records %q, which an operator cannot act on", detail)
+	}
+
+	// Any failure switches off the DISABLE sweep. That is the right call — the
+	// users that failed are the ones whose synced_at did not move — but leaving
+	// it to be inferred means the policy can sit idle for months behind a
+	// message about one username.
+	if !strings.Contains(syncErr.Error(), "left enabled") {
+		t.Errorf("the failure does not say the DISABLE sweep was skipped: %q", syncErr)
+	}
+}
