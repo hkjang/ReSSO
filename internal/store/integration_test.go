@@ -5155,3 +5155,75 @@ func TestIntegrationAClientThatCouldNeverLogAnyoneInIsRefused(t *testing.T) {
 	}
 	_ = machine
 }
+
+// Rotating a key is two writes, and they used to stand alone. A revocation
+// that failed left the replacement behind: the caller gets an error, so the new
+// secret goes nowhere, and the account keeps two live keys with the same name —
+// the original still working and one nobody can ever use. Retrying added
+// another each time.
+func TestIntegrationAPIKeyRotationIsAllOrNothing(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	original, err := data.CreatePersonalAPIKey(ctx, bootstrap.AdminUserID, "agent",
+		[]string{"api:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveNames := func() []string {
+		t.Helper()
+		rows, queryErr := data.Pool.Query(ctx,
+			"SELECT name FROM personal_api_keys WHERE user_id=$1 AND revoked_at IS NULL ORDER BY created_at",
+			bootstrap.AdminUserID)
+		if queryErr != nil {
+			t.Fatal(queryErr)
+		}
+		defer rows.Close()
+		names := make([]string, 0)
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			names = append(names, name)
+		}
+		return names
+	}
+
+	// Only the revoking UPDATE fails; reading and inserting still work, which
+	// is what lets the half-done state exist at all.
+	if _, err := data.Pool.Exec(ctx, `CREATE FUNCTION block_key_revocation() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'revocation blocked for the test'; END $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `CREATE TRIGGER block_key_revocation BEFORE UPDATE ON personal_api_keys
+		FOR EACH ROW WHEN (NEW.revoked_at IS NOT NULL AND OLD.revoked_at IS NULL)
+		EXECUTE FUNCTION block_key_revocation()`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := data.RotatePersonalAPIKey(ctx, bootstrap.AdminUserID, original.Key.ID); err == nil {
+		t.Fatal("a rotation whose revocation failed reported success")
+	}
+	if names := liveNames(); len(names) != 1 {
+		t.Errorf("a failed rotation left %v; the replacement's secret went nowhere, so it can never be used", names)
+	}
+
+	// With the revocation working again, rotating really does both halves.
+	if _, err := data.Pool.Exec(ctx, "DROP TRIGGER block_key_revocation ON personal_api_keys"); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := data.RotatePersonalAPIKey(ctx, bootstrap.AdminUserID, original.Key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := liveNames(); len(names) != 1 {
+		t.Errorf("after a successful rotation the account holds %v, want one key", names)
+	}
+	if _, err := data.AuthenticateAPIKey(ctx, rotated.Secret); err != nil {
+		t.Errorf("the replacement key does not authenticate: %v", err)
+	}
+	if _, err := data.AuthenticateAPIKey(ctx, original.Secret); !errors.Is(err, ErrNotFound) {
+		t.Errorf("the rotated-away key still authenticates: %v", err)
+	}
+}

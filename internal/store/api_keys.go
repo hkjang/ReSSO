@@ -57,13 +57,47 @@ func (s *Store) CreatePersonalAPIKey(ctx context.Context, userID uuid.UUID, name
 	// reads the same judgement back from the database.
 	key := PersonalAPIKey{ID: uuid.New(), Name: name, Prefix: prefix, Scopes: scopes,
 		CreatedAt: time.Now().UTC(), ExpiresAt: expiresAt, RotatedFrom: rotatedFrom, Active: true}
-	_, err = s.Pool.Exec(ctx, `INSERT INTO personal_api_keys(id,user_id,name,prefix,secret_hash,scopes,created_at,
-        expires_at,rotated_from) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, key.ID, userID, key.Name, key.Prefix,
+	_, err = s.Pool.Exec(ctx, insertPersonalAPIKey, key.ID, userID, key.Name, key.Prefix,
 		s.Sealer.Digest(secret), key.Scopes, key.CreatedAt, key.ExpiresAt, key.RotatedFrom)
 	if err != nil {
 		return CreatedAPIKey{}, fmt.Errorf("create personal API key: %w", err)
 	}
 	return CreatedAPIKey{Key: key, Secret: secret}, nil
+}
+
+// insertPersonalAPIKey is shared so that rotating a key writes the same row
+// creating one does; the rotation runs it inside its own transaction.
+const insertPersonalAPIKey = `INSERT INTO personal_api_keys(id,user_id,name,prefix,secret_hash,scopes,created_at,
+        expires_at,rotated_from) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`
+
+// newPersonalAPIKey mints the identifiers and secret for a key without writing
+// it, so the caller decides where the row goes.
+func newPersonalAPIKey(sealer *cryptoutil.Sealer, name string, scopes []string, expiresAt *time.Time,
+	rotatedFrom *uuid.UUID) (PersonalAPIKey, struct {
+	plain  string
+	digest []byte
+}, error) {
+	var secret struct {
+		plain  string
+		digest []byte
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return PersonalAPIKey{}, secret, errors.New("API key name is required")
+	}
+	prefixRandom, err := cryptoutil.RandomToken(16)
+	if err != nil {
+		return PersonalAPIKey{}, secret, err
+	}
+	secretPart, err := cryptoutil.RandomToken(32)
+	if err != nil {
+		return PersonalAPIKey{}, secret, err
+	}
+	prefix := "rk_" + prefixRandom[:12]
+	secret.plain = prefix + "." + secretPart
+	secret.digest = sealer.Digest(secret.plain)
+	return PersonalAPIKey{ID: uuid.New(), Name: name, Prefix: prefix, Scopes: scopes,
+		CreatedAt: time.Now().UTC(), ExpiresAt: expiresAt, RotatedFrom: rotatedFrom, Active: true}, secret, nil
 }
 
 func (s *Store) ListPersonalAPIKeys(ctx context.Context, userID uuid.UUID) ([]PersonalAPIKey, error) {
@@ -129,24 +163,50 @@ func (s *Store) RevokePersonalAPIKey(ctx context.Context, userID, keyID uuid.UUI
 	return nil
 }
 
+// RotatePersonalAPIKey replaces a key with an equivalent one and retires the
+// original, both or neither.
+//
+// The two writes used to stand alone, so a revocation that failed left the
+// replacement behind: the caller was handed an error, which means the new
+// secret went nowhere, and the account kept two live keys with the same name —
+// the original still working, and one nobody can ever use. Retrying added
+// another each time. Measured, one blocked revocation turned "agent" into
+// "agent, agent".
 func (s *Store) RotatePersonalAPIKey(ctx context.Context, userID, keyID uuid.UUID) (CreatedAPIKey, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return CreatedAPIKey{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	var name string
 	var scopes []string
 	var expires *time.Time
-	err := s.Pool.QueryRow(ctx, `SELECT name,scopes,expires_at FROM personal_api_keys
-        WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL`, keyID, userID).Scan(&name, &scopes, &expires)
+	err = tx.QueryRow(ctx, `SELECT name,scopes,expires_at FROM personal_api_keys
+        WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL FOR UPDATE`, keyID, userID).Scan(&name, &scopes, &expires)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CreatedAPIKey{}, ErrNotFound
 	}
 	if err != nil {
 		return CreatedAPIKey{}, err
 	}
-	created, err := s.CreatePersonalAPIKey(ctx, userID, name, scopes, expires, &keyID)
+	created, secret, err := newPersonalAPIKey(s.Sealer, name, scopes, expires, &keyID)
 	if err != nil {
 		return CreatedAPIKey{}, err
 	}
-	if err := s.RevokePersonalAPIKey(ctx, userID, keyID); err != nil {
+	if _, err := tx.Exec(ctx, insertPersonalAPIKey, created.ID, userID, created.Name, created.Prefix,
+		secret.digest, created.Scopes, created.CreatedAt, created.ExpiresAt, created.RotatedFrom); err != nil {
+		return CreatedAPIKey{}, fmt.Errorf("create personal API key: %w", err)
+	}
+	command, err := tx.Exec(ctx, `UPDATE personal_api_keys SET revoked_at=COALESCE(revoked_at,now())
+        WHERE id=$1 AND user_id=$2`, keyID, userID)
+	if err != nil {
 		return CreatedAPIKey{}, err
 	}
-	return created, nil
+	if command.RowsAffected() == 0 {
+		return CreatedAPIKey{}, ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return CreatedAPIKey{}, err
+	}
+	return CreatedAPIKey{Key: created, Secret: secret.plain}, nil
 }
