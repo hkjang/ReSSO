@@ -564,6 +564,7 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if _, sessionErr := s.store.SessionAuthTime(r.Context(), sid); sessionErr != nil {
+				s.recordUnjudgedIntrospection(r, "session", sessionErr)
 				writeJSON(w, http.StatusOK, map[string]any{"active": false})
 				return
 			}
@@ -578,7 +579,9 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusOK, map[string]any{"active": false})
 				return
 			}
-			if user, userErr := s.store.UserByID(r.Context(), subject); userErr != nil || !user.Enabled {
+			user, userErr := s.store.UserByID(r.Context(), subject)
+			if userErr != nil || !user.Enabled {
+				s.recordUnjudgedIntrospection(r, "user", userErr)
 				writeJSON(w, http.StatusOK, map[string]any{"active": false})
 				return
 			}
@@ -603,6 +606,30 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"active": false})
+}
+
+// recordUnjudgedIntrospection separates a token that is genuinely dead from
+// one the service could not judge.
+//
+// Both still answer active=false. Fail-closed is the right direction here and
+// a resource server handed a 5xx might well fail open, so the answer does not
+// change. What was missing is that the two were the same call in every signal
+// the service publishes: the response is 200, so the request counter records a
+// healthy introspection, the access log line says status=200, and the store
+// error was discarded where it happened. An outage confined to this endpoint
+// therefore looked exactly like every token being dead, with every resource
+// server refusing every request and nothing here to say why — the shape this
+// service has already fixed for logins and for token issuance.
+//
+// A session or an account that is gone is a real answer rather than a failure,
+// so only errors that are not that are recorded.
+func (s *Server) recordUnjudgedIntrospection(r *http.Request, stage string, err error) {
+	if err == nil || errors.Is(err, store.ErrNotFound) {
+		return
+	}
+	s.metrics.Add(metricIntrospectionErrors, 1, stage)
+	s.logger.Error("introspection could not judge a token", "trace_id", traceIDFrom(r.Context()),
+		"realm", chi.URLParam(r, "realm"), "stage", stage, "error", err)
 }
 
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {

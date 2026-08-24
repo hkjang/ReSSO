@@ -180,6 +180,7 @@ scrape_configs:
 | `resso_token_errors_total` | Grant type별 발급하지 못한 Token 요청 수 |
 | `resso_login_attempts_total` | 로그인 성공·실패·Rate limit·처리 실패 수 |
 | `resso_client_auth_failures_total` | Realm별 OIDC Client 인증 실패 수 |
+| `resso_introspection_errors_total` | 판정하지 못한 Introspection 수(실패한 조회 단계별). 죽은 Token으로 판정한 경우와 달리 서비스가 답을 낼 수 없었던 경우입니다 |
 | `resso_backchannel_logout_total` | Back-Channel Logout 전달 결과 |
 | `resso_federation_sync_total` | 주기 LDAP 동기화 성공·실패 수 |
 | `resso_system_log_records_total` | 서버 로그의 데이터베이스 기록·유실·실패 수 |

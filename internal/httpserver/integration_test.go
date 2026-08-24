@@ -2576,3 +2576,100 @@ func TestIntegrationALoginThatCannotMintItsCodeIsStillRecorded(t *testing.T) {
 			exported.String())
 	}
 }
+
+// A token the service judged dead and a token it could not judge both answer
+// 200 with active=false, which is the right direction — a resource server
+// handed a 5xx might fail open. But the two were the same call in every signal
+// the service publishes: the request counter records a healthy introspection,
+// the access line says status=200, and the store error was dropped where it
+// happened. An outage confined to this endpoint looked exactly like every token
+// being dead, with every resource server refusing every request and nothing
+// here to say why.
+func TestIntegrationAnIntrospectionItCannotJudgeIsDistinguishable(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceServer, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "unjudged-rs", Name: "RS", Type: "confidential",
+		RedirectURIs: []string{"https://rs.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "unjudged", Password: "unjudged-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "introspection", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, resourceServer.Client, user, session.Session.ID,
+		[]string{"openid"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	metrics := observability.NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+	introspect := func() (int, bool) {
+		t.Helper()
+		form := url.Values{"token": {tokens.AccessToken}, "client_id": {"unjudged-rs"},
+			"client_secret": {resourceServer.ClientSecret}}
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token/introspect", form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		var decoded map[string]any
+		if decodeErr := json.NewDecoder(response.Body).Decode(&decoded); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		active, _ := decoded["active"].(bool)
+		return response.StatusCode, active
+	}
+
+	if status, active := introspect(); status != http.StatusOK || !active {
+		t.Fatalf("a healthy introspection answered %d active=%v", status, active)
+	}
+	var healthy strings.Builder
+	metrics.WritePrometheus(&healthy)
+	if strings.Contains(healthy.String(), "resso_introspection_errors_total{") {
+		t.Errorf("a healthy introspection was counted as unjudged:\n%s", healthy.String())
+	}
+
+	// Only the session lookup breaks; the rest of the service is fine.
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE sso_sessions RENAME COLUMN created_at TO created_at_moved"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(),
+			"ALTER TABLE sso_sessions RENAME COLUMN created_at_moved TO created_at")
+	})
+
+	// The answer deliberately does not change: refusing is the safe direction.
+	if status, active := introspect(); status != http.StatusOK || active {
+		t.Errorf("an unjudgeable token answered %d active=%v, want 200 and inactive", status, active)
+	}
+	var broken strings.Builder
+	metrics.WritePrometheus(&broken)
+	if !strings.Contains(broken.String(), `resso_introspection_errors_total{stage="session"} 1`) {
+		t.Errorf("an outage confined to introspection left no signal:\n%s", broken.String())
+	}
+}

@@ -19,12 +19,17 @@ const (
 	// its own: a signing key that will not open takes every token request with
 	// it, and the counter of successes simply goes flat — which is what a
 	// quiet night looks like.
-	metricTokenErrors    = "resso_token_errors_total"
-	metricLogins         = "resso_login_attempts_total"
-	metricClientAuth     = "resso_client_auth_failures_total"
-	metricLogoutNotices  = backchannel.MetricName
-	MetricFederationSync = "resso_federation_sync_total"
-	metricFederationSync = MetricFederationSync
+	metricTokenErrors = "resso_token_errors_total"
+	metricLogins      = "resso_login_attempts_total"
+	metricClientAuth  = "resso_client_auth_failures_total"
+	// metricIntrospectionErrors counts the introspections the service could
+	// not judge, as opposed to the ones it judged dead. Both answer 200 with
+	// active=false, so without this series the two are the same call in every
+	// signal the service publishes.
+	metricIntrospectionErrors = "resso_introspection_errors_total"
+	metricLogoutNotices       = backchannel.MetricName
+	MetricFederationSync      = "resso_federation_sync_total"
+	metricFederationSync      = MetricFederationSync
 )
 
 // registerMetrics declares this package's series on a shared registry.
@@ -37,6 +42,8 @@ func registerMetrics(registry *observability.Registry) {
 	registry.Counter(metricTokenErrors, "Token requests the service could not fulfil, by grant type.", "grant_type")
 	registry.Counter(metricLogins, "Browser login attempts, by outcome.", "result")
 	registry.Counter(metricClientAuth, "Failed OIDC client authentications.", "realm")
+	registry.Counter(metricIntrospectionErrors,
+		"Introspections the service could not judge, by the lookup that failed.", "stage")
 	registry.Counter(metricLogoutNotices, "Back-channel logout deliveries, by outcome.", "result")
 	registry.Counter(metricFederationSync, "Scheduled LDAP federation syncs, by outcome.", "result")
 }

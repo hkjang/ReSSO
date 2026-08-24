@@ -60,6 +60,7 @@ ReSSO는 확장을 직접 설치하지 않습니다. 확장 설치는 데이터�
 - `resso_token_errors_total` 발생 — Token을 발급하지 못하는 상태. Signing Key를 열 수 없는 경우(Keyring 불일치)가 대표적이며, 모든 RP의 Token 교환이 함께 실패합니다. 발급 성공만 세면 이 상황도 시계열이 조용해질 뿐입니다.
 - `resso_login_attempts_total{result="error"}` 발생 — 로그인 시도를 완료하지 못하는 상태. LDAP 디렉터리 장애가 대표적입니다. 이 경우 성공도 실패도 집계되지 않으므로, `failure` 급증만 보고 있으면 전면 장애가 조용해 보입니다.
 - `resso_client_auth_failures_total` 급증 — Client Secret 오설정 또는 대입 시도
+- `resso_introspection_errors_total` 발생 — Resource Server의 질의에 답을 내지 못하는 상태. 응답은 `active=false`로 나가므로(안전한 방향입니다) **Token이 전부 죽은 것과 겉모습이 같습니다** — HTTP 상태는 200이고 요청 카운터에도 정상 호출로 잡힙니다. 이 계열만이 둘을 구분합니다.
 - `resso_backchannel_logout_total{result!="delivered"}` — RP가 로그아웃 통지를 받지 못하는 상태
 - `resso_federation_sync_total{result="failure"}` — LDAP 동기화 실패
 - `resso_http_request_duration_seconds` 상위 분위 상승 — 커넥션 풀 포화 또는 LDAP 지연
