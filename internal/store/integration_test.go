@@ -5227,3 +5227,58 @@ func TestIntegrationAPIKeyRotationIsAllOrNothing(t *testing.T) {
 		t.Errorf("the rotated-away key still authenticates: %v", err)
 	}
 }
+
+// An account and the Role it is created with belong together. The Role was
+// assigned by a statement whose outcome was discarded, so a failure there left
+// an account that looks ordinary in the console and carries no user Role in
+// realm_access — every relying party checking for it refuses the person, and
+// nothing says why. An account that would be born broken is better not created.
+func TestIntegrationCreatingAUserAndItsRoleIsAllOrNothing(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+
+	// Only the Role assignment fails; creating the account still works, which
+	// is what let the half-made account exist.
+	if _, err := data.Pool.Exec(ctx, `CREATE FUNCTION block_role_assignment() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'role assignment blocked for the test'; END $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `CREATE TRIGGER block_role_assignment BEFORE INSERT ON user_roles
+		FOR EACH ROW EXECUTE FUNCTION block_role_assignment()`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "halfmade", Password: "halfmade-password-1234", Enabled: true}); err == nil {
+		t.Fatal("an account was created without the Role it comes with")
+	}
+	var exists bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM users WHERE realm_id=$1 AND username='halfmade')",
+		bootstrap.RealmID).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Error("the account was left behind without its Role, which is the state this prevents")
+	}
+
+	// With the assignment working, an ordinary account is created with it.
+	if _, err := data.Pool.Exec(ctx, "DROP TRIGGER block_role_assignment ON user_roles"); err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "wholemade", Password: "wholemade-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var holdsUserRole bool
+	if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_roles ur JOIN roles r ON r.id=ur.role_id
+		WHERE ur.user_id=$1 AND r.name='user' AND r.realm_id=$2)`,
+		created.ID, bootstrap.RealmID).Scan(&holdsUserRole); err != nil {
+		t.Fatal(err)
+	}
+	if !holdsUserRole {
+		t.Error("an ordinary account was created without the user Role")
+	}
+}

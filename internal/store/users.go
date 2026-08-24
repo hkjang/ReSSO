@@ -172,17 +172,35 @@ func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateU
 		EmailVerified: input.Email != "" && input.EmailVerified,
 		DisplayName:   input.DisplayName, Enabled: input.Enabled, ManagerID: input.ManagerID,
 		PasswordChanged: now, CreatedAt: now, UpdatedAt: now}
-	_, err = s.Pool.Exec(ctx, `INSERT INTO users(id,realm_id,username,email,email_verified,display_name,password_hash,enabled,
-		manager_id,password_changed_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$10)`,
-		user.ID, realmID, user.Username, user.Email, user.EmailVerified, user.DisplayName, hashed, user.Enabled, user.ManagerID, now)
+	// The account and the Role it is created with go together. The Role was
+	// assigned by a statement whose outcome was discarded, so a failure there
+	// produced an account that looks ordinary in the console and carries no
+	// user Role in realm_access — every relying party that checks for it
+	// refuses the person, and nothing anywhere says why. An account that would
+	// be born broken is better not created: the administrator sees the failure
+	// and tries again.
+	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
+		return domain.User{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `INSERT INTO users(id,realm_id,username,email,email_verified,display_name,password_hash,enabled,
+		manager_id,password_changed_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$10)`,
+		user.ID, realmID, user.Username, user.Email, user.EmailVerified, user.DisplayName, hashed, user.Enabled,
+		user.ManagerID, now); err != nil {
 		if conflict, taken := conflictFromUnique(err); taken {
 			return domain.User{}, conflict
 		}
 		return domain.User{}, fmt.Errorf("create user: %w", err)
 	}
-	_, _ = s.Pool.Exec(ctx, `INSERT INTO user_roles(user_id,role_id)
-        SELECT $1,id FROM roles WHERE realm_id=$2 AND name='user' ON CONFLICT DO NOTHING`, user.ID, realmID)
+	if _, err := tx.Exec(ctx, `INSERT INTO user_roles(user_id,role_id)
+        SELECT $1,id FROM roles WHERE realm_id=$2 AND name='user' ON CONFLICT DO NOTHING`,
+		user.ID, realmID); err != nil {
+		return domain.User{}, fmt.Errorf("assign the default Role: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.User{}, err
+	}
 	return user, nil
 }
 
