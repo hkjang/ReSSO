@@ -5101,6 +5101,20 @@ func TestIntegrationAClientThatCouldNeverLogAnyoneInIsRefused(t *testing.T) {
 		t.Errorf("the refusal does not name the missing scope: %v", err)
 	}
 
+	// The same for a login Client with nowhere to send anyone back to: a
+	// registered redirect URI is what the authorization endpoint matches the
+	// request against, so with none registered nothing can match.
+	_, err = data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
+		ClientID: "no-redirect", Name: "No Redirect", Type: "public",
+		GrantTypes: []string{"authorization_code"},
+	})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("a Client with no redirect URI was accepted: %v", err)
+	}
+	if !errors.As(err, &messaged) || !strings.Contains(messaged.Message, "Redirect URI") {
+		t.Errorf("the refusal does not name what is missing: %v", err)
+	}
+
 	// Machine-to-machine Clients never reach the authorization endpoint.
 	machine, err := data.CreateClient(ctx, bootstrap.RealmID, CreateClientInput{
 		ClientID: "machine", Name: "Machine", Type: "confidential",
@@ -5130,6 +5144,14 @@ func TestIntegrationAClientThatCouldNeverLogAnyoneInIsRefused(t *testing.T) {
 	})
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Errorf("editing openid away was accepted: %v", err)
+	}
+	_, err = data.UpdateClient(ctx, usable.Client.ID, UpdateClientInput{
+		Name: "Usable", RedirectURIs: nil,
+		GrantTypes: []string{"authorization_code"}, DefaultScopes: usable.Client.DefaultScopes,
+		AccessTokenTTLSeconds: 300, RefreshTokenTTLSeconds: 1800, Enabled: true,
+	})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("editing the last redirect URI away was accepted: %v", err)
 	}
 	_ = machine
 }

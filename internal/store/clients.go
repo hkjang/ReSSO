@@ -114,6 +114,9 @@ func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClie
 	if err := requireOpenIDForLogins(input.GrantTypes, input.DefaultScopes); err != nil {
 		return domain.Client{}, err
 	}
+	if err := requireRedirectURIForLogins(input.GrantTypes, input.RedirectURIs); err != nil {
+		return domain.Client{}, err
+	}
 	if err := validateURIs(input.RedirectURIs, false); err != nil {
 		return domain.Client{}, fmt.Errorf("redirect_uris: %w", err)
 	}
@@ -171,6 +174,9 @@ func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input Creat
 		input.DefaultScopes = []string{"openid", "profile", "email", "roles"}
 	}
 	if err := requireOpenIDForLogins(input.GrantTypes, input.DefaultScopes); err != nil {
+		return CreatedClient{}, err
+	}
+	if err := requireRedirectURIForLogins(input.GrantTypes, input.RedirectURIs); err != nil {
 		return CreatedClient{}, err
 	}
 	if err := validateURIs(input.RedirectURIs, false); err != nil {
@@ -244,6 +250,23 @@ func requireOpenIDForLogins(grantTypes, scopes []string) error {
 		return nil
 	}
 	return invalidf("로그인에 쓰이는 Client의 허용 Scope에는 openid가 있어야 합니다. 없으면 모든 인가 요청이 invalid_scope로 거절됩니다.")
+}
+
+// requireRedirectURIForLogins refuses a login Client with nowhere to send
+// anyone back to.
+//
+// A registered redirect URI is what the authorization endpoint matches the
+// request against, so with none registered nothing can match and every
+// authorization request is refused as unregistered. Like the scope above, the
+// Client saves cleanly and only the relying party ever sees the problem.
+func requireRedirectURIForLogins(grantTypes, redirectURIs []string) error {
+	if !slices.Contains(grantTypes, "authorization_code") {
+		return nil
+	}
+	if len(redirectURIs) > 0 {
+		return nil
+	}
+	return invalidf("로그인에 쓰이는 Client에는 Redirect URI가 최소 하나 필요합니다. 없으면 모든 인가 요청이 등록되지 않은 주소로 거절됩니다.")
 }
 
 func validateURIs(values []string, allowFragment bool) error {
