@@ -1884,10 +1884,15 @@ func TestIntegrationPasswordChangeAdmitsWhenSessionsSurvive(t *testing.T) {
 	}
 	result, detail := lastAudit()
 	if result != "PARTIAL" || detail["other_sessions_ended"] != false || detail["error"] == nil {
-		// This has failed intermittently, and "SUCCESS with an empty detail"
-		// means the revoking UPDATE matched no row rather than being blocked.
-		// Whatever the cause, the next occurrence should say which of those it
-		// was instead of leaving it to be re-run.
+		// This has failed intermittently, twice, and "SUCCESS with an empty
+		// detail" is exactly what the first change of this test writes — so
+		// either the revoking UPDATE matched no row, or the wrong entry was
+		// read. Ruled out so far: reading the wrong entry, because the listing
+		// orders by occurred_at then by id, and id is a bigserial, so a tie on
+		// the timestamp still yields the newer row; and the test alone, which
+		// survived forty consecutive runs. That points at something another
+		// test in the package leaves behind, and the counts below are what
+		// would show it.
 		var liveNow, blockedByTrigger int
 		if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM sso_sessions
 			WHERE user_id=$1 AND revoked_at IS NULL`, bootstrap.AdminUserID).Scan(&liveNow); err != nil {
