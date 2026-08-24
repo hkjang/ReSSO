@@ -165,6 +165,17 @@ SELECT realm_id, kid, status, retire_at
 
 #### 동작이 바뀌는 변경
 
+- **로그인에 쓸 수 없는 Client는 이제 저장 자체가 거절됩니다.** v0.5.0에서는 허용 Scope에 `openid`가 없거나 Redirect URI가 하나도 없는 Client를 만들 수 있었고, 그런 Client는 만들어진 뒤 **모든 인가 요청이 실패**했습니다. 이제 만들 때도 수정할 때도 거절하므로, **그런 Client가 남아 있으면 이름만 바꾸려 해도 저장되지 않습니다** — 먼저 Scope나 Redirect URI를 채워야 합니다. 어차피 로그인이 되지 않던 Client이므로 고칠 대상이지만, 오류 문구가 방금 건드린 항목과 무관해 보일 수 있어 적어 둡니다.
+
+```sql
+SELECT c.client_id,
+       NOT ('openid' = ANY(c.default_scopes)) AS missing_openid,
+       cardinality(c.redirect_uris) = 0       AS missing_redirect_uri
+  FROM clients c
+ WHERE 'authorization_code' = ANY(c.grant_types)
+   AND (NOT ('openid' = ANY(c.default_scopes)) OR cardinality(c.redirect_uris) = 0);
+```
+
 - **Revocation endpoint가 503으로 답할 수 있습니다.** 폐기하지 못한 경우이며, RFC 7009 §2.2.1대로 호출자는 Token이 아직 살아 있다고 가정하고 재시도해야 합니다. 200만 정상으로 처리하는 RP 라이브러리는 이제 오류를 보게 됩니다 — **그것이 정확한 상태입니다.**
 - **204로 답하던 다섯 endpoint가 200에 본문을 실어 답할 수 있습니다.** 비밀번호 변경·재설정, 내 세션 종료, 관리자 세션 강제 종료, LDAP 공급자 삭제입니다. 요청은 요구받은 일을 했고 그에 딸린 동작이 실패한 경우이며, 본문이 무엇이 남았는지 말합니다. **204를 단정하는 클라이언트는 200도 받아들이도록 고쳐야 합니다.**
 - **LDAP 공급자 변경은 원래 200에 항목을 실어 답했고**, 이 경우에만 `users_signed_out`과 안내 문구 두 항목이 더해집니다. 상태 코드는 그대로이므로 기존 클라이언트는 영향받지 않습니다. 부분 실패로 끝날 수 있는 여섯 operation 모두 OpenAPI 문서에 기술되어 있습니다.
