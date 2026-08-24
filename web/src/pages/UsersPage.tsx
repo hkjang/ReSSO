@@ -96,9 +96,23 @@ export function UsersPage() {
     mutationFn: () => api<User>(`/api/admin/v1/realms/${selection.realmID}/users/${editForm!.id}`, { method: 'PUT', ...jsonBody({ email: editForm!.email, email_verified: editForm!.email_verified, display_name: editForm!.display_name, enabled: editForm!.enabled, manager_id: editForm!.manager_id || undefined }) }),
     onSuccess: async (saved) => { setSelected(saved); await invalidate() },
   })
+  // The server answers 204 when the sessions really ended and 200 with
+  // other_sessions_ended:false when they did not, because ending them can fail
+  // on its own after the password has already changed. The screen announced
+  // "reset the password and ended the sessions" for both — and an administrator
+  // resetting an account they believe is compromised is the person who most
+  // needs to hear that the sessions survived it.
+  const [resetPartial, setResetPartial] = useState('')
   const reset = useMutation({
-    mutationFn: () => api<void>(`/api/admin/v1/realms/${selection.realmID}/users/${selected!.id}/password`, { method: 'PUT', ...jsonBody({ new_password: resetPassword }) }),
-    onSuccess: () => setResetPassword(''),
+    mutationFn: () => api<{ other_sessions_ended?: boolean; message?: string } | undefined>(
+      `/api/admin/v1/realms/${selection.realmID}/users/${selected!.id}/password`,
+      { method: 'PUT', ...jsonBody({ new_password: resetPassword }) }),
+    onSuccess: (result) => {
+      setResetPassword('')
+      setResetPartial(result?.other_sessions_ended === false
+        ? result.message ?? '비밀번호는 재설정되었지만 이 계정의 세션을 종료하지 못했습니다.'
+        : '')
+    },
   })
   const unlock = useMutation({
     mutationFn: (user: User) => api<User>(`/api/admin/v1/realms/${selection.realmID}/users/${user.id}/unlock`, { method: 'POST' }),
@@ -205,7 +219,9 @@ export function UsersPage() {
               <Button variant="contained" onClick={() => saveRoles.mutate()} disabled={saveRoles.isPending}>Role 저장</Button>
             </Stack>}
           </Box>
-          <Box sx={{ borderTop: '1px solid', borderColor: 'divider', pt: 3 }}><Typography variant="h3">비밀번호 재설정</Typography><Typography variant="body2" color="text.secondary" sx={{ mt: .6, mb: 2 }}>{editForm.federation_id ? 'LDAP WRITABLE 공급자만 ReSSO에서 비밀번호를 변경할 수 있습니다. 성공하면 모든 로그인 세션이 종료됩니다.' : '재설정하면 이 사용자의 모든 로그인 세션이 종료됩니다.'}</Typography>{editForm.federation_id && <Alert severity="info" sx={{ mb: 2 }}>이 계정의 인증 원본은 LDAP입니다. READ_ONLY 또는 UNSYNCED라면 원본 디렉터리에서 변경하세요.</Alert>}{reset.error && <ErrorAlert error={reset.error} />}{reset.isSuccess && <Alert severity="success" sx={{ mb: 2 }}>비밀번호를 재설정하고 세션을 종료했습니다.</Alert>}<Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}><TextField label="새 비밀번호" type="password" autoComplete="new-password" value={resetPassword} onChange={(e) => setResetPassword(e.target.value)} /><Button color="warning" variant="outlined" onClick={() => reset.mutate()} disabled={reset.isPending || resetPassword.length < 8} sx={{ whiteSpace: 'nowrap' }}>재설정</Button></Stack></Box>
+          <Box sx={{ borderTop: '1px solid', borderColor: 'divider', pt: 3 }}><Typography variant="h3">비밀번호 재설정</Typography><Typography variant="body2" color="text.secondary" sx={{ mt: .6, mb: 2 }}>{editForm.federation_id ? 'LDAP WRITABLE 공급자만 ReSSO에서 비밀번호를 변경할 수 있습니다. 성공하면 모든 로그인 세션이 종료됩니다.' : '재설정하면 이 사용자의 모든 로그인 세션이 종료됩니다.'}</Typography>{editForm.federation_id && <Alert severity="info" sx={{ mb: 2 }}>이 계정의 인증 원본은 LDAP입니다. READ_ONLY 또는 UNSYNCED라면 원본 디렉터리에서 변경하세요.</Alert>}{reset.error && <ErrorAlert error={reset.error} />}{reset.isSuccess && (resetPartial
+              ? <Alert severity="warning" sx={{ mb: 2 }}>{resetPartial}</Alert>
+              : <Alert severity="success" sx={{ mb: 2 }}>비밀번호를 재설정하고 세션을 종료했습니다.</Alert>)}<Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}><TextField label="새 비밀번호" type="password" autoComplete="new-password" value={resetPassword} onChange={(e) => setResetPassword(e.target.value)} /><Button color="warning" variant="outlined" onClick={() => reset.mutate()} disabled={reset.isPending || resetPassword.length < 8} sx={{ whiteSpace: 'nowrap' }}>재설정</Button></Stack></Box>
         </Stack>}
       </DetailDrawer>
     </>

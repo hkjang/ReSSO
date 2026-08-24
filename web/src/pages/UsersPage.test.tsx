@@ -150,3 +150,30 @@ test('saving refreshes the form from the record the server returns', async () =>
 
   expect(await screen.findByDisplayValue('new@example.com')).toBeInTheDocument()
 })
+
+// Ending the sessions can fail on its own after the password has already
+// changed, which is why the server answers 200 with other_sessions_ended:false
+// instead of 204. The screen announced "reset the password and ended the
+// sessions" for both — and an administrator resetting an account they believe
+// is compromised is the person who most needs to hear that they survived it.
+test('a reset that could not end the sessions says so instead of claiming it did', async () => {
+  const user = userEvent.setup()
+  mocks.api.mockImplementation((path: string, init?: { method?: string }) => {
+    if (path.includes('/password') && init?.method === 'PUT') {
+      return Promise.resolve({ other_sessions_ended: false, message: '비밀번호는 재설정되었지만 이 계정의 세션을 종료하지 못했습니다.' })
+    }
+    if (path.includes('/role-mappings')) {
+      return Promise.resolve({ available_realm_roles: [], available_client_roles: [], realm_role_ids: [], federation_realm_role_ids: [], client_role_ids: [] })
+    }
+    if (path.includes('/users')) return Promise.resolve({ items: [legacyUser], total: 1 })
+    return Promise.resolve({ items: [] })
+  })
+  renderUsers()
+
+  await user.click(await screen.findByText('Alice'))
+  await user.type(await screen.findByLabelText('새 비밀번호'), 'a-new-password-1234')
+  await user.click(screen.getByRole('button', { name: '재설정' }))
+
+  expect(await screen.findByText('비밀번호는 재설정되었지만 이 계정의 세션을 종료하지 못했습니다.')).toBeInTheDocument()
+  expect(screen.queryByText('비밀번호를 재설정하고 세션을 종료했습니다.')).not.toBeInTheDocument()
+})
