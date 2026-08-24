@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"slices"
 	"strings"
@@ -247,13 +248,32 @@ func normalizeWebOrigins(values []string) ([]string, error) {
 		if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHostname(parsed.Hostname())) {
 			return nil, fmt.Errorf("%q must use HTTPS except for loopback development origins", value)
 		}
-		origin := strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)
+		origin := strings.ToLower(parsed.Scheme) + "://" + canonicalOriginHost(parsed)
 		if !seen[origin] {
 			normalized = append(normalized, origin)
 			seen[origin] = true
 		}
 	}
 	return normalized, nil
+}
+
+// canonicalOriginHost drops a port that is the scheme's default, because that
+// is the form a browser sends and therefore the only form that can ever match.
+// Keeping it meant an origin registered as https://app.example.com:443 was
+// accepted, displayed as saved, and never matched anything: the Origin header
+// carries https://app.example.com, so every cross-origin request from the
+// application it was registered for was refused with nothing to say why. The
+// two spellings are the same origin, so collapsing them cannot widen what is
+// allowed.
+func canonicalOriginHost(parsed *url.URL) string {
+	host := strings.ToLower(parsed.Hostname())
+	port := parsed.Port()
+	if port == "" ||
+		(parsed.Scheme == "https" && port == "443") ||
+		(parsed.Scheme == "http" && port == "80") {
+		return host
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func isLoopbackHostname(host string) bool {
