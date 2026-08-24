@@ -2673,3 +2673,129 @@ func TestIntegrationAnIntrospectionItCannotJudgeIsDistinguishable(t *testing.T) 
 		t.Errorf("an outage confined to introspection left no signal:\n%s", broken.String())
 	}
 }
+
+// Revoking an access token had no test that it works, only one that a failure
+// to record it is reported. The revocation handler decides between three
+// outcomes and this is the branch none of them covered, so the whole path from
+// "the client asks" to "the resource server is told no" could have broken
+// without a single test noticing.
+func TestIntegrationRevokingAnAccessTokenStopsItBeingAccepted(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "access-revoker", Name: "Revoker", Type: "confidential",
+		RedirectURIs: []string{"https://rp.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "holder", Password: "holder-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "revoke-access", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, client.Client, user, session.Session.ID,
+		[]string{"openid"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	introspect := func() bool {
+		t.Helper()
+		form := url.Values{"token": {tokens.AccessToken}, "client_id": {"access-revoker"},
+			"client_secret": {client.ClientSecret}}
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token/introspect", form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		var decoded map[string]any
+		if decodeErr := json.NewDecoder(response.Body).Decode(&decoded); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		active, _ := decoded["active"].(bool)
+		return active
+	}
+	userInfoStatus := func() int {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodGet,
+			server.URL+"/realms/master/protocol/openid-connect/userinfo", nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+
+	if !introspect() {
+		t.Fatal("a freshly issued access token was already inactive")
+	}
+	if status := userInfoStatus(); status != http.StatusOK {
+		t.Fatalf("userinfo refused a freshly issued token: %d", status)
+	}
+
+	form := url.Values{"token": {tokens.AccessToken}, "client_id": {"access-revoker"},
+		"client_secret": {client.ClientSecret}}
+	response, err := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/revoke", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("revoke answered %d, want 200", response.StatusCode)
+	}
+
+	if introspect() {
+		t.Error("introspection still reports a revoked access token as active")
+	}
+	if status := userInfoStatus(); status == http.StatusOK {
+		t.Error("userinfo still accepts a revoked access token")
+	}
+
+	// The trail has to say which kind of token went, and name it.
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "TOKEN_REVOKED", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(page.Items))
+	}
+	if page.Items[0].Result != "SUCCESS" {
+		t.Errorf("a revocation that worked recorded result=%s", page.Items[0].Result)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(page.Items[0].Detail, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail["revoked"] != "access_token" {
+		t.Errorf("the trail records revoked=%v, want access_token", detail["revoked"])
+	}
+	if detail["jti"] == nil {
+		t.Error("the trail does not name the token it revoked")
+	}
+}
