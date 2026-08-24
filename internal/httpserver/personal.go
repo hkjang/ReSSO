@@ -201,19 +201,34 @@ func (s *Server) revokeMySession(w http.ResponseWriter, r *http.Request) {
 	// Ownership is decided by the revoking statement itself. A session that is
 	// not this person's is reported as absent rather than refused, so the
 	// answer says nothing about whether it exists.
-	if err := s.store.RevokeOwnedSession(r.Context(), id, principal.UserID); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, r, http.StatusNotFound, "not_found", "세션을 찾을 수 없습니다.")
-			return
-		}
-		writeStoreError(w, r, err)
+	err = s.store.RevokeOwnedSession(r.Context(), id, principal.UserID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, r, http.StatusNotFound, "not_found", "세션을 찾을 수 없습니다.")
 		return
 	}
-	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "SESSION_REVOKE", "SUCCESS", "session", id.String(), nil)
+	// The session ending and its refresh tokens being revoked fail separately.
+	// Treating the second as a failure of the whole thing answered an error
+	// for a session that had ended, recorded nothing, and — when it was this
+	// browser's own session — left the cookies in place for a session that no
+	// longer works, so the next request fails in a way nobody can read.
+	var detail map[string]any
+	ended := err == nil
+	switch {
+	case err != nil && !errors.Is(err, store.ErrRefreshTokensNotRevoked):
+		writeStoreError(w, r, err)
+		return
+	case err != nil:
+		s.logger.Error("session ended without revoking its refresh tokens",
+			"trace_id", traceIDFrom(r.Context()), "session_id", id, "error", err)
+		detail = map[string]any{"session_revoked": true, "refresh_tokens_revoked": false, "error": err.Error()}
+	}
+	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "SESSION_REVOKE",
+		partialIfNot(ended), "session", id.String(), detail)
 	if principal.SessionID != nil && *principal.SessionID == id {
 		s.clearBrowserCookies(w, r)
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeSessionsEnded(w, ended,
+		"세션은 종료했지만 이 세션의 Refresh Token을 폐기하지 못했습니다. 연동 애플리케이션에서 계속 사용될 수 있습니다.")
 }
 
 func (s *Server) listMyAPIKeys(w http.ResponseWriter, r *http.Request) {

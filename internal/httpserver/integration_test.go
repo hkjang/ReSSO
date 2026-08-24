@@ -2914,3 +2914,107 @@ func TestIntegrationForcingASessionOutIsRecordedEvenWhenHalfOfItFails(t *testing
 		t.Errorf("the trail does not record the refresh tokens that survived: %v", detail)
 	}
 }
+
+// Ending one's own session has the same two halves, and the same handler shape
+// that treated the second failing as the whole thing failing: an error for a
+// session that had ended, nothing in the trail, and — when it is this browser's
+// own session — the cookies left in place for a session that no longer works,
+// so the next request fails in a way nobody can read.
+func TestIntegrationEndingMyOwnSessionSurvivesRefreshTokensItCannotRevoke(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "own-session", Name: "RP", Type: "confidential",
+		RedirectURIs: []string{"https://rp.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "own", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := mine.Session.ID
+	userID := bootstrap.AdminUserID
+	if _, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: client.Client.ID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at TO revoked_at_moved"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at_moved TO revoked_at"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(restore)
+
+	request, err := http.NewRequest(http.MethodDelete,
+		server.URL+"/api/v1/me/sessions/"+sessionID.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: "resso_session", Value: mine.Token})
+	request.Header.Set("X-CSRF-Token", mine.CSRFToken)
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	restore()
+
+	if response.StatusCode >= 500 {
+		t.Errorf("ending a session that really ended answered %d", response.StatusCode)
+	}
+	// It was this browser's own session, so its cookies have to go with it.
+	cleared := false
+	for _, cookie := range response.Cookies() {
+		if cookie.Name == "resso_session" && cookie.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Error("the browser kept a cookie for a session that no longer works")
+	}
+	var revoked bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT revoked_at IS NOT NULL FROM sso_sessions WHERE id=$1", sessionID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Fatal("the session was not revoked, so this is not measuring what it claims")
+	}
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "SESSION_REVOKE", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("ending a session left %d entries in the trail", len(page.Items))
+	}
+	if page.Items[0].Result != "PARTIAL" {
+		t.Errorf("the trail records result=%s for a sign-out that half worked", page.Items[0].Result)
+	}
+}
