@@ -109,7 +109,7 @@ func validateBackchannelLogoutURI(value string) (string, error) {
 
 func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClientInput) (domain.Client, error) {
 	if strings.TrimSpace(input.Name) == "" {
-		return domain.Client{}, errors.New("client name is required")
+		return domain.Client{}, invalidf("Client 표시 이름이 필요합니다.")
 	}
 	if err := requireOpenIDForLogins(input.GrantTypes, input.DefaultScopes); err != nil {
 		return domain.Client{}, err
@@ -165,7 +165,7 @@ func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClie
 func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input CreateClientInput) (CreatedClient, error) {
 	input.ClientID, input.Name, input.Type = strings.TrimSpace(input.ClientID), strings.TrimSpace(input.Name), strings.TrimSpace(input.Type)
 	if input.ClientID == "" || input.Name == "" || !slices.Contains([]string{"public", "confidential"}, input.Type) {
-		return CreatedClient{}, errors.New("client_id, name and a valid type are required")
+		return CreatedClient{}, invalidf("client_id와 이름, 그리고 public 또는 confidential 유형이 필요합니다.")
 	}
 	if len(input.GrantTypes) == 0 {
 		input.GrantTypes = []string{"authorization_code", "refresh_token"}

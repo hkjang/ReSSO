@@ -53,7 +53,7 @@ func (s *Store) ListRoles(ctx context.Context, realmID uuid.UUID) ([]Role, error
 func (s *Store) CreateRole(ctx context.Context, realmID uuid.UUID, name, description string) (Role, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return Role{}, errors.New("role name is required")
+		return Role{}, invalidf("Role 이름이 필요합니다.")
 	}
 	now := time.Now().UTC()
 	role := Role{ID: uuid.New(), RealmID: realmID, Name: name, Description: strings.TrimSpace(description), CreatedAt: now, UpdatedAt: now}
@@ -148,7 +148,7 @@ func nullableUUID(id uuid.UUID) *uuid.UUID {
 func (s *Store) CreateClientRole(ctx context.Context, realmID, clientID uuid.UUID, name, description string) (ClientRole, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return ClientRole{}, errors.New("client role name is required")
+		return ClientRole{}, invalidf("Client Role 이름이 필요합니다.")
 	}
 	role := ClientRole{ID: uuid.New(), ClientID: clientID, Name: name,
 		Description: strings.TrimSpace(description), CreatedAt: time.Now().UTC()}

@@ -147,7 +147,7 @@ func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateU
 	}
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 	if input.Username == "" || input.Password == "" {
-		return domain.User{}, errors.New("username and password are required")
+		return domain.User{}, invalidf("사용자 이름과 비밀번호가 필요합니다.")
 	}
 	var minLength int
 	if err := s.Pool.QueryRow(ctx, "SELECT password_min_length FROM realms WHERE id=$1", realmID).Scan(&minLength); err != nil {
@@ -361,7 +361,7 @@ func (s *Store) ChangePassword(ctx context.Context, userID uuid.UUID, current, r
 	if !adminReset && user.FederationID == nil {
 		ok, err := password.VerifyContext(ctx, current, hash)
 		if err != nil || !ok {
-			return errors.New("current password is incorrect")
+			return invalidf("현재 비밀번호가 올바르지 않습니다.")
 		}
 	}
 	var minLength int
@@ -369,7 +369,7 @@ func (s *Store) ChangePassword(ctx context.Context, userID uuid.UUID, current, r
 		return err
 	}
 	if len([]rune(replacement)) < minLength {
-		return fmt.Errorf("new password must contain at least %d characters", minLength)
+		return invalidf("새 비밀번호는 %d자 이상이어야 합니다.", minLength)
 	}
 	if user.FederationID != nil {
 		if err := s.changeFederatedPassword(ctx, user, current, replacement); err != nil {

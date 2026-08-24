@@ -190,11 +190,7 @@ func (s *Server) adminCreateRealm(w http.ResponseWriter, r *http.Request) {
 	}
 	realm, err := s.store.CreateRealm(r.Context(), input)
 	if err != nil {
-		if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrInvalidInput) {
-			writeStoreError(w, r, err)
-			return
-		}
-		writeError(w, r, http.StatusBadRequest, "realm_creation_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	if err := s.store.EnsureActiveSigningKey(r.Context(), realm.ID); err != nil {
@@ -229,11 +225,7 @@ func (s *Server) adminUpdateRealm(w http.ResponseWriter, r *http.Request) {
 	}
 	realm, err := s.store.UpdateRealm(r.Context(), id, input)
 	if err != nil {
-		if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrInvalidInput) {
-			writeStoreError(w, r, err)
-			return
-		}
-		writeError(w, r, http.StatusBadRequest, "realm_update_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	s.audit(r, &id, &principal.UserID, principal.Username, "REALM_UPDATE", "SUCCESS", "realm", id.String(), map[string]any{"approval_enabled": realm.ApprovalEnabled})
@@ -275,11 +267,7 @@ func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 			writeStoreError(w, r, err)
 			return
 		}
-		if errors.Is(err, store.ErrConflict) {
-			writeStoreError(w, r, err)
-			return
-		}
-		writeError(w, r, http.StatusBadRequest, "user_creation_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	principal, _ := principalFrom(r.Context())
@@ -366,7 +354,7 @@ func (s *Server) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusBadGateway, "ldap_password_update_failed", "LDAP 디렉터리에서 비밀번호를 변경하지 못했습니다.")
 			return
 		}
-		writeError(w, r, http.StatusBadRequest, "password_reset_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	ended, detail := s.endOtherSessions(r, userID, nil)
@@ -401,11 +389,7 @@ func (s *Server) adminCreateClient(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := s.store.CreateClient(r.Context(), realmID, input)
 	if err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			writeStoreError(w, r, err)
-			return
-		}
-		writeError(w, r, http.StatusBadRequest, "client_creation_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	principal, _ := principalFrom(r.Context())
@@ -495,11 +479,7 @@ func (s *Server) adminCreateRole(w http.ResponseWriter, r *http.Request) {
 	}
 	role, err := s.store.CreateRole(r.Context(), realmID, input.Name, input.Description)
 	if err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			writeStoreError(w, r, err)
-			return
-		}
-		writeError(w, r, http.StatusBadRequest, "role_creation_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	principal, _ := principalFrom(r.Context())
@@ -590,11 +570,7 @@ func (s *Server) adminCreateClientRole(w http.ResponseWriter, r *http.Request) {
 	}
 	role, err := s.store.CreateClientRole(r.Context(), realmID, clientID, input.Name, input.Description)
 	if err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			writeStoreError(w, r, err)
-			return
-		}
-		writeError(w, r, http.StatusBadRequest, "client_role_creation_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	principal, _ := principalFrom(r.Context())

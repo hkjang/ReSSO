@@ -164,7 +164,7 @@ func (s *Store) CreateRealm(ctx context.Context, input CreateRealmInput) (domain
 			"Realm 이름은 소문자·숫자·하이픈만 쓸 수 있고 소문자나 숫자로 시작해야 합니다 (최대 63자)")
 	}
 	if realm.Name == "" || realm.DisplayName == "" || realm.IssuerURL == "" {
-		return domain.Realm{}, errors.New("name, display_name and issuer_url are required")
+		return domain.Realm{}, invalidf("name, display_name, issuer_url이 모두 필요합니다.")
 	}
 	if err := validateIssuerURL(realm.IssuerURL); err != nil {
 		return domain.Realm{}, err
@@ -288,11 +288,11 @@ func (s *Store) UpdateRealm(ctx context.Context, id uuid.UUID, input UpdateRealm
 func validateIssuerURL(value string) error {
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return errors.New("issuer_url must be an absolute URL without query or fragment")
+		return invalidf("issuer_url은 query나 fragment가 없는 절대 URL이어야 합니다.")
 	}
 	host := parsed.Hostname()
 	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && (host == "localhost" || host == "127.0.0.1" || host == "::1")) {
-		return errors.New("issuer_url must use HTTPS except for localhost development")
+		return invalidf("issuer_url은 localhost 개발용을 제외하면 HTTPS여야 합니다.")
 	}
 	return nil
 }

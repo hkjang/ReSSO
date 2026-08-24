@@ -95,7 +95,7 @@ func (s *Server) changeMyPassword(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusBadGateway, "ldap_password_update_failed", "LDAP 디렉터리에서 비밀번호를 변경하지 못했습니다.")
 			return
 		}
-		writeError(w, r, http.StatusBadRequest, "password_change_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	ended, detail := s.endOtherSessions(r, principal.UserID, principal.SessionID)

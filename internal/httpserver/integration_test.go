@@ -1883,11 +1883,22 @@ func TestIntegrationPasswordChangeAdmitsWhenSessionsSurvive(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, detail := lastAudit()
-	if result != "PARTIAL" {
-		t.Errorf("the audit entry reads %s, want PARTIAL", result)
-	}
-	if detail["other_sessions_ended"] != false || detail["error"] == nil {
-		t.Errorf("the audit entry does not record what failed: %v", detail)
+	if result != "PARTIAL" || detail["other_sessions_ended"] != false || detail["error"] == nil {
+		// This has failed intermittently, and "SUCCESS with an empty detail"
+		// means the revoking UPDATE matched no row rather than being blocked.
+		// Whatever the cause, the next occurrence should say which of those it
+		// was instead of leaving it to be re-run.
+		var liveNow, blockedByTrigger int
+		if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM sso_sessions
+			WHERE user_id=$1 AND revoked_at IS NULL`, bootstrap.AdminUserID).Scan(&liveNow); err != nil {
+			t.Fatal(err)
+		}
+		if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_trigger
+			WHERE tgname='block_revocation' AND NOT tgisinternal`).Scan(&blockedByTrigger); err != nil {
+			t.Fatal(err)
+		}
+		t.Errorf("audit=%s detail=%v; live sessions before the change=%d, now=%d, trigger present=%d",
+			result, detail, liveBeforeChange, liveNow, blockedByTrigger)
 	}
 }
 
@@ -3943,5 +3954,89 @@ func TestIntegrationRoleMappingFailuresDoNotLeakDatabaseText(t *testing.T) {
 	}
 	if status == http.StatusBadRequest {
 		t.Errorf("a write that failed on our side was reported as a bad request: %d %v", status, body)
+	}
+}
+
+// Every administrative write that can fail has two kinds of failure: what the
+// caller sent, and what happened on our side. The first is theirs to fix and is
+// said in words; the second is ours and must not arrive as database text under
+// a status blaming them. This walks the writes that used to echo whatever came
+// back and requires both halves of that.
+func TestIntegrationAdminWriteFailuresExplainOrStayQuiet(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	admin, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "admin", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func(method, path, body string) (int, string) {
+		t.Helper()
+		request, requestErr := http.NewRequest(method, server.URL+path, strings.NewReader(body))
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.AddCookie(&http.Cookie{Name: "resso_session", Value: admin.Token})
+		request.Header.Set("X-CSRF-Token", admin.CSRFToken)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		decoded := map[string]any{}
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		message, _ := decoded["message"].(string)
+		return response.StatusCode, message
+	}
+
+	realm := "/api/admin/v1/realms/" + bootstrap.RealmID.String()
+	for _, sent := range []struct{ what, method, path, body, expect string }{
+		{"a Realm with no name", http.MethodPost, "/api/admin/v1/realms",
+			`{"name":"","display_name":"","issuer_url":""}`, "필요"},
+		{"a Realm with a plaintext issuer", http.MethodPost, "/api/admin/v1/realms",
+			`{"name":"plain","display_name":"Plain","issuer_url":"http://plain.example.test/realms/plain"}`, "HTTPS"},
+		{"a Client with no name", http.MethodPost, realm + "/clients",
+			`{"client_id":"x","name":"","type":"public","redirect_uris":["https://x.example.test/cb"]}`, "필요"},
+		{"a Role with no name", http.MethodPost, realm + "/roles", `{"name":"","description":""}`, "필요"},
+		{"a user with no password", http.MethodPost, realm + "/users",
+			`{"username":"nopass","email":"","display_name":"No Pass","password":"","enabled":true}`, "필요"},
+	} {
+		status, message := send(sent.method, sent.path, sent.body)
+		if status != http.StatusBadRequest {
+			t.Errorf("%s answered %d, want 400", sent.what, status)
+		}
+		if !strings.Contains(message, sent.expect) {
+			t.Errorf("%s was refused with %q, which does not say what to fix", sent.what, message)
+		}
+	}
+
+	// Now a failure on our side, on one of the same routes.
+	if _, err := data.Pool.Exec(ctx, `CREATE FUNCTION block_role_create() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'role creation blocked'; END $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `CREATE TRIGGER block_role_create BEFORE INSERT ON roles
+		FOR EACH ROW EXECUTE FUNCTION block_role_create()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "DROP TRIGGER IF EXISTS block_role_create ON roles")
+	})
+	status, message := send(http.MethodPost, realm+"/roles", `{"name":"blocked","description":""}`)
+	for _, trace := range []string{"SQLSTATE", "ERROR:", "role creation blocked"} {
+		if strings.Contains(message, trace) {
+			t.Errorf("a failed write quoted the database (%q): %q", trace, message)
+		}
+	}
+	if status == http.StatusBadRequest {
+		t.Errorf("a write that failed on our side was reported as a bad request: %d %q", status, message)
 	}
 }
