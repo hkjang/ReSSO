@@ -218,3 +218,62 @@ func TestShutdownStopsFurtherRetries(t *testing.T) {
 		t.Errorf("shutdown waited out a backoff: %s", elapsed)
 	}
 }
+
+// A relying party in the middle of a restart usually accepts the connection and
+// then says nothing, so the attempt ends on its timeout rather than a refusal.
+// That is precisely the case the retry policy exists for, and it was the case
+// the policy could not serve: one number was both the per-attempt timeout and
+// the budget for the whole sequence, so a first attempt that stalled spent
+// every retry it had coming and the logout was lost.
+func TestAStalledFirstAttemptStillGetsItsRetries(t *testing.T) {
+	shortenBackoff(t)
+	originalTimeout := attemptTimeout
+	attemptTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { attemptTimeout = originalTimeout })
+
+	var attempts atomic.Int32
+	released := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			select {
+			case <-released:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer func() { close(released); server.Close() }()
+
+	notifier := New(context.Background(), nil, nil, slog.New(slog.DiscardHandler), nil)
+	notifier.client.Timeout = 0 // the per-attempt context is what has to bound this
+	ctx, cancel := notifier.deliveryContext()
+	defer cancel()
+	notifier.post(ctx, "master", "rp", server.URL, "signed.logout.token")
+
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("delivery was attempted %d times, want 2: a stalled attempt must not consume the retries", got)
+	}
+}
+
+// The budget for one notification has to be read off the retry policy. Fixing a
+// number here and changing the policy there is how the two came apart before.
+func TestDeliveryBudgetCoversEveryAttemptAndWait(t *testing.T) {
+	required := time.Duration(len(retryBackoff)+1) * attemptTimeout
+	for _, wait := range retryBackoff {
+		required += wait
+	}
+	notifier := New(context.Background(), nil, nil, slog.New(slog.DiscardHandler), nil)
+	ctx, cancel := notifier.deliveryContext()
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("a delivery context carries no deadline")
+	}
+	// The deadline is already ticking by the time it is read, so a moment of
+	// slack keeps this measuring the policy rather than the clock.
+	if granted := time.Until(deadline); granted < required-time.Second {
+		t.Fatalf("a delivery is granted %s, want at least %s (%d attempts of %s plus the waits)",
+			granted.Round(time.Second), required, len(retryBackoff)+1, attemptTimeout)
+	}
+}

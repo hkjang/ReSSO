@@ -27,7 +27,6 @@ import (
 const MetricName = "resso_backchannel_logout_total"
 
 const (
-	deliveryTimeout    = 10 * time.Second
 	maximumConcurrency = 8
 	// A revocation burst (an administrator disabling an account with many
 	// sessions) must not queue unbounded work. Excess notifications are
@@ -59,7 +58,7 @@ func New(ctx context.Context, data *store.Store, service *oidc.Service, logger *
 		oidc:   service,
 		logger: logger,
 		client: &http.Client{
-			Timeout: deliveryTimeout,
+			Timeout: attemptTimeout,
 			// Logout endpoints answer directly; following a redirect would
 			// forward a signed token to an address the client never registered.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -112,6 +111,26 @@ func (n *Notifier) Wait(timeout time.Duration) {
 	}
 }
 
+// deliveryBudget is what one notification may spend in total: every attempt at
+// its full timeout, plus the waits between them.
+//
+// Sizing it from the retry policy rather than picking a number is the point.
+// One number used to serve as both the per-attempt timeout and the budget for
+// the whole sequence, so the retries the policy describes could not all run:
+// two attempts and the second backoff exactly exhausted it, the third never
+// happened, and the last eight seconds were spent waiting for a retry that had
+// already been ruled out. A relying party that accepts the connection and then
+// stalls — which is what restarting usually looks like — spent the entire
+// budget on the first attempt and got no retry at all, the very case the retry
+// was written for.
+func deliveryBudget() time.Duration {
+	total := time.Duration(len(retryBackoff)+1) * attemptTimeout
+	for _, wait := range retryBackoff {
+		total += wait
+	}
+	return total
+}
+
 // deliveryContext bounds one notification.
 //
 // It deliberately outlives cancellation of the base context. Shutdown cancels
@@ -119,22 +138,28 @@ func (n *Notifier) Wait(timeout time.Duration) {
 // way was abandoned mid-request — the user had logged out, ReSSO had ended the
 // session, and the relying party was never told, leaving them signed in there.
 // Wait exists to give exactly these deliveries a bounded moment to finish, and
-// it was waiting on work that had already given up. The per-attempt timeout
-// still bounds this, and it matches the budget Wait allows.
+// it was waiting on work that had already given up. Shutdown still stops the
+// sequence after the attempt in hand, so what Wait actually has to cover is one
+// attempt — not this whole budget.
 func (n *Notifier) deliveryContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(n.base), deliveryTimeout)
+	return context.WithTimeout(context.WithoutCancel(n.base), deliveryBudget())
 }
 
 func (n *Notifier) deliver(revoked store.RevokedSession) {
 	ctx, cancel := n.deliveryContext()
 	defer cancel()
-	realm, err := n.store.RealmByID(ctx, revoked.RealmID)
+	// The lookups are not deliveries and get one attempt's worth of time; a
+	// database that is slow to answer must not spend the budget the relying
+	// parties are waiting on.
+	lookupCtx, cancelLookup := context.WithTimeout(ctx, attemptTimeout)
+	defer cancelLookup()
+	realm, err := n.store.RealmByID(lookupCtx, revoked.RealmID)
 	if err != nil {
 		n.logger.Warn("back-channel logout skipped: Realm is unavailable",
 			"realm_id", revoked.RealmID, "error", err)
 		return
 	}
-	targets, err := n.store.BackchannelLogoutTargets(ctx, revoked.RealmID, revoked.SessionID)
+	targets, err := n.store.BackchannelLogoutTargets(lookupCtx, revoked.RealmID, revoked.SessionID)
 	if err != nil {
 		n.logger.Warn("back-channel logout target lookup failed",
 			"realm_id", revoked.RealmID, "session_id", revoked.SessionID, "error", err)
@@ -143,6 +168,7 @@ func (n *Notifier) deliver(revoked store.RevokedSession) {
 	if len(targets) == 0 {
 		return
 	}
+	cancelLookup()
 	gate := make(chan struct{}, maximumConcurrency)
 	var group sync.WaitGroup
 	for _, client := range targets {
@@ -169,6 +195,10 @@ func (n *Notifier) deliver(revoked store.RevokedSession) {
 // Retrying is only useful for failures that can clear on their own, so a
 // refusal by the relying party is taken at its word.
 var retryBackoff = []time.Duration{2 * time.Second, 8 * time.Second}
+
+// attemptTimeout bounds one delivery attempt. It is a variable so the tests can
+// drive the same knob the retry policy is sized from.
+var attemptTimeout = 10 * time.Second
 
 func (n *Notifier) post(ctx context.Context, realmName, clientID, endpoint, token string) {
 	for attempt := 0; ; attempt++ {
@@ -202,8 +232,12 @@ func (n *Notifier) post(ctx context.Context, realmName, clientID, endpoint, toke
 // attempt performs one delivery and reports its outcome and whether another
 // try could plausibly succeed.
 func (n *Notifier) attempt(ctx context.Context, realmName, clientID, endpoint, token string) (string, bool) {
+	// Each attempt gets its own deadline. Sharing the sequence's deadline let a
+	// single stalled relying party consume every retry it had coming.
+	attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+	defer cancel()
 	body := strings.NewReader(url.Values{"logout_token": {token}}.Encode())
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
+	request, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, endpoint, body)
 	if err != nil {
 		n.logger.Error("back-channel logout request could not be built",
 			"realm", realmName, "client", clientID, "error", err)
@@ -211,6 +245,8 @@ func (n *Notifier) attempt(ctx context.Context, realmName, clientID, endpoint, t
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Cache-Control", "no-store")
+	// Retryability is decided by the sequence's context, not this attempt's:
+	// an attempt that ran out of time is exactly the case worth repeating.
 	response, err := n.client.Do(request)
 	if err != nil {
 		// Unreachable, refused or timed out: the relying party may be
