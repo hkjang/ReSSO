@@ -283,7 +283,8 @@ func (s *Store) loadActivePrivateKey(ctx context.Context, realmID uuid.UUID) (*r
 // The per-Realm cache can still serve a key for its own lifetime past that
 // moment, which is bounded by signingKeyTTL rather than by an hour.
 func (s *Store) ListSigningKeys(ctx context.Context, realmID uuid.UUID) ([]domain.SigningKey, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id,realm_id,kid,algorithm,status,public_jwk,created_at,retire_at
+	rows, err := s.Pool.Query(ctx, `SELECT id,realm_id,kid,algorithm,status,public_jwk,created_at,retire_at,
+        GREATEST(0, EXTRACT(day FROM now()-created_at))::int
         FROM signing_keys WHERE realm_id=$1 AND status <> 'RETIRED'
         AND (retire_at IS NULL OR retire_at > now()) ORDER BY created_at DESC`, realmID)
 	if err != nil {
@@ -294,7 +295,7 @@ func (s *Store) ListSigningKeys(ctx context.Context, realmID uuid.UUID) ([]domai
 	for rows.Next() {
 		var key domain.SigningKey
 		if err := rows.Scan(&key.ID, &key.RealmID, &key.KID, &key.Algorithm, &key.Status,
-			&key.PublicJWK, &key.CreatedAt, &key.RetireAt); err != nil {
+			&key.PublicJWK, &key.CreatedAt, &key.RetireAt, &key.AgeDays); err != nil {
 			return nil, err
 		}
 		keys = append(keys, key)

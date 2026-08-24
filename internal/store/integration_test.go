@@ -5028,3 +5028,50 @@ func TestIntegrationLDAPAuthenticationTestSeparatesUnreachableFromRejected(t *te
 		t.Errorf("an unreachable directory was reported as a rejected credential: %v", err)
 	}
 }
+
+// The dashboard counts aged signing keys with the database's clock, and the
+// screen that lists them worked the age out from the browser's. Two clocks
+// deciding one fact is what the shared advisory threshold already exists to
+// prevent — it was solved for the number and not for the age, so a machine
+// running fast showed a key as overdue that the dashboard did not count.
+func TestIntegrationSigningKeyAgeComesFromTheDatabase(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := data.ListSigningKeys(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh) != 1 || fresh[0].AgeDays != 0 {
+		t.Fatalf("a key created just now reports an age of %v days", fresh)
+	}
+
+	// Age it in the database only. Nothing about this process's clock changes,
+	// which is the point: the answer follows the database.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE signing_keys SET created_at=now()-interval '200 days' WHERE realm_id=$1`,
+		bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	aged, err := data.ListSigningKeys(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aged) != 1 || aged[0].AgeDays != 200 {
+		t.Fatalf("a key created 200 days ago reports %d days", aged[0].AgeDays)
+	}
+
+	// And it is the same clock the readiness count uses, so the two agree.
+	var counted int
+	if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM signing_keys k JOIN realms r ON r.id=k.realm_id
+		WHERE k.status='ACTIVE' AND r.enabled=true AND k.created_at < now()-make_interval(days => 180)
+		AND k.realm_id=$1`, bootstrap.RealmID).Scan(&counted); err != nil {
+		t.Fatal(err)
+	}
+	if counted != 1 {
+		t.Errorf("the dashboard counts %d aged keys while the listing reports %d days", counted, aged[0].AgeDays)
+	}
+}

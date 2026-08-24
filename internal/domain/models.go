@@ -153,6 +153,12 @@ type SigningKey struct {
 	PublicJWK json.RawMessage `json:"public_jwk"`
 	CreatedAt time.Time       `json:"created_at"`
 	RetireAt  *time.Time      `json:"retire_at,omitempty"`
+	// AgeDays is how old the key is according to the database, which is the
+	// clock the dashboard counts aged keys with. The console worked it out
+	// from the browser's clock, so the screen listing a key and the dashboard
+	// counting it could reach different verdicts about the same key — the
+	// disagreement the advisory threshold is already shared to avoid.
+	AgeDays int `json:"age_days"`
 }
 
 type ApprovalRequest struct {

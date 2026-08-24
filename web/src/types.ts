@@ -139,6 +139,9 @@ export interface SigningKey {
   status: string
   created_at: string
   retire_at?: string
+  // Decided by the database, the same clock the dashboard counts aged keys
+  // with, so the two screens cannot disagree about one key.
+  age_days: number
 }
 
 export interface Role {
