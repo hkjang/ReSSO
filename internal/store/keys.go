@@ -254,9 +254,25 @@ func (s *Store) loadActivePrivateKey(ctx context.Context, realmID uuid.UUID) (*r
 	return privateKey, key, nil
 }
 
+// ListSigningKeys returns the keys of a Realm that are still in effect: the
+// JWKS document, signature verification and the console all read this.
+//
+// A key is out of effect the moment retire_at passes, and that moment is now
+// what decides it. Only the status column used to, and nothing writes that
+// column except the hourly retention pass — so a key stayed published, stayed
+// accepted, and stayed on the console as PASSIVE for up to an hour after the
+// time it was retired, next to a column stating the retirement time that had
+// already gone by. Rotation is what an operator reaches for when a key may
+// have leaked, and the window it promises is not one to leave in the hands of
+// a job that exists to delete old rows. The retention pass still marks the
+// status so the row records what happened; it no longer decides it.
+//
+// The per-Realm cache can still serve a key for its own lifetime past that
+// moment, which is bounded by signingKeyTTL rather than by an hour.
 func (s *Store) ListSigningKeys(ctx context.Context, realmID uuid.UUID) ([]domain.SigningKey, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT id,realm_id,kid,algorithm,status,public_jwk,created_at,retire_at
-        FROM signing_keys WHERE realm_id=$1 AND status <> 'RETIRED' ORDER BY created_at DESC`, realmID)
+        FROM signing_keys WHERE realm_id=$1 AND status <> 'RETIRED'
+        AND (retire_at IS NULL OR retire_at > now()) ORDER BY created_at DESC`, realmID)
 	if err != nil {
 		return nil, err
 	}

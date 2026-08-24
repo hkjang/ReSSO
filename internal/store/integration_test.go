@@ -4333,3 +4333,60 @@ func TestIntegrationAnInventedKeyIdentifierDoesNotForceAReadPerRequest(t *testin
 		t.Errorf("100 invented identifiers took %d connection acquisitions; the floor is not holding", reads)
 	}
 }
+
+// Rotation states how long the previous key stays accepted, and writes that
+// moment to retire_at. Nothing read it. The status column decided instead, and
+// the only thing that writes the status is the hourly retention pass — so the
+// retired key stayed in the JWKS, stayed accepted, and stayed on the console
+// as PASSIVE for up to an hour past the retirement time the console was
+// displaying in the same row. Rotation is what an operator reaches for when a
+// key may have leaked; the window it promises should not depend on a job whose
+// purpose is deleting old rows.
+func TestIntegrationAKeyIsOutOfEffectTheMomentItRetires(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	_, retiring, err := data.ActivePrivateKey(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.RotateSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	if key, err := data.SigningKeyByKID(ctx, bootstrap.RealmID, retiring.KID); err != nil {
+		t.Fatalf("the rotated key is refused before its retirement: %v (%s)", err, key.KID)
+	}
+
+	// The retirement moment arrives. The retention pass has not run.
+	if _, err := data.Pool.Exec(ctx, `UPDATE signing_keys SET retire_at=now()-interval '1 minute'
+        WHERE realm_id=$1 AND status='PASSIVE'`, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	data.InvalidateSigningKeys(bootstrap.RealmID)
+
+	published, err := data.PublishedSigningKeys(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := findSigningKey(published, retiring.KID); found {
+		t.Errorf("the JWKS still publishes %s after its retirement", retiring.KID)
+	}
+	if _, err := data.SigningKeyByKID(ctx, bootstrap.RealmID, retiring.KID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a token signed with the retired key still verifies: err = %v", err)
+	}
+	// The console reads the same list, so it cannot show a key as PASSIVE
+	// beside a retirement time that has already gone by.
+	listed, err := data.ListSigningKeys(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := findSigningKey(listed, retiring.KID); found {
+		t.Errorf("the console still lists %s as live after its retirement", retiring.KID)
+	}
+	if len(listed) != 1 {
+		t.Errorf("keys in effect = %d, want only the active one", len(listed))
+	}
+}
