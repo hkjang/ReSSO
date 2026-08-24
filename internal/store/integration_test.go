@@ -3887,3 +3887,68 @@ func TestIntegrationBootstrapDoesNotUndoAnAdministratorsDecisions(t *testing.T) 
 			created, enabled, admin)
 	}
 }
+
+// The trigram indexes are optional and created one statement at a time, and
+// the first failure used to return, leaving the rest uncreated. The caller
+// logs a single line either way, so a search by e-mail or display name went on
+// scanning the whole table with nothing to say which of the three was missing —
+// the same shape as the retention sweep stopping at its first failure.
+func TestIntegrationSearchIndexesAreAllAttempted(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	_ = bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+
+	var extensionPresent bool
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_trgm')`).Scan(&extensionPresent); err != nil {
+		t.Fatal(err)
+	}
+	if !extensionPresent {
+		t.Skip("pg_trgm is not installed in this database")
+	}
+	indexed, err := data.EnsureSearchIndexes(ctx)
+	if err != nil || !indexed {
+		t.Fatalf("creating the search indexes reported indexed=%v err=%v", indexed, err)
+	}
+	present := func() int {
+		t.Helper()
+		var count int
+		if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes
+			WHERE schemaname=current_schema() AND indexname IN
+			('idx_users_username_trgm','idx_users_email_trgm','idx_users_display_name_trgm')`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	if present() != 3 {
+		t.Fatalf("only %d of the three search indexes exist", present())
+	}
+
+	// Take them away, then make the middle statement fail. The one before it
+	// must still have been created and — the point — the one after it too.
+	for _, name := range []string{"idx_users_username_trgm", "idx_users_email_trgm", "idx_users_display_name_trgm"} {
+		if _, err := data.Pool.Exec(ctx, "DROP INDEX "+name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE users RENAME COLUMN email TO email_renamed"); err != nil {
+		t.Fatal(err)
+	}
+	indexed, err = data.EnsureSearchIndexes(ctx)
+	if _, restoreErr := data.Pool.Exec(ctx,
+		"ALTER TABLE users RENAME COLUMN email_renamed TO email"); restoreErr != nil {
+		t.Fatal(restoreErr)
+	}
+	if err == nil {
+		t.Fatal("an index that could not be created was reported as created")
+	}
+	if indexed {
+		t.Error("indexed was reported true while one index could not be created")
+	}
+	if !strings.Contains(err.Error(), "email") {
+		t.Errorf("the failure does not name which index it was: %v", err)
+	}
+	if present() != 2 {
+		t.Errorf("%d of the two possible indexes exist; the run stopped at the failure", present())
+	}
+}

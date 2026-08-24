@@ -39,16 +39,24 @@ func (s *Store) EnsureSearchIndexes(ctx context.Context) (bool, error) {
 	// The operator class is schema-qualified from the catalog rather than
 	// resolved through search_path, so an extension installed outside the
 	// application's search_path still works.
-	statements := []string{
-		`CREATE INDEX IF NOT EXISTS idx_users_username_trgm ON users USING gin (lower(username) %s.gin_trgm_ops)`,
-		`CREATE INDEX IF NOT EXISTS idx_users_email_trgm ON users USING gin (lower(email) %s.gin_trgm_ops)`,
-		`CREATE INDEX IF NOT EXISTS idx_users_display_name_trgm ON users USING gin (lower(display_name) %s.gin_trgm_ops)`,
+	// Each index is attempted and the failures reported together. Returning at
+	// the first one left the rest uncreated while the caller logged a single
+	// line, so a search by e-mail or display name went on scanning the whole
+	// table with nothing to say which of the three was missing.
+	indexes := []struct{ column, statement string }{
+		{"username", `CREATE INDEX IF NOT EXISTS idx_users_username_trgm ON users USING gin (lower(username) %s.gin_trgm_ops)`},
+		{"email", `CREATE INDEX IF NOT EXISTS idx_users_email_trgm ON users USING gin (lower(email) %s.gin_trgm_ops)`},
+		{"display name", `CREATE INDEX IF NOT EXISTS idx_users_display_name_trgm ON users USING gin (lower(display_name) %s.gin_trgm_ops)`},
 	}
 	quoted := quoteIdentifier(extensionSchema)
-	for _, statement := range statements {
-		if _, err := s.Pool.Exec(ctx, fmt.Sprintf(statement, quoted)); err != nil {
-			return false, fmt.Errorf("create trigram search index: %w", err)
+	var failures []error
+	for _, index := range indexes {
+		if _, err := s.Pool.Exec(ctx, fmt.Sprintf(index.statement, quoted)); err != nil {
+			failures = append(failures, fmt.Errorf("search index on %s: %w", index.column, err))
 		}
+	}
+	if len(failures) > 0 {
+		return false, errors.Join(failures...)
 	}
 	return true, nil
 }
