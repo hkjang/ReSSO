@@ -3549,3 +3549,97 @@ func TestIntegrationMCPChallengePointsSomewhereThatWorks(t *testing.T) {
 			scope[1], response.StatusCode)
 	}
 }
+
+// Every federation route takes a Realm and a provider in its path, and the two
+// have to belong together. The middleware only checks that the caller may act
+// on the Realm named, so the shape that matters is a coherent Realm paired with
+// somebody else's provider — which is what an administrator of one tenant would
+// send to reach another's directory configuration, bind DN and sync controls.
+//
+// Six routes carry that pair. Reading each one and finding a check is not the
+// same as the check working, and a route added later is exactly the one that
+// would be missed.
+func TestIntegrationFederationRoutesRefuseAProviderFromAnotherRealm(t *testing.T) {
+	directory := "ldap://127.0.0.1:1"
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := data.CreateRealm(ctx, store.CreateRealmInput{
+		Name: "other-tenant", DisplayName: "Other", IssuerURL: "https://other.example.test/realms/other-tenant"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, theirs.ID, store.LDAPFederationInput{
+		Name: "theirs", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn", ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	admin, err := data.CreateSession(ctx, mine.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "admin", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// My Realm in the path, their provider as the identifier.
+	base := "/api/admin/v1/realms/" + mine.ID.String() + "/user-federations/" + provider.ID.String()
+	for _, attempt := range []struct{ method, path, body string }{
+		{http.MethodGet, base, ""},
+		{http.MethodPut, base, `{"name":"taken","vendor":"OTHER","connection_url":"ldap://127.0.0.1:1",` +
+			`"bind_dn":"cn=admin,dc=example,dc=test","users_dn":"ou=people,dc=example,dc=test",` +
+			`"username_ldap_attribute":"uid","rdn_ldap_attribute":"uid","uuid_ldap_attribute":"entryUUID",` +
+			`"user_object_classes":["inetOrgPerson"],"search_scope":"SUBTREE","batch_size":100,` +
+			`"edit_mode":"READ_ONLY","missing_user_action":"KEEP","enabled":true}`},
+		{http.MethodDelete, base, ""},
+		{http.MethodPost, base + "/test-connection", ""},
+		{http.MethodPost, base + "/test-authentication", `{"username":"alice","password":"x"}`},
+		{http.MethodPost, base + "/sync", ""},
+	} {
+		var body io.Reader
+		if attempt.body != "" {
+			body = strings.NewReader(attempt.body)
+		}
+		request, requestErr := http.NewRequest(attempt.method, server.URL+attempt.path, body)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.AddCookie(&http.Cookie{Name: "resso_session", Value: admin.Token})
+		request.Header.Set("X-CSRF-Token", admin.CSRFToken)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			t.Errorf("%s %s answered %d for another Realm's provider, want 404",
+				attempt.method, attempt.path, response.StatusCode)
+		}
+	}
+
+	// The provider is untouched by any of it.
+	after, err := data.LDAPFederationByID(ctx, provider.ID)
+	if err != nil {
+		t.Fatalf("the provider was removed by a request from another Realm: %v", err)
+	}
+	if after.Name != "theirs" || after.RealmID != theirs.ID {
+		t.Errorf("the provider was modified from another Realm: %+v", after)
+	}
+}
