@@ -116,7 +116,7 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 			"/api/v1/auth/login":              openAPIPath("post", "Personal", "브라우저 로그인", false),
 			"/api/v1/auth/logout":             openAPIPath("post", "Personal", "브라우저 로그아웃", true),
 			"/api/v1/auth/challenge/{token}":  openAPIParameterizedPath("get", "Personal", "로그인 요청 컨텍스트 조회", false, "token"),
-			"/api/v1/me/sessions/{id}":        openAPIParameterizedPath("delete", "Personal", "내 세션 종료", true, "id"),
+			"/api/v1/me/sessions/{id}":        withPartialTokenRevocation(openAPIParameterizedPath("delete", "Personal", "내 세션 종료", true, "id")),
 			"/api/v1/me/api-keys/{id}":        openAPIParameterizedPath("delete", "Personal", "내 API 키 폐기", true, "id"),
 			"/api/v1/me/api-keys/{id}/rotate": openAPIParameterizedPath("post", "Personal", "내 API 키 회전", true, "id"),
 			"/api/v1/me/approval-capability":  openAPIReadPath("Personal", "내 검토 권한 조회"),
@@ -138,7 +138,7 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 			},
 			"/api/admin/v1/realms/{realmID}/keys":                              openAPIParameterizedPath("get", "Administration", "Realm 서명 키 목록", false, "realmID"),
 			"/api/admin/v1/realms/{realmID}/sessions":                          openAPIParameterizedPath("get", "Administration", "Realm SSO 세션 조회", false, "realmID"),
-			"/api/admin/v1/realms/{realmID}/sessions/{sessionID}":              openAPIParameterizedPath("delete", "Administration", "SSO 세션 강제 종료", true, "realmID", "sessionID"),
+			"/api/admin/v1/realms/{realmID}/sessions/{sessionID}":              withPartialTokenRevocation(openAPIParameterizedPath("delete", "Administration", "SSO 세션 강제 종료", true, "realmID", "sessionID")),
 			"/api/admin/v1/realms/{realmID}/clients/{clientID}":                openAPIParameterizedPath("put", "Administration", "OIDC Client 변경", true, "realmID", "clientID"),
 			"/api/admin/v1/realms/{realmID}/clients/{clientID}/rotate-secret":  openAPIParameterizedPath("post", "Administration", "Client Secret 회전", true, "realmID", "clientID"),
 			"/api/admin/v1/realms/{realmID}/clients/{clientID}/roles/{roleID}": openAPIParameterizedPath("delete", "Administration", "Client Role 삭제", true, "realmID", "clientID", "roleID"),
@@ -292,6 +292,16 @@ func openAPIUserSchemas() map[string]any {
 				"new_password":     map[string]any{"type": "string", "format": "password", "minLength": 1},
 			},
 		},
+		"PartialTokenRevocation": map[string]any{
+			"type":        "object",
+			"description": "세션은 종료했지만 그 세션의 Refresh Token을 폐기하지 못한 경우의 응답. 감사 이벤트는 PARTIAL로 기록됩니다.",
+			"required":    []string{"session_ended", "refresh_tokens_revoked", "message"},
+			"properties": map[string]any{
+				"session_ended":          map[string]any{"type": "boolean", "enum": []any{true}},
+				"refresh_tokens_revoked": map[string]any{"type": "boolean", "enum": []any{false}},
+				"message":                map[string]any{"type": "string"},
+			},
+		},
 		"PartialSessionRevocation": map[string]any{
 			"type":        "object",
 			"description": "비밀번호는 바뀌었지만 세션 종료가 실패한 경우의 응답. 감사 이벤트는 PARTIAL로 기록됩니다.",
@@ -309,6 +319,22 @@ func openAPIUserSchemas() map[string]any {
 // that step can fail on its own after the password is already changed — the
 // request is not refused, so a client that assumes 204 is a client that never
 // learns those sessions are still live.
+// withPartialTokenRevocation declares the second shape an endpoint that ends
+// one session can answer with. The session is gone either way; what can fail
+// on its own is revoking the refresh tokens issued from it, and a relying
+// party holding one of those is not signed out by the session ending.
+func withPartialTokenRevocation(item map[string]any) map[string]any {
+	operation, _ := item["delete"].(map[string]any)
+	responses, _ := operation["responses"].(map[string]any)
+	responses["200"] = map[string]any{
+		"description": "Session ended, but the refresh tokens issued from it could not be revoked",
+		"content": map[string]any{"application/json": map[string]any{
+			"schema": map[string]any{"$ref": "#/components/schemas/PartialTokenRevocation"},
+		}},
+	}
+	return item
+}
+
 func withPartialSessionRevocation(operation map[string]any) map[string]any {
 	responses, _ := operation["responses"].(map[string]any)
 	responses["200"] = map[string]any{

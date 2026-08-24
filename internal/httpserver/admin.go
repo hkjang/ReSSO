@@ -745,7 +745,7 @@ func (s *Server) adminRevokeSession(w http.ResponseWriter, r *http.Request) {
 	ended, detail := s.endSession(r, sessionID)
 	s.audit(r, &realmID, &principal.UserID, principal.Username, "ADMIN_FORCE_LOGOUT",
 		partialIfNot(ended), "session", sessionID.String(), detail)
-	writeSessionsEnded(w, ended,
+	writeSessionEnded(w, ended,
 		"세션은 종료했지만 이 세션의 Refresh Token을 폐기하지 못했습니다. 연동 애플리케이션에서 계속 사용될 수 있습니다.")
 }
 

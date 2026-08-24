@@ -173,6 +173,20 @@ func partialIfNot(ok bool) string {
 // writeSessionsEnded answers 204 when everything was done, and 200 with what
 // was not when it was not. The unchanged status on the ordinary path keeps the
 // contract these two endpoints already had.
+// writeSessionEnded answers a request to end one session. It is separate from
+// writeSessionsEnded because the two describe different things: there are no
+// other sessions here, only this one and the refresh tokens issued from it,
+// and answering with a field named other_sessions_ended would describe the
+// request as something it was not.
+func writeSessionEnded(w http.ResponseWriter, revokedTokens bool, message string) {
+	if revokedTokens {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_ended": true, "refresh_tokens_revoked": false, "message": message})
+}
+
 func writeSessionsEnded(w http.ResponseWriter, ended bool, message string) {
 	if ended {
 		w.WriteHeader(http.StatusNoContent)
@@ -227,7 +241,7 @@ func (s *Server) revokeMySession(w http.ResponseWriter, r *http.Request) {
 	if principal.SessionID != nil && *principal.SessionID == id {
 		s.clearBrowserCookies(w, r)
 	}
-	writeSessionsEnded(w, ended,
+	writeSessionEnded(w, ended,
 		"세션은 종료했지만 이 세션의 Refresh Token을 폐기하지 못했습니다. 연동 애플리케이션에서 계속 사용될 수 있습니다.")
 }
 

@@ -102,9 +102,21 @@ export function PersonalSessionsPage() {
   const idleMinutes = Math.round((me?.password_policy?.idle_timeout_seconds ?? 0) / 60)
   const [confirmCurrent, setConfirmCurrent] = useState<Session | null>(null)
   const sessions = useQuery({ queryKey: ['my-sessions'], queryFn: () => api<{ items: Session[]; current_session_id: string }>('/api/v1/me/sessions'), refetchInterval: 30_000 })
+  // The session ends either way; revoking the refresh tokens issued from it can
+  // fail on its own, and a relying party holding one of those is not signed out
+  // by the session ending. Saying "ended" for both hides the half that matters.
   const revoke = useMutation({
-    mutationFn: (session: Session) => api<void>(`/api/v1/me/sessions/${session.id}`, { method: 'DELETE' }),
-    onSuccess: async () => { setConfirmCurrent(null); notify('세션을 종료했습니다.'); await queryClient.invalidateQueries({ queryKey: ['my-sessions'] }) },
+    mutationFn: (session: Session) => api<{ refresh_tokens_revoked?: boolean; message?: string } | undefined>(
+      `/api/v1/me/sessions/${session.id}`, { method: 'DELETE' }),
+    onSuccess: async (result) => {
+      setConfirmCurrent(null)
+      if (result?.refresh_tokens_revoked === false) {
+        notify(result.message ?? '세션은 종료했지만 Refresh Token을 폐기하지 못했습니다.', 'warning')
+      } else {
+        notify('세션을 종료했습니다.')
+      }
+      await queryClient.invalidateQueries({ queryKey: ['my-sessions'] })
+    },
   })
   if (sessions.isLoading) return <PageLoading />
   if (sessions.error) return <ErrorAlert error={sessions.error} onRetry={() => void sessions.refetch()} />

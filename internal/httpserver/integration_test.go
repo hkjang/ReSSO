@@ -2878,11 +2878,17 @@ func TestIntegrationForcingASessionOutIsRecordedEvenWhenHalfOfItFails(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	var adminBody map[string]any
+	_ = json.NewDecoder(response.Body).Decode(&adminBody)
 	_ = response.Body.Close()
 	restore()
 
-	if response.StatusCode >= 500 {
-		t.Errorf("a session that really ended answered %d", response.StatusCode)
+	if response.StatusCode != http.StatusOK {
+		t.Errorf("a session that really ended answered %d, want 200 carrying what did not happen",
+			response.StatusCode)
+	}
+	if adminBody["session_ended"] != true || adminBody["refresh_tokens_revoked"] != false {
+		t.Errorf("the response does not describe this request: %v", adminBody)
 	}
 	// The session did end, which is why losing the record matters.
 	var revoked bool
@@ -2983,11 +2989,17 @@ func TestIntegrationEndingMyOwnSessionSurvivesRefreshTokensItCannotRevoke(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	var body map[string]any
+	_ = json.NewDecoder(response.Body).Decode(&body)
 	_ = response.Body.Close()
 	restore()
 
-	if response.StatusCode >= 500 {
-		t.Errorf("ending a session that really ended answered %d", response.StatusCode)
+	if response.StatusCode != http.StatusOK {
+		t.Errorf("ending a session that really ended answered %d, want 200 carrying what did not happen",
+			response.StatusCode)
+	}
+	if body["session_ended"] != true || body["refresh_tokens_revoked"] != false {
+		t.Errorf("the response does not describe this request: %v", body)
 	}
 	// It was this browser's own session, so its cookies have to go with it.
 	cleared := false
