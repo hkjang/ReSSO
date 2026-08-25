@@ -27,6 +27,12 @@ export function DashboardPage() {
   ]
   // Each readiness row links to the screen that can fix it. Reporting "3개 실패"
   // with no way to reach the failing provider left the operator to hunt for it.
+  //
+  // The clock difference has no such screen: it is settled on the hosts, not
+  // here. It used to offer "시각 동기화 확인" pointing at the audit log, which
+  // cannot check time synchronisation — a button that looks like the others and
+  // leads somewhere that does not help is worse than no button, so this row
+  // says what to do instead.
   const readiness = [
     { label: '외부 Issuer HTTPS', ready: Boolean(query.data?.readiness.issuer_https), detail: query.data?.readiness.issuer_https ? '정상' : 'HTTP Issuer 확인 필요', to: '/admin/realms', action: 'Realm 설정 열기' },
     { label: 'Realm 서명 키', ready: Boolean(query.data?.readiness.signing_keys_ready), detail: query.data?.readiness.signing_keys_ready ? '정상' : 'ACTIVE 키 누락', to: '/admin/keys', action: '서명 키 열기' },
@@ -37,7 +43,7 @@ export function DashboardPage() {
     // Two clocks. Their difference shifts every session and token lifetime by
     // its size, and past the refresh rotation grace it starts signing people
     // out of relying parties, so that window is the threshold.
-    { label: '서버·데이터베이스 시각 차이', ready: Math.abs(query.data?.readiness.clock_skew_seconds ?? 0) < (query.data?.readiness.clock_skew_advisory_seconds ?? 30), detail: `${(query.data?.readiness.clock_skew_seconds ?? 0).toFixed(1)}초 (측정 오차 ±${query.data?.readiness.clock_skew_round_trip_ms ?? 0}ms)`, to: '/admin/audit', action: '시각 동기화 확인' },
+    { label: '서버·데이터베이스 시각 차이', ready: Math.abs(query.data?.readiness.clock_skew_seconds ?? 0) < (query.data?.readiness.clock_skew_advisory_seconds ?? 30), detail: `${(query.data?.readiness.clock_skew_seconds ?? 0).toFixed(1)}초 (측정 오차 ±${query.data?.readiness.clock_skew_round_trip_ms ?? 0}ms)`, guidance: '두 호스트가 같은 시각 소스를 쓰도록 맞추세요' },
   ]
   return (
     <>
@@ -62,7 +68,7 @@ export function DashboardPage() {
             <Typography variant="h3">운영 준비 상태</Typography>
             <Typography color="text.secondary" variant="body2" sx={{ mt: .75, mb: 3 }}>핵심 인증 구성요소가 PostgreSQL 기반으로 준비되어 있습니다.</Typography>
             <Stack spacing={2.2}>
-              {readiness.map((item) => <Box key={item.label}><Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1} sx={{ mb: .7 }}><Typography variant="body2" fontWeight={650}>{item.label}</Typography><Stack direction="row" spacing={1} alignItems="center"><Typography variant="caption" color={item.ready ? 'success.main' : 'warning.main'}>{item.detail}</Typography>{!item.ready && <Button component={RouterLink} to={item.to} size="small" endIcon={<ArrowForwardRoundedIcon fontSize="small" />} sx={{ py: 0, minWidth: 0 }}>{item.action}</Button>}</Stack></Stack><LinearProgress variant="determinate" value={item.ready ? 100 : 35} color={item.ready ? 'success' : 'warning'} sx={{ height: 7, borderRadius: 99 }} /></Box>)}
+              {readiness.map((item) => <Box key={item.label}><Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1} sx={{ mb: .7 }}><Typography variant="body2" fontWeight={650}>{item.label}</Typography><Stack direction="row" spacing={1} alignItems="center"><Typography variant="caption" color={item.ready ? 'success.main' : 'warning.main'}>{item.detail}</Typography>{!item.ready && item.to === undefined && <Typography variant="caption" color="text.secondary">{item.guidance}</Typography>}{!item.ready && item.to !== undefined && <Button component={RouterLink} to={item.to} size="small" endIcon={<ArrowForwardRoundedIcon fontSize="small" />} sx={{ py: 0, minWidth: 0 }}>{item.action}</Button>}</Stack></Stack><LinearProgress variant="determinate" value={item.ready ? 100 : 35} color={item.ready ? 'success' : 'warning'} sx={{ height: 7, borderRadius: 99 }} /></Box>)}
             </Stack>
           </ContentCard>
         </Grid>
