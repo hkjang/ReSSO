@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -344,7 +345,15 @@ func (s *Store) BackchannelLogoutTargets(ctx context.Context, realmID, sessionID
 	return clients, rows.Err()
 }
 
-func (s *Store) ListSessions(ctx context.Context, realmID *uuid.UUID, userID *uuid.UUID, limit int) ([]domain.Session, error) {
+// ListSessions answers "which sessions are open", optionally narrowed to one
+// Realm, one user, or a search over the username and address.
+//
+// The search is here rather than in the console because the listing is capped:
+// filtering the rows that were already fetched answers the question only for
+// the most recently used sessions, and reports "none" for a session that is
+// open but further down. The screen exists to answer "which sessions does this
+// person have open", which is exactly the case that failed.
+func (s *Store) ListSessions(ctx context.Context, realmID *uuid.UUID, userID *uuid.UUID, query string, limit int) ([]domain.Session, error) {
 	if limit < 1 || limit > 500 {
 		limit = 100
 	}
@@ -358,7 +367,11 @@ func (s *Store) ListSessions(ctx context.Context, realmID *uuid.UUID, userID *uu
         JOIN users u ON u.id=s.user_id
         JOIN realms r ON r.id=s.realm_id
         WHERE ($1::uuid IS NULL OR s.realm_id=$1)
-        AND ($2::uuid IS NULL OR s.user_id=$2) ORDER BY s.last_access DESC LIMIT $3`, realmID, userID, limit)
+        AND ($2::uuid IS NULL OR s.user_id=$2)
+        AND ($3='' OR lower(u.username) LIKE $4 OR lower(s.ip_address) LIKE $4)
+        ORDER BY s.last_access DESC LIMIT $5`,
+		realmID, userID, strings.TrimSpace(query),
+		"%"+strings.ToLower(strings.TrimSpace(query))+"%", limit)
 	if err != nil {
 		return nil, err
 	}

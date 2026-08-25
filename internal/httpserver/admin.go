@@ -693,7 +693,7 @@ func (s *Server) adminListRealmSessions(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	items, err := s.store.ListSessions(r.Context(), &realmID, nil, queryInt(r, "limit", 200))
+	items, err := s.store.ListSessions(r.Context(), &realmID, nil, r.URL.Query().Get("q"), queryInt(r, "limit", 200))
 	if err != nil {
 		writeStoreError(w, r, err)
 		return

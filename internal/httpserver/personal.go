@@ -210,7 +210,7 @@ func writeSessionsEnded(w http.ResponseWriter, ended bool, detail map[string]any
 
 func (s *Server) mySessions(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFrom(r.Context())
-	sessions, err := s.store.ListSessions(r.Context(), nil, &principal.UserID, 100)
+	sessions, err := s.store.ListSessions(r.Context(), nil, &principal.UserID, "", 100)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return

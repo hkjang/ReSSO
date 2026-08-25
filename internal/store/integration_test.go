@@ -1042,6 +1042,87 @@ func TestIntegrationApprovalListResolvesRequesterAndTargetRole(t *testing.T) {
 // the operator paged through screens of accounts that were not locked. The
 // listing and its count share one predicate here so they cannot say different
 // things.
+// The sessions screen exists to answer "which sessions does this person have
+// open", and the listing is capped. Filtering the rows that came back answers
+// that only for the most recently used sessions: a session that is open but
+// further down is reported as not existing, which is the one answer the screen
+// must never give. The search runs against the table, so the cap limits how
+// much is shown and not what can be found.
+func TestIntegrationSessionSearchReachesPastTheListingCap(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm := bootstrap.RealmID
+
+	quiet, err := data.CreateUser(ctx, realm, CreateUserInput{
+		Username: "quiet-contractor", Password: "quiet-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	quietSession, err := data.CreateSession(ctx, realm, quiet.ID, time.Hour, "10.0.0.9", "agent", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Its last use is the oldest, so any cap puts it past the end.
+	if _, err := data.Pool.Exec(ctx, "UPDATE sso_sessions SET last_access=now()-interval '2 days' WHERE id=$1",
+		quietSession.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	busy, err := data.CreateUser(ctx, realm, CreateUserInput{
+		Username: "busy-operator", Password: "busy-password-12345", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 5; index++ {
+		if _, err := data.CreateSession(ctx, realm, busy.ID, time.Hour, "10.0.0.1", "agent", "password"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A cap smaller than the number of sessions, which is the situation the
+	// screen is in on any Realm with more sessions than it asks for.
+	const cap = 3
+	page, err := data.ListSessions(ctx, &realm, nil, "", cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != cap {
+		t.Fatalf("the capped listing returned %d sessions, want %d", len(page), cap)
+	}
+	for _, session := range page {
+		if session.Username == "quiet-contractor" {
+			t.Fatal("the quiet session was inside the cap, so this proves nothing about reaching past it")
+		}
+	}
+
+	found, err := data.ListSessions(ctx, &realm, nil, "quiet-contractor", cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || found[0].Username != "quiet-contractor" {
+		t.Fatalf("searching for a session past the cap returned %d rows: the screen would say "+
+			"the session does not exist while it is open", len(found))
+	}
+
+	// The address is the other thing an administrator searches by.
+	byAddress, err := data.ListSessions(ctx, &realm, nil, "10.0.0.9", cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byAddress) != 1 {
+		t.Errorf("searching by address returned %d rows, want 1", len(byAddress))
+	}
+
+	// Case is not something an administrator should have to match.
+	upper, err := data.ListSessions(ctx, &realm, nil, "QUIET-Contractor", cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(upper) != 1 {
+		t.Errorf("searching in capitals returned %d rows, want 1", len(upper))
+	}
+}
+
 func TestIntegrationUserStatusFilterNarrowsTheCountAsWellAsTheRows(t *testing.T) {
 	data := openIntegrationStore(t, integrationSealer(t))
 	bootstrap := bootstrapIntegrationStore(t, data)
@@ -2526,7 +2607,7 @@ func TestIntegrationListedSessionReportsWhetherItStillWorks(t *testing.T) {
 	}
 	listed := func() domain.Session {
 		t.Helper()
-		items, listErr := data.ListSessions(ctx, &bootstrap.RealmID, nil, 10)
+		items, listErr := data.ListSessions(ctx, &bootstrap.RealmID, nil, "", 10)
 		if listErr != nil {
 			t.Fatal(listErr)
 		}

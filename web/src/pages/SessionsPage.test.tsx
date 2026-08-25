@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, test, vi } from 'vitest'
 import { SessionsPage } from './SessionsPage'
@@ -66,4 +66,32 @@ test('a force logout that could not revoke the refresh tokens says so', async ()
   await user.click(await screen.findByRole('button', { name: '강제 로그아웃' }))
 
   expect(await screen.findByText('세션은 종료했지만 이 세션의 Refresh Token을 폐기하지 못했습니다.')).toBeInTheDocument()
+})
+
+// The screen exists to answer "which sessions does this person have open", and
+// the listing is capped at 500. Narrowing the rows that came back answered that
+// only for the most recently used ones: a session further down was reported as
+// not existing. The term goes to the server so the cap limits what is shown,
+// not what can be found.
+test('the search goes to the server rather than filtering the page already fetched', async () => {
+  const user = userEvent.setup()
+  renderSessions()
+  await waitFor(() => expect(mocks.api).toHaveBeenCalled())
+
+  await user.type(screen.getByLabelText('세션 검색'), 'quiet-contractor')
+
+  await waitFor(() => {
+    const asked = mocks.api.mock.calls.map(([path]) => String(path))
+    expect(asked.some((path) => path.includes('/sessions?') && path.includes('q=quiet-contractor'))).toBe(true)
+  })
+})
+
+// A cut-off list that says nothing looks like the whole list.
+test('a listing that hits the cap says so', async () => {
+  mocks.api.mockResolvedValue({ items: Array.from({ length: 500 }, (_, index) => ({
+    ...session, id: `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`,
+  })) })
+  renderSessions()
+
+  expect(await screen.findByText(/500건만 표시합니다/)).toBeInTheDocument()
 })
