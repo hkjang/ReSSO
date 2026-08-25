@@ -164,4 +164,25 @@ func TestReadmeListsTheMetricsTheServiceExposes(t *testing.T) {
 			t.Errorf("the README lists %s, which nothing serves", name)
 		}
 	}
+
+	// The operations guide names metrics too, in the section that says which
+	// ones to alert on — the names an operator copies into their monitoring.
+	// They are all in the README today, so a rename fails the check above and
+	// whoever fixes it there should notice the guide. Should notice is what
+	// this exists to replace: an alert built on a name nothing serves never
+	// fires, and looks configured while it does not. One direction only, like
+	// the audit table: the guide is a selection of what is worth watching.
+	guide, err := os.ReadFile(filepath.Join(root, "docs", "operations.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := regexp.MustCompile("`?(resso_[a-z_]+)").FindAllStringSubmatch(string(guide), -1)
+	if len(named) == 0 {
+		t.Fatal("the operations guide no longer names any metric")
+	}
+	for _, match := range named {
+		if !exposed[match[1]] {
+			t.Errorf("the operations guide tells an operator to watch %s, which nothing serves", match[1])
+		}
+	}
 }
