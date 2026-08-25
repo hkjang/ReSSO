@@ -857,7 +857,8 @@ func (s *Server) adminListAuditEventTypes(w http.ResponseWriter, r *http.Request
 
 func (s *Server) adminListSystemLogs(w http.ResponseWriter, r *http.Request) {
 	items, err := s.store.ListSystemLogs(r.Context(), strings.ToUpper(r.URL.Query().Get("level")),
-		r.URL.Query().Get("q"), queryInt(r, "limit", 200), queryInt(r, "offset", 0))
+		r.URL.Query().Get("q"), strings.TrimSpace(r.URL.Query().Get("trace")),
+		queryInt(r, "limit", 200), queryInt(r, "offset", 0))
 	if err != nil {
 		writeStoreError(w, r, err)
 		return

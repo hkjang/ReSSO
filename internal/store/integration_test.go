@@ -4954,6 +4954,70 @@ func TestIntegrationSigningRefusesAKeyTheJWKSOmits(t *testing.T) {
 // can return one record twice and never return another — and the one that gets
 // skipped is as likely as any to be the line explaining the incident somebody
 // is paging through the log to understand.
+// Following a trace from an audit entry to the log lines it produced is a step
+// the console offers, and the trace it carries is an exact identifier. Searched
+// as free text it is a leading-wildcard scan of thirty days of every request —
+// 163ms against 0.08ms on 400k rows — and it also matches lines that merely
+// mention the identifier rather than carrying it, which is not what the button
+// promises.
+func TestIntegrationSystemLogTraceFilterIsExact(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	const wanted = "1e5f2b7c9a"
+	rows := []struct{ message, trace string }{
+		{"token issued", wanted},
+		{"session ended", wanted + "0"},          // a longer id that contains it
+		{"retrying trace " + wanted, "other-id"}, // the identifier only mentioned
+	}
+	for _, row := range rows {
+		if _, err := data.Pool.Exec(ctx, `INSERT INTO system_logs(level,component,message,trace_id)
+			VALUES('INFO','httpserver',$1,$2)`, row.message, row.trace); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	exact, err := data.ListSystemLogs(ctx, "", "", wanted, 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exact) != 1 {
+		t.Fatalf("the trace filter returned %d lines, want the 1 carrying that trace", len(exact))
+	}
+	if exact[0].Message != "token issued" {
+		t.Errorf("returned %q", exact[0].Message)
+	}
+
+	// The free-text search still does what it did, so the two are not the same
+	// thing wearing different names.
+	loose, err := data.ListSystemLogs(ctx, "", wanted, "", 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loose) != 3 {
+		t.Errorf("free-text search returned %d lines, want all 3 mentioning it", len(loose))
+	}
+
+	// And it narrows what the free-text search finds rather than replacing it.
+	both, err := data.ListSystemLogs(ctx, "", "session", wanted+"0", 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(both) != 1 {
+		t.Errorf("trace and text together returned %d lines, want 1", len(both))
+	}
+
+	// The exactness is only half of it: without an index this is still a scan,
+	// and nothing else in the suite would notice the index going away.
+	var indexed bool
+	if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_indexes
+		WHERE indexname='idx_logs_trace' AND schemaname=current_schema())`).Scan(&indexed); err != nil {
+		t.Fatal(err)
+	}
+	if !indexed {
+		t.Error("the trace lookup has no index, so it still reads the whole mirror")
+	}
+}
+
 func TestIntegrationSystemLogPagingReturnsEachRecordOnce(t *testing.T) {
 	data := openIntegrationStore(t, integrationSealer(t))
 	ctx := context.Background()
@@ -4970,7 +5034,7 @@ func TestIntegrationSystemLogPagingReturnsEachRecordOnce(t *testing.T) {
 	seen := map[string]int{}
 	const page = 7
 	for offset := 0; offset < burst; offset += page {
-		records, err := data.ListSystemLogs(ctx, "", "record-", page, offset)
+		records, err := data.ListSystemLogs(ctx, "", "record-", "", page, offset)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -4989,7 +5053,7 @@ func TestIntegrationSystemLogPagingReturnsEachRecordOnce(t *testing.T) {
 
 	// Tied records come back newest-arrived first, which is the only order a
 	// reader can make sense of when the timestamps are equal.
-	first, err := data.ListSystemLogs(ctx, "", "record-", 3, 0)
+	first, err := data.ListSystemLogs(ctx, "", "record-", "", 3, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

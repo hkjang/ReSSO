@@ -36,12 +36,33 @@ test('typing a trace identifier issues one request, not one per keystroke', asyn
   expect(issued).toBeLessThan(5)
 })
 
-test('a trace handed over from the audit screen seeds the search', async () => {
+// A trace is an exact identifier. Sent as free text it becomes a leading
+// wildcard over a mirror holding thirty days of every request — a full scan for
+// something one index lookup answers — and it also matches lines that merely
+// mention the identifier rather than carrying it.
+test('a trace handed over from the audit screen is looked up as a trace, not searched as text', async () => {
   renderLogs('/admin/logs?trace=handed-over-trace')
   await waitFor(() => {
-    expect(mocks.api.mock.calls.some(([path]) => String(path).includes('q=handed-over-trace'))).toBe(true)
+    expect(mocks.api.mock.calls.some(([path]) => String(path).includes('trace=handed-over-trace'))).toBe(true)
   })
+  expect(mocks.api.mock.calls.every(([path]) => !String(path).includes('q=handed-over-trace'))).toBe(true)
   expect(screen.getByLabelText('로그 검색')).toHaveValue('handed-over-trace')
+})
+
+// Once the term is edited it is no longer the trace that was handed over, and
+// the free-text search is what the person is asking for.
+test('editing the handed-over trace goes back to searching text', async () => {
+  const user = userEvent.setup()
+  renderLogs('/admin/logs?trace=handed-over-trace')
+  await waitFor(() => expect(mocks.api).toHaveBeenCalled())
+
+  const field = screen.getByLabelText('로그 검색')
+  await user.clear(field)
+  await user.type(field, 'refused')
+
+  await waitFor(() => {
+    expect(mocks.api.mock.calls.some(([path]) => String(path).includes('q=refused'))).toBe(true)
+  })
 })
 
 // A table with no accessible name is announced as just "table". The console

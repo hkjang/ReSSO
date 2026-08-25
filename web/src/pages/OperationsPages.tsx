@@ -102,9 +102,18 @@ export function LogsPage() {
       setParams(next, { replace: true })
     }
   }, [search, params, setParams])
+  // While the term is still the trace the audit screen handed over, send it as
+  // the trace filter rather than as free text. It is an exact identifier, and
+  // searching a mirror of thirty days of requests for it with a leading
+  // wildcard scans the whole table for something one index lookup answers. The
+  // moment the term is edited it is no longer that trace, and the effect above
+  // has already dropped it from the URL, so this falls back to free text on its
+  // own.
+  const handedOverTrace = params.get('trace') === search ? search : ''
   const query = useQuery({
-    queryKey: ['system-logs', level, search],
-    queryFn: () => api<{ items: LogRow[] }>(`/api/admin/v1/system-logs?limit=500&level=${encodeURIComponent(level)}&q=${encodeURIComponent(search)}`),
+    queryKey: ['system-logs', level, search, handedOverTrace],
+    queryFn: () => api<{ items: LogRow[] }>(`/api/admin/v1/system-logs?limit=500&level=${encodeURIComponent(level)}`
+      + (handedOverTrace ? `&trace=${encodeURIComponent(handedOverTrace)}` : `&q=${encodeURIComponent(search)}`)),
     refetchInterval: 15_000,
   })
   const truncated = (query.data?.items.length ?? 0) >= 500
