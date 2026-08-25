@@ -306,6 +306,15 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 	includeRefresh := slices.Contains(client.GrantTypes, "refresh_token")
 	response, err := s.oidc.IssueUserTokens(r.Context(), realm, client, user, code.SessionID, code.Scope, code.Nonce, includeRefresh)
 	if err != nil {
+		// A Realm with no key to sign with is not a bad grant. Answering
+		// invalid_grant tells the relying party its code or refresh token is
+		// spent, and the ordinary response is to discard it — so an outage that
+		// ends when the key is restored would take every session with it.
+		if errors.Is(err, store.ErrNoActiveSigningKey) {
+			writeOAuthError(w, http.StatusInternalServerError, "server_error",
+				"this realm has no active signing key; tokens cannot be issued until one is restored")
+			return
+		}
 		if errors.Is(err, store.ErrNotFound) {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization session is no longer active")
 			return
@@ -350,7 +359,13 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 	rotated, rawNew, err := s.store.RotateRefreshToken(r.Context(), raw, reducedScopes)
 	if err != nil {
 		if errors.Is(err, store.ErrTokenReuse) {
-			s.audit(r, &realm.ID, inspected.UserID, "", "REFRESH_TOKEN_REUSE", "FAILURE", "client", client.ClientID, nil)
+			// Named, not just identified. This is the strongest signal that a
+			// token was taken, and the operations guide sends a reader to the
+			// audit screen to look for it — where the actor column was blank
+			// and a search by account could never return it. The account is
+			// already loaded a few lines above.
+			s.audit(r, &realm.ID, inspected.UserID, user.Username,
+				"REFRESH_TOKEN_REUSE", "FAILURE", "client", client.ClientID, nil)
 		}
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token is invalid or was already used")
 		return
@@ -363,6 +378,15 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 		if rollbackErr := s.store.RollbackRefreshRotation(r.Context(), inspected.ID, rotated.ID); rollbackErr != nil {
 			s.logger.Error("refresh rotation could not be undone", "trace_id", traceIDFrom(r.Context()),
 				"client", client.ClientID, "error", rollbackErr)
+		}
+		// A Realm with no key to sign with is not a bad grant. Answering
+		// invalid_grant tells the relying party its code or refresh token is
+		// spent, and the ordinary response is to discard it — so an outage that
+		// ends when the key is restored would take every session with it.
+		if errors.Is(err, store.ErrNoActiveSigningKey) {
+			writeOAuthError(w, http.StatusInternalServerError, "server_error",
+				"this realm has no active signing key; tokens cannot be issued until one is restored")
+			return
 		}
 		if errors.Is(err, store.ErrNotFound) {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization session is no longer active")

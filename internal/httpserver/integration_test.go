@@ -663,6 +663,183 @@ func callIntegrationMCP(t *testing.T, client *http.Client, baseURL, token, paylo
 // for the length of the grace window and then reads as a replay, revoking the
 // family and reporting a theft that never happened. Rejecting before the
 // rotation is what keeps the caller whole.
+// Presenting a rotated refresh token again is the strongest signal this service
+// has that a token was taken, and the operations guide sends a reader to the
+// audit screen to look for it. The entry named the client and left the actor
+// blank, so the screen showed no account and a search by account could never
+// return it — for the one event where "whose" is the question.
+// A Realm with no key to sign with cannot issue tokens, and that is a fault on
+// this side. It was answered as invalid_grant, which tells a relying party its
+// refresh token is spent — and the ordinary response to that is to discard it
+// and send the person back to sign in, which also cannot work while the key is
+// gone. A Realm that lost its key would come back to find every session that
+// could have survived thrown away by the clients that tried during it. The
+// dashboard has a readiness row for exactly this state, so it is one the
+// service expects to be in.
+func TestIntegrationTokenEndpointDoesNotBlameTheGrantForAMissingSigningKey(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "keyless-probe", Name: "Keyless Probe", Type: "public",
+		RedirectURIs: []string{"https://probe.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "keyless-integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: created.Client.ID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No signing key is created for this Realm, which is the state the
+	// dashboard reports as "ACTIVE 키 누락".
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {raw},
+		"client_id": {"keyless-probe"}}
+	response, err := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	var answer struct {
+		Error       string `json:"error"`
+		Description string `json:"error_description"`
+	}
+	if unmarshalErr := json.Unmarshal(body, &answer); unmarshalErr != nil {
+		t.Fatalf("the endpoint answered something that is not an OAuth error: %s", body)
+	}
+	if answer.Error == "invalid_grant" {
+		t.Fatalf("a missing signing key was reported as a bad grant: the client discards a refresh "+
+			"token that is perfectly good (%s)", body)
+	}
+	if answer.Error != "server_error" || response.StatusCode != http.StatusInternalServerError {
+		t.Errorf("answered %d %q, want 500 server_error", response.StatusCode, answer.Error)
+	}
+	if !strings.Contains(answer.Description, "signing key") {
+		t.Errorf("the description does not say what is missing: %q", answer.Description)
+	}
+
+	// And the token was not consumed by the attempt.
+	var rotatedAt *time.Time
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT rotated_at FROM refresh_tokens WHERE session_id=$1 AND parent_id IS NULL`,
+		sessionID).Scan(&rotatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if rotatedAt != nil {
+		t.Error("the refresh token was spent by an attempt that could never have produced a token")
+	}
+}
+
+func TestIntegrationRefreshTokenReuseNamesTheAccount(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "reuse-probe", Name: "Reuse Probe", Type: "public",
+		RedirectURIs: []string{"https://probe.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "reuse-integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: created.Client.ID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	refresh := func(token string) (int, string) {
+		t.Helper()
+		form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {token},
+			"client_id": {"reuse-probe"}}
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token", form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+
+	if status, body := refresh(raw); status != http.StatusOK {
+		t.Fatalf("the first refresh answered %d: %s", status, body)
+	}
+	// Past the rotation grace, which exists so that parallel tabs and a retried
+	// request whose response was lost are not treated as theft. Inside it the
+	// same token is accepted again on purpose; outside it, this is reuse.
+	if _, err := data.Pool.Exec(ctx, `UPDATE refresh_tokens SET rotated_at=now()-interval '1 minute'
+		WHERE session_id=$1 AND parent_id IS NULL`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if status, body := refresh(raw); status != http.StatusBadRequest {
+		t.Fatalf("presenting a rotated token again answered %d (%s), so no reuse was detected", status, body)
+	}
+
+	page, err := data.ListAudit(ctx, store.AuditFilter{RealmID: &realm.ID,
+		EventType: "REFRESH_TOKEN_REUSE", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("%d reuse events were recorded, want 1", len(page.Items))
+	}
+	if page.Items[0].ActorName != "admin" {
+		t.Errorf("the reuse entry names the actor as %q: the audit screen shows no account for it, "+
+			"and narrowing the trail to that person never returns it", page.Items[0].ActorName)
+	}
+	// Narrowing by account is how this is looked for, so it has to work.
+	byActor, err := data.ListAudit(ctx, store.AuditFilter{RealmID: &realm.ID,
+		EventType: "REFRESH_TOKEN_REUSE", Actor: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byActor.Items) != 1 {
+		t.Errorf("searching the trail for that account returned %d reuse events", len(byActor.Items))
+	}
+}
+
 func TestIntegrationRefreshFailureLeavesTheClientsTokenUsable(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()

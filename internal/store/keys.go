@@ -236,6 +236,17 @@ func findSigningKey(keys []domain.SigningKey, kid string) (domain.SigningKey, bo
 	return domain.SigningKey{}, false
 }
 
+// ErrNoActiveSigningKey reports that the Realm has no key to sign with.
+//
+// It wraps ErrNotFound so that callers which only ask "was something missing"
+// keep working, and is distinguishable because the token endpoint must not
+// answer invalid_grant for it. That answer tells a relying party its code or
+// refresh token is bad, and the ordinary response is to discard it and send
+// the person back to sign in — which also cannot work while the key is gone.
+// A Realm that lost its signing key would come back to find the sessions that
+// could have survived thrown away by every client that tried during it.
+var ErrNoActiveSigningKey = fmt.Errorf("realm has no active signing key: %w", ErrNotFound)
+
 func (s *Store) loadActivePrivateKey(ctx context.Context, realmID uuid.UUID) (*rsa.PrivateKey, domain.SigningKey, error) {
 	var key domain.SigningKey
 	var encrypted []byte
@@ -243,7 +254,7 @@ func (s *Store) loadActivePrivateKey(ctx context.Context, realmID uuid.UUID) (*r
         FROM signing_keys WHERE realm_id=$1 AND status='ACTIVE'`, realmID).Scan(&key.ID, &key.RealmID, &key.KID,
 		&key.Algorithm, &key.Status, &key.PublicJWK, &key.CreatedAt, &key.RetireAt, &encrypted)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.SigningKey{}, ErrNotFound
+		return nil, domain.SigningKey{}, ErrNoActiveSigningKey
 	}
 	if err != nil {
 		return nil, domain.SigningKey{}, err
