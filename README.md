@@ -219,7 +219,7 @@ Smoke test는 PKCE, Scope 기반 Claim, Refresh Token 재사용 탐지, Web Orig
 - 관리자 화면의 감사 이벤트와 서버 로그를 정기적으로 검토하세요.
 - Signing Key 회전 후 이전 키는 기존 Token 검증을 위해 일정 시간 JWKS에 유지됩니다.
 - Client Secret은 Digest Keyring으로 보호됩니다. Digest Key를 제거하기 전에 해당 키로 만든 Client Secret을 모두 회전하세요.
-- 대규모 사용자 검색 성능을 위해 데이터베이스 소유자 권한으로 `CREATE EXTENSION pg_trgm;`을 실행하세요. ReSSO는 확장을 직접 설치하지 않고, 존재하면 다음 기동 시 색인을 만듭니다.
+- 대규모 사용자 검색과 **감사 기록의 행위자 검색** 성능을 위해 데이터베이스 소유자 권한으로 `CREATE EXTENSION pg_trgm;`을 실행하세요. ReSSO는 확장을 직접 설치하지 않고, 존재하면 다음 기동 시 색인을 만듭니다.
 - LDAP Bind Credential도 Data Encryption Keyring으로 암호화되며 API·MCP·감사로그에 평문으로 반환하지 않습니다.
 - 현재 릴리즈는 Kerberos/SPNEGO, MFA/TOTP, SAML, WebAuthn, 외부 Identity Broker를 포함하지 않습니다. 해당 기능이 필요한 조직은 별도 보안 검토와 단계적 확장이 필요합니다.
 

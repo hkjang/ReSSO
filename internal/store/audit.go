@@ -103,7 +103,9 @@ func (f AuditFilter) normalized() AuditFilter {
 const auditWhere = `WHERE ($1::uuid IS NULL OR realm_id=$1)
         AND ($2='' OR event_type=$2)
         AND ($3='' OR result=$3)
-        AND ($4='' OR actor_name ILIKE '%' || $4 || '%')
+        -- lower() LIKE rather than ILIKE so the optional trigram index on
+        -- lower(actor_name) can serve it; ILIKE would not match the expression.
+        AND ($4='' OR lower(actor_name) LIKE '%' || lower($4) || '%')
         AND ($5='' OR trace_id=$5)`
 
 func (s *Store) ListAudit(ctx context.Context, filter AuditFilter) (AuditPage, error) {

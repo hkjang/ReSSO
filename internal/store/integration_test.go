@@ -833,12 +833,13 @@ func TestIntegrationEnsureSearchIndexesIsIdempotentAndOptional(t *testing.T) {
 	}
 	var created int
 	if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes
-		WHERE indexname IN ('idx_users_username_trgm','idx_users_email_trgm','idx_users_display_name_trgm')
+		WHERE indexname IN ('idx_users_username_trgm','idx_users_email_trgm','idx_users_display_name_trgm',
+			'idx_audit_actor_trgm')
 		AND schemaname=current_schema()`).Scan(&created); err != nil {
 		t.Fatal(err)
 	}
-	if created != 3 {
-		t.Fatalf("created %d trigram indexes, want 3", created)
+	if created != 4 {
+		t.Fatalf("created %d trigram indexes, want 4", created)
 	}
 	// The search itself must still return the right rows with the index in place.
 	realm, err := data.CreateRealm(ctx, CreateRealmInput{Name: "search-realm", DisplayName: "Search",
@@ -1066,9 +1067,14 @@ func TestIntegrationAuditFilterNarrowsAndCountsMatches(t *testing.T) {
 		"by event type": {AuditFilter{RealmID: &bootstrap.RealmID, EventType: "LOGIN_FAILURE"}, 2},
 		"by result":     {AuditFilter{RealmID: &bootstrap.RealmID, Result: "SUCCESS"}, 2},
 		"by actor":      {AuditFilter{RealmID: &bootstrap.RealmID, Actor: "ali"}, 2},
-		"by trace":      {AuditFilter{RealmID: &bootstrap.RealmID, TraceID: "trace-c"}, 1},
-		"combined":      {AuditFilter{RealmID: &bootstrap.RealmID, EventType: "LOGIN_FAILURE", Actor: "bob"}, 1},
-		"no match":      {AuditFilter{RealmID: &bootstrap.RealmID, EventType: "NOT_AN_EVENT"}, 0},
+		// The actor filter matches without regard to case, and it is written as
+		// lower() LIKE lower() rather than ILIKE so the optional trigram index
+		// on lower(actor_name) can serve it. Dropping either lower() leaves the
+		// common all-lowercase search working and silently loses this one.
+		"by actor, typed in capitals": {AuditFilter{RealmID: &bootstrap.RealmID, Actor: "ALI"}, 2},
+		"by trace":                    {AuditFilter{RealmID: &bootstrap.RealmID, TraceID: "trace-c"}, 1},
+		"combined":                    {AuditFilter{RealmID: &bootstrap.RealmID, EventType: "LOGIN_FAILURE", Actor: "bob"}, 1},
+		"no match":                    {AuditFilter{RealmID: &bootstrap.RealmID, EventType: "NOT_AN_EVENT"}, 0},
 	} {
 		page, err := data.ListAudit(ctx, tc.filter)
 		if err != nil {
