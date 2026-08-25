@@ -295,7 +295,7 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 		if permitErr != nil {
 			return nil, permitErr
 		}
-		output, err = s.store.ListUsers(r.Context(), realmID, args.Query, store.UserSort{}, 20, 0)
+		output, err = s.store.ListUsers(r.Context(), realmID, args.Query, store.UserStatusAny, store.UserSort{}, 20, 0)
 	default:
 		return nil, errors.New("등록되지 않은 도구입니다")
 	}

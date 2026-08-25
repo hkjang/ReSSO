@@ -31,7 +31,7 @@ export function DashboardPage() {
     { label: '외부 Issuer HTTPS', ready: Boolean(query.data?.readiness.issuer_https), detail: query.data?.readiness.issuer_https ? '정상' : 'HTTP Issuer 확인 필요', to: '/admin/realms', action: 'Realm 설정 열기' },
     { label: 'Realm 서명 키', ready: Boolean(query.data?.readiness.signing_keys_ready), detail: query.data?.readiness.signing_keys_ready ? '정상' : 'ACTIVE 키 누락', to: '/admin/keys', action: '서명 키 열기' },
     { label: 'LDAP 최근 동기화', ready: (query.data?.readiness.federation_failures ?? 0) === 0, detail: `${query.data?.readiness.federation_failures ?? 0}개 실패`, to: '/admin/user-federation', action: 'User Federation 열기' },
-    { label: '잠긴 사용자', ready: (query.data?.readiness.locked_users ?? 0) === 0, detail: `${query.data?.readiness.locked_users ?? 0}명`, to: '/admin/users', action: '잠긴 사용자 보기' },
+    { label: '잠긴 사용자', ready: (query.data?.readiness.locked_users ?? 0) === 0, detail: `${query.data?.readiness.locked_users ?? 0}명`, to: '/admin/users?status=locked', action: '잠긴 사용자 보기' },
     { label: '7일 내 API 키 만료', ready: (query.data?.readiness.expiring_api_keys ?? 0) === 0, detail: `${query.data?.readiness.expiring_api_keys ?? 0}개`, to: '/admin/audit', action: '감사 이벤트 확인' },
     { label: `${query.data?.readiness.signing_key_advisory_days ?? 180}일 초과 서명 키`, ready: (query.data?.readiness.aging_signing_keys ?? 0) === 0, detail: `${query.data?.readiness.aging_signing_keys ?? 0}개`, to: '/admin/keys', action: '서명 키 회전' },
     // Two clocks. Their difference shifts every session and token lifetime by

@@ -238,13 +238,16 @@ func (s *Server) adminListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	query := r.URL.Query().Get("q")
+	status := store.UserStatus(strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status"))))
 	sort := store.UserSort{Column: r.URL.Query().Get("sort"), Descending: r.URL.Query().Get("order") == "desc"}
-	items, err := s.store.ListUsers(r.Context(), realmID, query, sort, queryInt(r, "limit", 100), queryInt(r, "offset", 0))
+	items, err := s.store.ListUsers(r.Context(), realmID, query, status, sort,
+		queryInt(r, "limit", 100), queryInt(r, "offset", 0))
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
-	total, err := s.store.CountUsers(r.Context(), realmID, query)
+	// The same narrowing, so the pager counts what the rows show.
+	total, err := s.store.CountUsers(r.Context(), realmID, query, status)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return

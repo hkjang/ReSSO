@@ -35,12 +35,27 @@ export function UsersPage() {
   // screen too, and landing on the route the browser is already on remounts
   // nothing. A term read once is applied to the first hand-over only, leaving
   // the field, the request and the address bar saying three different things.
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
   const handedOverTerm = searchParams.get('q') ?? ''
   const [searchInput, setSearchInput] = useState(handedOverTerm)
   const [search, setSearch] = useState(handedOverTerm)
   const [page, setPage] = useState(0)
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  // The status lives in the URL, like the Realm does and for the same reason:
+  // the dashboard links straight to the locked accounts, and a filtered list is
+  // something to share or bookmark. An unrecognised value is no filter, so a
+  // stale link opens the list rather than an error.
+  const requestedStatus = searchParams.get('status')
+  const statusFilter: StatusFilter = requestedStatus === 'locked' || requestedStatus === 'disabled'
+    ? requestedStatus
+    : 'all'
+  const setStatusFilter = (value: StatusFilter) => {
+    const next = new URLSearchParams(searchParams)
+    if (value === 'all') next.delete('status')
+    else next.set('status', value)
+    // Replace: choosing a filter is not a place the back button should stop.
+    setSearchParams(next, { replace: true })
+    setPage(0)
+  }
   const [sort, setSort] = useState<SortState<UserSortColumn>>({ column: 'username', descending: false })
   const [rowsPerPage, setRowsPerPage] = useState(50)
   const [createOpen, setCreateOpen] = useState(false)
@@ -51,8 +66,9 @@ export function UsersPage() {
   const [realmRoleIDs, setRealmRoleIDs] = useState<string[]>([])
   const [clientRoleIDs, setClientRoleIDs] = useState<string[]>([])
   const users = useQuery({
-    queryKey: ['users', selection.realmID, search, sort, page, rowsPerPage],
+    queryKey: ['users', selection.realmID, search, statusFilter, sort, page, rowsPerPage],
     queryFn: () => api<{ items: User[]; total: number }>(`/api/admin/v1/realms/${selection.realmID}/users?q=${encodeURIComponent(search)}`
+      + (statusFilter === 'all' ? '' : `&status=${statusFilter}`)
       + `&sort=${sort.column}&order=${sort.descending ? 'desc' : 'asc'}&limit=${rowsPerPage}&offset=${page * rowsPerPage}`),
     enabled: Boolean(selection.realmID),
   })
@@ -157,13 +173,11 @@ export function UsersPage() {
   // gates whether the unlock action is offered, so a browser running fast used
   // to hide the only way to release an account nobody could sign in to.
   const isLocked = (user: User) => user.locked
-  // The filter narrows the page that is already loaded; the server-side query
-  // stays a plain paged search so the count in the pager remains truthful.
-  const visibleUsers = (users.data?.items ?? []).filter((user) => {
-    if (statusFilter === 'locked') return isLocked(user)
-    if (statusFilter === 'disabled') return !user.enabled
-    return true
-  })
+  // The server applies the status filter to the listing and to its count, so
+  // the pager counts what the rows show. Narrowing the loaded page here instead
+  // left the pager reporting the unfiltered total, and the number the dashboard
+  // promises could not be reached: the locked accounts were on some later page.
+  const visibleUsers = users.data?.items ?? []
   if (realms.isLoading) return <PageLoading />
   if (realms.error) return <ErrorAlert error={realms.error} onRetry={() => void realms.refetch()} />
   return (

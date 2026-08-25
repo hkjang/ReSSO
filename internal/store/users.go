@@ -66,14 +66,46 @@ func (s UserSort) orderBy() string {
 	return column + " " + direction + ", lower(username) ASC"
 }
 
-func (s *Store) ListUsers(ctx context.Context, realmID uuid.UUID, query string, sort UserSort, limit, offset int) ([]domain.User, error) {
+// UserStatus narrows a listing to accounts in one state. An unrecognised value
+// means no narrowing, the same way an unknown sort column falls back to the
+// username: a stale link must not produce an error page.
+type UserStatus string
+
+const (
+	UserStatusAny      UserStatus = ""
+	UserStatusLocked   UserStatus = "locked"
+	UserStatusDisabled UserStatus = "disabled"
+)
+
+func (f UserStatus) normalized() UserStatus {
+	switch f {
+	case UserStatusLocked, UserStatusDisabled:
+		return f
+	default:
+		return UserStatusAny
+	}
+}
+
+// userFilter is shared by the listing and its count so the two cannot disagree.
+// The console pages with the count and shows the rows; when the status filter
+// only narrowed the rows, the pager went on reporting the unfiltered total and
+// an operator following "잠긴 사용자 보기" from the dashboard paged through
+// screens of accounts that were not locked looking for the number it promised.
+//
+// locked_until is compared against the database clock, which is the clock that
+// wrote it — the same reason the row's own locked flag is decided server-side.
+const userFilter = `realm_id=$1
+        AND ($2='' OR lower(username) LIKE $3 OR lower(email) LIKE $3 OR lower(display_name) LIKE $3)
+        AND ($4='' OR ($4='locked' AND locked_until>now()) OR ($4='disabled' AND NOT enabled))`
+
+func (s *Store) ListUsers(ctx context.Context, realmID uuid.UUID, query string, status UserStatus, sort UserSort, limit, offset int) ([]domain.User, error) {
 	if limit < 1 || limit > 500 {
 		limit = 100
 	}
 	pattern := "%" + strings.ToLower(strings.TrimSpace(query)) + "%"
-	rows, err := s.Pool.Query(ctx, "SELECT "+userColumns+` FROM users WHERE realm_id=$1 AND
-        ($2='' OR lower(username) LIKE $3 OR lower(email) LIKE $3 OR lower(display_name) LIKE $3)
-        ORDER BY `+sort.orderBy()+` LIMIT $4 OFFSET $5`, realmID, strings.TrimSpace(query), pattern, limit, offset)
+	rows, err := s.Pool.Query(ctx, "SELECT "+userColumns+" FROM users WHERE "+userFilter+`
+        ORDER BY `+sort.orderBy()+` LIMIT $5 OFFSET $6`,
+		realmID, strings.TrimSpace(query), pattern, string(status.normalized()), limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -89,12 +121,11 @@ func (s *Store) ListUsers(ctx context.Context, realmID uuid.UUID, query string, 
 	return users, rows.Err()
 }
 
-func (s *Store) CountUsers(ctx context.Context, realmID uuid.UUID, query string) (int, error) {
+func (s *Store) CountUsers(ctx context.Context, realmID uuid.UUID, query string, status UserStatus) (int, error) {
 	pattern := "%" + strings.ToLower(strings.TrimSpace(query)) + "%"
 	var total int
-	err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE realm_id=$1 AND
-		($2='' OR lower(username) LIKE $3 OR lower(email) LIKE $3 OR lower(display_name) LIKE $3)`,
-		realmID, strings.TrimSpace(query), pattern).Scan(&total)
+	err := s.Pool.QueryRow(ctx, "SELECT count(*) FROM users WHERE "+userFilter,
+		realmID, strings.TrimSpace(query), pattern, string(status.normalized())).Scan(&total)
 	return total, err
 }
 

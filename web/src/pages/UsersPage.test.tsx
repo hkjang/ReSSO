@@ -102,13 +102,20 @@ test('a locked account can be released without resetting its password', async ()
   expect(mocks.api.mock.calls.some(([path]) => String(path).includes('/password'))).toBe(false)
 })
 
+// The filter is applied by the server, to the count as well as to the rows, so
+// the pager counts what is shown and a locked account on a later page is still
+// reachable. Narrowing only the page that had been fetched could not do that.
 test('the status filter narrows the list to locked accounts', async () => {
   const user = userEvent.setup()
   mocks.api.mockImplementation((path: string) => {
     if (path.includes('/role-mappings')) {
       return Promise.resolve({ available_realm_roles: [], available_client_roles: [], realm_role_ids: [], federation_realm_role_ids: [], client_role_ids: [] })
     }
-    if (path.includes('/users')) return Promise.resolve({ items: [legacyUser, lockedUser], total: 2 })
+    if (path.includes('/users')) {
+      return path.includes('status=locked')
+        ? Promise.resolve({ items: [lockedUser], total: 1 })
+        : Promise.resolve({ items: [legacyUser, lockedUser], total: 2 })
+    }
     return Promise.resolve({ items: [] })
   })
   renderUsers()
@@ -117,8 +124,11 @@ test('the status filter narrows the list to locked accounts', async () => {
   expect(screen.getByText('Bob')).toBeInTheDocument()
 
   await user.click(screen.getByRole('button', { name: '잠김' }))
+
+  expect(await screen.findByText('Bob')).toBeInTheDocument()
   expect(screen.queryByText('Alice')).not.toBeInTheDocument()
-  expect(screen.getByText('Bob')).toBeInTheDocument()
+  // The count the pager reports comes from the same narrowed query.
+  expect(screen.getByText(/1-1 of 1|1–1 \/ 1|1–1 of 1/)).toBeInTheDocument()
 })
 
 test('saving refreshes the form from the record the server returns', async () => {
@@ -207,4 +217,37 @@ test('a second quick search applies its term to the list already open', async ()
     const asked = mocks.api.mock.calls.map(([path]) => String(path))
     expect(asked.some((path) => path.includes('/users?q=bob'))).toBe(true)
   })
+})
+
+// The dashboard reports how many accounts are locked and offers a link to see
+// them. It has to arrive filtered, and the request has to carry the filter so
+// the server narrows the count as well as the rows — otherwise the pager counts
+// accounts the list is not showing and the promised number cannot be reached.
+test('arriving from the dashboard asks the server for locked accounts only', async () => {
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+    <MemoryRouter initialEntries={['/admin/users?status=locked']}>
+      <Routes><Route path="/admin/users" element={<UsersPage />} /></Routes>
+    </MemoryRouter>
+  </QueryClientProvider>)
+
+  await vi.waitFor(() => {
+    const asked = mocks.api.mock.calls.map(([path]) => String(path))
+    expect(asked.some((path) => path.includes('/users?') && path.includes('status=locked'))).toBe(true)
+  })
+  expect(screen.getByRole('button', { name: '잠김' })).toHaveAttribute('aria-pressed', 'true')
+})
+
+// A link written by hand, or one left over from a version that named the filter
+// differently, opens the list rather than an error.
+test('a status the console does not know opens the unfiltered list', async () => {
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+    <MemoryRouter initialEntries={['/admin/users?status=on-fire']}>
+      <Routes><Route path="/admin/users" element={<UsersPage />} /></Routes>
+    </MemoryRouter>
+  </QueryClientProvider>)
+
+  await vi.waitFor(() => expect(mocks.api).toHaveBeenCalled())
+  const asked = mocks.api.mock.calls.map(([path]) => String(path))
+  expect(asked.every((path) => !path.includes('status='))).toBe(true)
+  expect(await screen.findByText('Alice')).toBeInTheDocument()
 })

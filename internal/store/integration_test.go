@@ -853,14 +853,14 @@ func TestIntegrationEnsureSearchIndexesIsIdempotentAndOptional(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	users, err := data.ListUsers(ctx, realm.ID, "smith", UserSort{}, 100, 0)
+	users, err := data.ListUsers(ctx, realm.ID, "smith", UserStatusAny, UserSort{}, 100, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(users) != 2 {
 		t.Fatalf("search for %q returned %d users", "smith", len(users))
 	}
-	total, err := data.CountUsers(ctx, realm.ID, "smith")
+	total, err := data.CountUsers(ctx, realm.ID, "smith", UserStatusAny)
 	if err != nil || total != 2 {
 		t.Fatalf("CountUsers = %d, err=%v", total, err)
 	}
@@ -1033,6 +1033,86 @@ func TestIntegrationApprovalListResolvesRequesterAndTargetRole(t *testing.T) {
 	}
 	if len(views) != 2 {
 		t.Fatalf("expected two requests, got %d", len(views))
+	}
+}
+
+// The dashboard reports how many accounts are locked and offers "잠긴 사용자
+// 보기". Narrowing only the page that was already fetched left the pager
+// counting the unfiltered total, so the promised number could not be reached:
+// the operator paged through screens of accounts that were not locked. The
+// listing and its count share one predicate here so they cannot say different
+// things.
+func TestIntegrationUserStatusFilterNarrowsTheCountAsWellAsTheRows(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	realm := bootstrap.RealmID
+	for index := 0; index < 12; index++ {
+		if _, err := data.CreateUser(ctx, realm, CreateUserInput{
+			Username: fmt.Sprintf("member%02d", index), Password: "member-password-123",
+			Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two locked and one disabled, chosen from the far end of the username
+	// ordering so a single page of the default listing would not contain them.
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET locked_until=now()+interval '10 minutes'
+		WHERE realm_id=$1 AND username IN ('member10','member11')`, realm); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET enabled=false
+		WHERE realm_id=$1 AND username='member09'`, realm); err != nil {
+		t.Fatal(err)
+	}
+	// A lock that has run out is not a lock. Counting it would report accounts
+	// the console offers no unlock action for, because the row is not locked.
+	if _, err := data.Pool.Exec(ctx, `UPDATE users SET locked_until=now()-interval '1 minute'
+		WHERE realm_id=$1 AND username='member08'`, realm); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		status UserStatus
+		want   int
+	}{
+		{UserStatusLocked, 2},
+		{UserStatusDisabled, 1},
+		{UserStatus("something-a-stale-link-carried"), 13}, // 12 members and the bootstrap admin
+	} {
+		rows, err := data.ListUsers(ctx, realm, "", tc.status, UserSort{}, 100, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.status, err)
+		}
+		total, err := data.CountUsers(ctx, realm, "", tc.status)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.status, err)
+		}
+		if len(rows) != tc.want || total != tc.want {
+			t.Errorf("status %q returned %d rows and a count of %d, want %d of each",
+				tc.status, len(rows), total, tc.want)
+		}
+	}
+
+	// One page at a time is the case the dashboard's number has to survive.
+	firstPage, err := data.ListUsers(ctx, realm, "", UserStatusLocked, UserSort{}, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, err := data.CountUsers(ctx, realm, "", UserStatusLocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstPage) != 1 || total != 2 {
+		t.Errorf("a page of 1 returned %d rows with a count of %d, want 1 and 2", len(firstPage), total)
+	}
+
+	// And it still combines with the search rather than replacing it.
+	narrowed, err := data.ListUsers(ctx, realm, "member11", UserStatusLocked, UserSort{}, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(narrowed) != 1 {
+		t.Errorf("search and status together returned %d rows, want 1", len(narrowed))
 	}
 }
 
@@ -1220,7 +1300,7 @@ func TestIntegrationUserSortIsWhitelistedAndStable(t *testing.T) {
 		}
 	}
 	names := func(sort UserSort) []string {
-		users, err := data.ListUsers(ctx, realm.ID, "", sort, 100, 0)
+		users, err := data.ListUsers(ctx, realm.ID, "", UserStatusAny, sort, 100, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -4615,7 +4695,7 @@ func TestIntegrationDisablingAProviderSignsItsPeopleOutEverywhere(t *testing.T) 
 	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
 		t.Fatal(err)
 	}
-	people, err := data.ListUsers(ctx, realm.ID, "worker", UserSort{}, 5, 0)
+	people, err := data.ListUsers(ctx, realm.ID, "worker", UserStatusAny, UserSort{}, 5, 0)
 	if err != nil || len(people) != 1 {
 		t.Fatalf("imported users = %d (%v)", len(people), err)
 	}
@@ -4714,7 +4794,7 @@ func TestIntegrationUnlinkingAProviderSignsItsPeopleOutEverywhere(t *testing.T) 
 	if _, err := data.SyncLDAPFederation(ctx, provider.ID); err != nil {
 		t.Fatal(err)
 	}
-	people, err := data.ListUsers(ctx, realm.ID, "leaver", UserSort{}, 5, 0)
+	people, err := data.ListUsers(ctx, realm.ID, "leaver", UserStatusAny, UserSort{}, 5, 0)
 	if err != nil || len(people) != 1 {
 		t.Fatalf("imported users = %d (%v)", len(people), err)
 	}
