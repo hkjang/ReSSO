@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.9.2
+
+문서가 **열거한** Realm 정지의 약속을 HTTP 수준에서 확인합니다 — 사양상 거절하지 않아야 하는 두 endpoint까지 그 의미로 구분해서.
 
 ### 개발
 
