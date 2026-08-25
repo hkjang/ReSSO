@@ -676,6 +676,108 @@ func callIntegrationMCP(t *testing.T, client *http.Client, baseURL, token, paylo
 // could have survived thrown away by the clients that tried during it. The
 // dashboard has a readiness row for exactly this state, so it is one the
 // service expects to be in.
+// Suspending a Realm is documented as stopping the whole tenant, and the
+// operations guide enumerates what stops: discovery, JWKS, authorization,
+// token, userinfo, introspection and revocation. One function decides it for
+// all of them, which is the right shape — and nothing checked that every
+// protocol route actually goes through it. A route added later that resolves
+// the Realm its own way would serve a suspended tenant with the guide still
+// promising otherwise.
+func TestIntegrationSuspendedRealmRefusesEveryProtocolEndpoint(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	const base = "/realms/master"
+	endpoints := []struct{ method, path string }{
+		{http.MethodGet, base + "/.well-known/openid-configuration"},
+		{http.MethodGet, base + "/protocol/openid-connect/certs"},
+		{http.MethodGet, base + "/protocol/openid-connect/auth"},
+		{http.MethodPost, base + "/protocol/openid-connect/token"},
+		{http.MethodGet, base + "/protocol/openid-connect/userinfo"},
+		{http.MethodPost, base + "/protocol/openid-connect/userinfo"},
+		{http.MethodGet, base + "/protocol/openid-connect/logout"},
+		{http.MethodPost, base + "/protocol/openid-connect/logout"},
+	}
+	call := func(method, path string) (int, string) {
+		t.Helper()
+		request, requestErr := http.NewRequest(method, server.URL+path, strings.NewReader(""))
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+
+	// While it is running, discovery answers — so a refusal below means the
+	// suspension and not a path that never existed.
+	if status, _ := call(http.MethodGet, base+"/.well-known/openid-configuration"); status != http.StatusOK {
+		t.Fatalf("discovery answered %d before the Realm was suspended", status)
+	}
+
+	if _, err := data.Pool.Exec(ctx, "UPDATE realms SET enabled=false WHERE id=$1", realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range endpoints {
+		status, _ := call(endpoint.method, endpoint.path)
+		if status < 400 {
+			t.Errorf("%s %s answered %d while the Realm was suspended: the operations guide says "+
+				"the whole tenant stops", endpoint.method, endpoint.path, status)
+		}
+	}
+
+	// Introspection and revocation are the two that must not refuse, and it is
+	// not an exception to the rule above — it is how the rule is expressed
+	// there. RFC 7662 answers an unknown token with active:false and RFC 7009
+	// answers 200, both so that neither endpoint becomes a way to ask whether
+	// something exists. A suspended Realm has to look exactly like a Realm with
+	// nothing in it, which is what these two say.
+	status, body := call(http.MethodPost, base+"/protocol/openid-connect/token/introspect")
+	if status != http.StatusOK {
+		t.Errorf("introspection answered %d for a suspended Realm, which tells a caller it exists", status)
+	}
+	var introspection struct {
+		Active bool `json:"active"`
+	}
+	if err := json.Unmarshal([]byte(body), &introspection); err != nil {
+		t.Fatalf("introspection answered something that is not the documented shape: %s", body)
+	}
+	if introspection.Active {
+		t.Error("introspection reported a token as active in a suspended Realm")
+	}
+	if status, _ := call(http.MethodPost, base+"/protocol/openid-connect/revoke"); status != http.StatusOK {
+		t.Errorf("revocation answered %d for a suspended Realm; RFC 7009 answers 200 so that the "+
+			"endpoint cannot be used to ask what exists", status)
+	}
+
+	// Suspension is blocking, not discarding: the guide says re-enabling brings
+	// the tenant back.
+	if _, err := data.Pool.Exec(ctx, "UPDATE realms SET enabled=true WHERE id=$1", realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := call(http.MethodGet, base+"/.well-known/openid-configuration"); status != http.StatusOK {
+		t.Errorf("discovery answered %d after the Realm was enabled again", status)
+	}
+}
+
 func TestIntegrationTokenEndpointDoesNotBlameTheGrantForAMissingSigningKey(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()
