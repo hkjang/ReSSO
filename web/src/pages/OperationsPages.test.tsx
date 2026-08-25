@@ -91,3 +91,51 @@ test('the audit screen opens on the event type a link names', async () => {
     expect(asked.some((path) => path.includes('/audit?') && path.includes('event_type=APPROVAL_DECISION'))).toBe(true)
   })
 })
+
+function renderAudit(entry = '/admin/audit') {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return render(<QueryClientProvider client={queryClient}>
+    <MemoryRouter initialEntries={[entry]}><AuditPage /></MemoryRouter>
+  </QueryClientProvider>)
+}
+
+const auditAsked = () => mocks.api.mock.calls.map(([path]) => String(path)).filter((path) => path.includes('/audit?'))
+
+// Every filter on this screen travels in the URL, not just the event type: a
+// narrowed audit view is something to link to during an incident, and a link
+// that carries only half the filters shows a different list to whoever opens it.
+test('the audit screen opens on the result a link names', async () => {
+  renderAudit('/admin/audit?result=FAILURE')
+  await waitFor(() => expect(auditAsked().some((path) => path.includes('result=FAILURE'))).toBe(true))
+})
+
+test('the audit screen opens on the actor a link names, with the box filled in', async () => {
+  renderAudit('/admin/audit?actor=alice')
+  await waitFor(() => expect(auditAsked().some((path) => path.includes('actor=alice'))).toBe(true))
+  expect(screen.getByLabelText(/행위자|Actor/i)).toHaveValue('alice')
+})
+
+test('typing an actor puts it in the URL so the narrowed view can be shared', async () => {
+  const user = userEvent.setup()
+  renderAudit()
+  await waitFor(() => expect(mocks.api).toHaveBeenCalled())
+
+  await user.type(screen.getByLabelText(/행위자|Actor/i), 'carol')
+
+  await waitFor(() => expect(auditAsked().some((path) => path.includes('actor=carol'))).toBe(true))
+})
+
+test('clearing removes every filter, not some of them', async () => {
+  const user = userEvent.setup()
+  renderAudit('/admin/audit?event_type=LOGIN_FAILURE&result=FAILURE&actor=alice')
+  await waitFor(() => expect(auditAsked().some((path) => path.includes('actor=alice'))).toBe(true))
+
+  await user.click(screen.getByRole('button', { name: /초기화|필터 해제|전체 해제/ }))
+
+  await waitFor(() => {
+    const last = auditAsked().at(-1) ?? ''
+    expect(last).not.toContain('event_type=LOGIN_FAILURE')
+    expect(last).not.toContain('result=FAILURE')
+    expect(last).not.toContain('actor=alice')
+  })
+})
