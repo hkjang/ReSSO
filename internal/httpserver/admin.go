@@ -277,10 +277,10 @@ func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.store.CreateUser(r.Context(), realmID, input)
 	if err != nil {
-		if errors.Is(err, store.ErrInvalidInput) {
-			writeStoreError(w, r, err)
-			return
-		}
+		// writeStoreError already separates what the caller sent from what
+		// went wrong here; a branch that calls it for one of those cases and
+		// then again for the rest reads as though this handler treats them
+		// differently, and it does not.
 		writeStoreError(w, r, err)
 		return
 	}
