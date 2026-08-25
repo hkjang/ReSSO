@@ -196,12 +196,20 @@ func (s *Server) adminCreateRealm(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err)
 		return
 	}
+	principal, _ := principalFrom(r.Context())
 	if err := s.store.EnsureActiveSigningKey(r.Context(), realm.ID); err != nil {
 		s.logger.Error("initial realm key creation failed", "realm_id", realm.ID, "error", err)
+		// The Realm exists from here on, and the response says so. Returning
+		// before the audit line left the only record of a new tenant in a log
+		// that is kept for thirty days against the trail's year — and left the
+		// answer to "when did this Realm appear" as nothing at all. The same
+		// shape as an administrator ending a session and having it go
+		// unrecorded, which this service already corrected once.
+		s.audit(r, &realm.ID, &principal.UserID, principal.Username, "REALM_CREATE", "PARTIAL",
+			"realm", realm.ID.String(), map[string]any{"signing_key": "not_created", "error": err.Error()})
 		writeError(w, r, http.StatusInternalServerError, "key_creation_failed", "Realm은 생성되었으나 서명 키를 만들지 못했습니다.")
 		return
 	}
-	principal, _ := principalFrom(r.Context())
 	s.audit(r, &realm.ID, &principal.UserID, principal.Username, "REALM_CREATE", "SUCCESS", "realm", realm.ID.String(), nil)
 	writeJSON(w, http.StatusCreated, realm)
 }

@@ -683,6 +683,96 @@ func callIntegrationMCP(t *testing.T, client *http.Client, baseURL, token, paylo
 // protocol route actually goes through it. A route added later that resolves
 // the Realm its own way would serve a suspended tenant with the guide still
 // promising otherwise.
+// Creating a Realm is two writes: the Realm, then its first signing key. When
+// the second failed the handler answered 500 and returned — before the line
+// that records what happened. The Realm exists from the first write onward, so
+// the trail had no answer to "when did this tenant appear", and the only record
+// was a server log kept for thirty days against the trail's year. The same
+// shape as an administrator ending a session and having it go unrecorded,
+// which this service corrected once already.
+func TestIntegrationRealmCreatedWithoutItsKeyIsStillRecorded(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := &http.Client{Jar: jar}
+	loginResponse := postIntegrationLogin(t, browser, server.URL, "admin", "bootstrap-password-123")
+	var login struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.NewDecoder(loginResponse.Body).Decode(&login); err != nil {
+		t.Fatal(err)
+	}
+	_ = loginResponse.Body.Close()
+
+	// Only the key write fails. Everything else about the request is ordinary,
+	// which is what makes the Realm exist while the response says it went wrong.
+	if _, err := data.Pool.Exec(ctx, `CREATE FUNCTION block_key() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'signing key blocked for the test'; END $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `CREATE TRIGGER block_key BEFORE INSERT ON signing_keys
+		FOR EACH ROW EXECUTE FUNCTION block_key()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "DROP TRIGGER IF EXISTS block_key ON signing_keys")
+	})
+
+	body := `{"name":"tenant-without-a-key","display_name":"Tenant","issuer_url":"https://sso.example.com/realms/tenant-without-a-key"}`
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/admin/v1/realms", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-CSRF-Token", login.CSRFToken)
+	response, err := browser.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("creating a Realm whose key could not be written answered %d", response.StatusCode)
+	}
+
+	// The Realm is there, which is what makes the missing record matter.
+	var exists bool
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM realms WHERE name='tenant-without-a-key')").Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("the Realm was not created, so there is nothing for the trail to be missing")
+	}
+
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "REALM_CREATE", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("%d REALM_CREATE entries: a tenant exists that the trail cannot date", len(page.Items))
+	}
+	if page.Items[0].Result != "PARTIAL" {
+		t.Errorf("the entry records %s; the Realm was created and its key was not, which is neither "+
+			"a plain success nor nothing happening", page.Items[0].Result)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(page.Items[0].Detail, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail["signing_key"] != "not_created" {
+		t.Errorf("the entry does not say which half failed: %v", detail)
+	}
+}
+
 func TestIntegrationSuspendedRealmRefusesEveryProtocolEndpoint(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()
