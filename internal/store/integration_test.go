@@ -2598,6 +2598,20 @@ func TestIntegrationStaleSyncIsNotReportedAsRunning(t *testing.T) {
 	if stale.LastSyncStatus != "RUNNING" {
 		t.Errorf("the raw status was expected to remain RUNNING, got %q", stale.LastSyncStatus)
 	}
+
+	// The console offers the button because nothing is reported as running, and
+	// the server has to agree. The claim reads the same staleness window as the
+	// guard and the listing; a change that dropped it there alone would leave
+	// the button enabled and the request refused — this test's own subject,
+	// from the other side. Two of the three readers were asserted here and the
+	// one that decides whether the run may start was not.
+	reclaimed, err := data.ClaimLDAPSyncForTest(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reclaimed {
+		t.Error("an abandoned run could not be replaced: the console offers a sync the server refuses")
+	}
 }
 
 // A Realm that expires unused sessions refuses them long before expires_at
