@@ -89,6 +89,7 @@ export interface LDAPFederation {
   last_sync_added: number
   last_sync_updated: number
   last_sync_failed: number
+  last_sync_disabled: number
   sync_running: boolean
   created_at: string
   updated_at: string

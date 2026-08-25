@@ -23,7 +23,7 @@ var ldapFederationColumns = `id,realm_id,name,vendor,priority,enabled,connection
     first_name_ldap_attribute,last_name_ldap_attribute,display_name_ldap_attribute,member_of_ldap_attribute,
     group_role_mappings,import_enabled,sync_registrations,missing_user_action,edit_mode,batch_size,
     sync_period_seconds,next_sync_at,last_sync_at,last_sync_status,last_sync_error,last_sync_added,
-    last_sync_updated,last_sync_failed,
+    last_sync_updated,last_sync_failed,last_sync_disabled,
     (last_sync_status='RUNNING' AND updated_at >= now()-make_interval(secs => ` + staleSyncAfterSeconds + `)),
     created_at,updated_at`
 
@@ -115,7 +115,7 @@ func (s *Store) scanLDAPFederation(row pgx.Row) (ldapRuntime, error) {
 		&runtime.Provider.EditMode, &runtime.Provider.BatchSize, &runtime.Provider.SyncPeriodSeconds,
 		&runtime.Provider.NextSyncAt, &runtime.Provider.LastSyncAt, &runtime.Provider.LastSyncStatus,
 		&runtime.Provider.LastSyncError, &runtime.Provider.LastSyncAdded, &runtime.Provider.LastSyncUpdated,
-		&runtime.Provider.LastSyncFailed, &runtime.Provider.SyncRunning,
+		&runtime.Provider.LastSyncFailed, &runtime.Provider.LastSyncDisabled, &runtime.Provider.SyncRunning,
 		&runtime.Provider.CreatedAt, &runtime.Provider.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ldapRuntime{}, ErrNotFound
@@ -708,9 +708,10 @@ func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederati
 	}
 	var failures []error
 	if _, err := s.Pool.Exec(ctx, `UPDATE user_federations SET last_sync_at=now(),last_sync_status=$2,last_sync_error=$3,
-        last_sync_added=$4,last_sync_updated=$5,last_sync_failed=$6,
+        last_sync_added=$4,last_sync_updated=$5,last_sync_failed=$6,last_sync_disabled=$7,
         next_sync_at=CASE WHEN sync_period_seconds>0 THEN now()+make_interval(secs=>sync_period_seconds) END,
-        updated_at=now() WHERE id=$1`, provider.ID, status, message, summary.Added, summary.Updated, summary.Failed); err != nil {
+        updated_at=now() WHERE id=$1`, provider.ID, status, message,
+		summary.Added, summary.Updated, summary.Failed, summary.Disabled); err != nil {
 		failures = append(failures, fmt.Errorf("record the outcome on the provider: %w", err))
 	}
 

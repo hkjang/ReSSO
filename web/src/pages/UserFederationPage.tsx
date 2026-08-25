@@ -263,7 +263,7 @@ export function UserFederationPage() {
               {syncRunning
                 ? <Alert severity="info" icon={<CircularProgress size={18} />}>동기화가 진행 중입니다. 완료되면 아래 결과가 갱신됩니다.</Alert>
                 : liveEditing.last_sync_at && <Alert severity={liveEditing.last_sync_status === 'FAILURE' ? 'warning' : 'success'}>
-                    최근 동기화 {formatDate(liveEditing.last_sync_at)} · 추가 {liveEditing.last_sync_added ?? 0} · 갱신 {liveEditing.last_sync_updated ?? 0} · 실패 {liveEditing.last_sync_failed ?? 0}
+                    최근 동기화 {formatDate(liveEditing.last_sync_at)} · 추가 {liveEditing.last_sync_added ?? 0} · 갱신 {liveEditing.last_sync_updated ?? 0} · 실패 {liveEditing.last_sync_failed ?? 0} · 비활성화 {liveEditing.last_sync_disabled ?? 0}
                   </Alert>}
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}><Button startIcon={<PlayArrowRoundedIcon />} variant="outlined" onClick={() => testConnection.mutate()} disabled={testConnection.isPending}>연결 테스트</Button><Button startIcon={syncRunning ? <CircularProgress size={16} /> : <SyncRoundedIcon />} variant="outlined" onClick={() => sync.mutate()} disabled={sync.isPending || syncRunning || !editing.import_enabled}>{syncRunning ? '동기화 중…' : '전체 사용자 동기화'}</Button></Stack>
               {!editing.import_enabled && <Typography variant="caption" color="text.secondary">사용자 가져오기가 꺼져 있어 전체 동기화를 실행할 수 없습니다.</Typography>}

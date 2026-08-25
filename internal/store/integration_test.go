@@ -2832,6 +2832,18 @@ func TestIntegrationFederationSyncImportsThenDisablesOnlyWhatLeft(t *testing.T) 
 	if summary.Disabled != 1 {
 		t.Errorf("accounts disabled = %d, want 1", summary.Disabled)
 	}
+	// The summary is returned to whoever called this function, and a scheduled
+	// run has no such caller. The console sends an administrator to the
+	// provider's own last_sync fields to find out what a run did, so the number
+	// that ended someone's sessions has to be among them.
+	after, err := data.LDAPFederationByID(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.LastSyncDisabled != 1 {
+		t.Errorf("the provider reports %d accounts disabled by the last run, want 1: the screen "+
+			"an administrator is sent to cannot show what the run did", after.LastSyncDisabled)
+	}
 	if isEnabled, _ := enabled("leaves"); isEnabled {
 		t.Error("an account the directory no longer lists stayed enabled")
 	}

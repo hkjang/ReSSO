@@ -94,6 +94,13 @@ type LDAPFederation struct {
 	LastSyncAdded            int               `json:"last_sync_added"`
 	LastSyncUpdated          int               `json:"last_sync_updated"`
 	LastSyncFailed           int               `json:"last_sync_failed"`
+	// LastSyncDisabled is how many accounts the run deactivated because they
+	// were gone from the directory. Under the DISABLE policy that is the
+	// consequential outcome of a sync — it ends those people's sessions — and
+	// the console sends an administrator to these fields to find out what a run
+	// did, so leaving it to the audit trail alone hid it where they were told
+	// to look.
+	LastSyncDisabled int `json:"last_sync_disabled"`
 	// SyncRunning is the reconciled answer to "is a run happening now", not
 	// the raw status column. A run whose process died leaves that column
 	// saying RUNNING for ever, and the console used to believe it: the sync
