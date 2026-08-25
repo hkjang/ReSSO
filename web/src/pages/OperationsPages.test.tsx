@@ -11,7 +11,13 @@ vi.mock('../lib/api', () => ({ api: (...args: unknown[]) => mocks.api(...args) }
 
 beforeEach(() => {
   mocks.api.mockReset()
-  mocks.api.mockResolvedValue({ items: [] })
+  // The audit screen asks for the event types it can filter by and puts them in
+  // a select. Answering with none makes MUI warn that the value in the URL is
+  // out of range, which is noise the next person has to rule out.
+  mocks.api.mockImplementation((path: string) =>
+    Promise.resolve(String(path).includes('/audit/event-types')
+      ? { items: ['LOGIN_FAILURE', 'APPROVAL_DECISION'] }
+      : { items: [] }))
 })
 
 function renderLogs(entry = '/admin/logs') {

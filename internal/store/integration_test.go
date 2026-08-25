@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -2726,6 +2727,97 @@ func TestIntegrationLockAndKeyStateComeFromTheServer(t *testing.T) {
 // the sweep directly, not by synchronising anything.
 //
 // Set RESSO_TEST_LDAP_URL alongside the database DSN to run this.
+// A group is mapped to a Role by typing its name, and the name is taken as
+// written. A Role that this Realm does not have — a typo, or one deleted after
+// the mapping was made — resolves to nothing: the rule stays in the
+// configuration, the people in that group never receive the Role, and every run
+// reports success. Nobody is told which rule is dead, so nobody fixes it.
+func TestIntegrationFederationSyncNamesRoleMappingsThatResolveToNothing(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run federation synchronisation tests")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	branch := "ou=sync-mappings,dc=example,dc=test"
+	createDirectoryBranch(t, branch, "mapped")
+	if _, err := data.CreateRole(ctx, bootstrap.RealmID, "warehouse", "창고"); err != nil {
+		t.Fatal(err)
+	}
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		MemberOfLDAPAttribute: "memberOf",
+		GroupRoleMappings: map[string]string{
+			"cn=warehouse,ou=groups,dc=example,dc=test":   "warehouse",
+			"cn=night-shift,ou=groups,dc=example,dc=test": "warehosue", // as mistyped
+		},
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := data.SyncLDAPFederation(ctx, provider.ID)
+	if err != nil {
+		t.Fatalf("synchronising a reachable directory failed: %v (%+v)", err, summary)
+	}
+	if len(summary.UnknownRoles) != 1 || summary.UnknownRoles[0] != "warehosue" {
+		t.Fatalf("the run reported unknown roles %v: a mapping naming a Role this Realm does not "+
+			"have grants nothing and says nothing", summary.UnknownRoles)
+	}
+
+	// The audit trail is where a scheduled run's outcome is read; it has no
+	// caller to hand the summary to.
+	page, err := data.ListAudit(ctx, AuditFilter{RealmID: &bootstrap.RealmID,
+		EventType: "LDAP_FEDERATION_SYNC", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) == 0 {
+		t.Fatal("the run was not audited")
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(page.Items[0].Detail, &detail); err != nil {
+		t.Fatal(err)
+	}
+	named, ok := detail["unknown_roles"].([]any)
+	if !ok || len(named) != 1 || named[0] != "warehosue" {
+		t.Errorf("the audit entry does not name the dead mapping: %v", detail["unknown_roles"])
+	}
+
+	// A configuration whose mappings all resolve says nothing, so the message
+	// means something when it appears.
+	if _, err := data.UpdateLDAPFederation(ctx, provider.ID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: branch, UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "KEEP",
+		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
+		MemberOfLDAPAttribute: "memberOf",
+		GroupRoleMappings: map[string]string{
+			"cn=warehouse,ou=groups,dc=example,dc=test": "warehouse",
+		},
+		ImportEnabled: true, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	corrected, err := data.SyncLDAPFederation(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(corrected.UnknownRoles) != 0 {
+		t.Errorf("a configuration whose mappings all resolve reported %v", corrected.UnknownRoles)
+	}
+}
+
 func TestIntegrationFederationSyncImportsThenDisablesOnlyWhatLeft(t *testing.T) {
 	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
 	if directory == "" {

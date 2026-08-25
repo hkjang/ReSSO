@@ -101,6 +101,11 @@ type LDAPFederation struct {
 	// did, so leaving it to the audit trail alone hid it where they were told
 	// to look.
 	LastSyncDisabled int `json:"last_sync_disabled"`
+	// LastSyncUnknownRoles names the Roles a group mapping points at that this
+	// Realm does not have. They are configuration faults rather than run
+	// failures: the sync succeeds and grants nothing, so without naming them
+	// there is nothing to act on.
+	LastSyncUnknownRoles []string `json:"last_sync_unknown_roles,omitempty"`
 	// SyncRunning is the reconciled answer to "is a run happening now", not
 	// the raw status column. A run whose process died leaves that column
 	// saying RUNNING for ever, and the console used to believe it: the sync

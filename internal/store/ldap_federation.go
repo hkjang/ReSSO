@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,7 +24,7 @@ var ldapFederationColumns = `id,realm_id,name,vendor,priority,enabled,connection
     first_name_ldap_attribute,last_name_ldap_attribute,display_name_ldap_attribute,member_of_ldap_attribute,
     group_role_mappings,import_enabled,sync_registrations,missing_user_action,edit_mode,batch_size,
     sync_period_seconds,next_sync_at,last_sync_at,last_sync_status,last_sync_error,last_sync_added,
-    last_sync_updated,last_sync_failed,last_sync_disabled,
+    last_sync_updated,last_sync_failed,last_sync_disabled,last_sync_unknown_roles,
     (last_sync_status='RUNNING' AND updated_at >= now()-make_interval(secs => ` + staleSyncAfterSeconds + `)),
     created_at,updated_at`
 
@@ -72,6 +73,12 @@ type LDAPSyncSummary struct {
 	Updated      int       `json:"updated"`
 	Failed       int       `json:"failed"`
 	Disabled     int64     `json:"disabled"`
+	// UnknownRoles names the Role a group is mapped to that this Realm does
+	// not have. The mapping is free text and is accepted as written, so a typo
+	// or a Role deleted afterwards leaves a rule that resolves to nothing: the
+	// people in that group simply never receive the Role, every run reports
+	// success, and nothing says why. Naming them is what makes it fixable.
+	UnknownRoles []string `json:"unknown_roles,omitempty"`
 	// Failures names the users a run could not synchronize and why, up to
 	// namedSyncFailures of them. The count alone could not be acted on: the
 	// reason is known where it happens — a username already held by a local
@@ -115,7 +122,8 @@ func (s *Store) scanLDAPFederation(row pgx.Row) (ldapRuntime, error) {
 		&runtime.Provider.EditMode, &runtime.Provider.BatchSize, &runtime.Provider.SyncPeriodSeconds,
 		&runtime.Provider.NextSyncAt, &runtime.Provider.LastSyncAt, &runtime.Provider.LastSyncStatus,
 		&runtime.Provider.LastSyncError, &runtime.Provider.LastSyncAdded, &runtime.Provider.LastSyncUpdated,
-		&runtime.Provider.LastSyncFailed, &runtime.Provider.LastSyncDisabled, &runtime.Provider.SyncRunning,
+		&runtime.Provider.LastSyncFailed, &runtime.Provider.LastSyncDisabled,
+		&runtime.Provider.LastSyncUnknownRoles, &runtime.Provider.SyncRunning,
 		&runtime.Provider.CreatedAt, &runtime.Provider.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ldapRuntime{}, ErrNotFound
@@ -537,6 +545,13 @@ func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncS
 		summary.RecordError = recordError(s.finishLDAPSync(context.WithoutCancel(ctx), runtime.Provider, summary, err))
 		return summary, err
 	}
+	// Checked once for the run rather than per user: the mapping is the
+	// provider's configuration, not a property of anyone it matches.
+	unknown, err := s.unmappableRoles(ctx, runtime.Provider)
+	if err != nil {
+		return summary, err
+	}
+	summary.UnknownRoles = unknown
 	claimed, err := s.claimLDAPSync(ctx, id)
 	if err != nil {
 		return summary, err
@@ -706,12 +721,21 @@ func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederati
 	if len(message) > 1000 {
 		message = message[:1000]
 	}
+	// Never nil: the column is NOT NULL, and a nil slice encodes as NULL. The
+	// write that fails here is the one that records the outcome, so the run
+	// stays marked RUNNING and the next one is refused as already in progress —
+	// a report that cannot be filed stops the next report from happening.
+	unknownRoles := summary.UnknownRoles
+	if unknownRoles == nil {
+		unknownRoles = []string{}
+	}
 	var failures []error
 	if _, err := s.Pool.Exec(ctx, `UPDATE user_federations SET last_sync_at=now(),last_sync_status=$2,last_sync_error=$3,
         last_sync_added=$4,last_sync_updated=$5,last_sync_failed=$6,last_sync_disabled=$7,
+        last_sync_unknown_roles=$8,
         next_sync_at=CASE WHEN sync_period_seconds>0 THEN now()+make_interval(secs=>sync_period_seconds) END,
         updated_at=now() WHERE id=$1`, provider.ID, status, message,
-		summary.Added, summary.Updated, summary.Failed, summary.Disabled); err != nil {
+		summary.Added, summary.Updated, summary.Failed, summary.Disabled, unknownRoles); err != nil {
 		failures = append(failures, fmt.Errorf("record the outcome on the provider: %w", err))
 	}
 
@@ -723,6 +747,9 @@ func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederati
 	realmID := provider.RealmID
 	detail := map[string]any{"provider": provider.Name, "read": summary.Read, "added": summary.Added,
 		"updated": summary.Updated, "failed": summary.Failed, "disabled": summary.Disabled}
+	if len(summary.UnknownRoles) > 0 {
+		detail["unknown_roles"] = summary.UnknownRoles
+	}
 	if len(summary.Failures) > 0 {
 		detail["failures"] = summary.Failures
 	}
@@ -791,6 +818,46 @@ func (s *Store) upsertFederatedUser(ctx context.Context, provider domain.LDAPFed
 		return false, err
 	}
 	return added, nil
+}
+
+// unmappableRoles reports the Roles a group mapping names that the Realm does
+// not have, sorted so the message is stable.
+func (s *Store) unmappableRoles(ctx context.Context, provider domain.LDAPFederation) ([]string, error) {
+	wanted := map[string]struct{}{}
+	for _, role := range provider.GroupRoleMappings {
+		if role = strings.TrimSpace(role); role != "" {
+			wanted[role] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return nil, nil
+	}
+	names := make([]string, 0, len(wanted))
+	for name := range wanted {
+		names = append(names, name)
+	}
+	rows, err := s.Pool.Query(ctx, `SELECT name FROM roles WHERE realm_id=$1 AND name=ANY($2)`,
+		provider.RealmID, names)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		delete(wanted, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	missing := make([]string, 0, len(wanted))
+	for name := range wanted {
+		missing = append(missing, name)
+	}
+	sort.Strings(missing)
+	return missing, nil
 }
 
 func syncFederatedRoles(ctx context.Context, tx pgx.Tx, provider domain.LDAPFederation, userID uuid.UUID, names []string) error {
