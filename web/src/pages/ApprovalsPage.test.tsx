@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, expect, test, vi } from 'vitest'
 import { ApprovalsPage } from './ApprovalsPage'
 
@@ -35,7 +36,7 @@ beforeEach(() => {
 
 function renderApprovals() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={queryClient}><ApprovalsPage /></QueryClientProvider>)
+  return render(<QueryClientProvider client={queryClient}><MemoryRouter><ApprovalsPage /></MemoryRouter></QueryClientProvider>)
 }
 
 test('the queue names the requester and the role instead of identifiers', async () => {
@@ -64,4 +65,28 @@ test('a request whose role no longer exists is flagged rather than shown blank',
   mocks.api.mockResolvedValue({ items: [{ ...request, target_role_name: '' }] })
   renderApprovals()
   expect(await screen.findByText(/요청한 Role을 찾을 수 없습니다/)).toBeInTheDocument()
+})
+
+// The listing is capped at 500 and waiting requests come first, so what it
+// drops is the oldest decided ones. A cut list that says nothing looks like the
+// whole history. The decisions it cannot show are in the audit trail, which
+// keeps a year of them — and the link has to arrive there already narrowed to
+// approval decisions, or the reader is left to find them again.
+test('a listing that hits the cap says so and points at the decisions it dropped', async () => {
+  mocks.api.mockResolvedValue({ items: Array.from({ length: 500 }, (_, index) => ({
+    ...request, id: `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`, status: 'APPROVED',
+  })) })
+  renderApprovals()
+
+  expect(await screen.findByText(/500건만 표시합니다/)).toBeInTheDocument()
+  expect(screen.getByRole('link', { name: '감사 이벤트에서 보기' }))
+    .toHaveAttribute('href', '/admin/audit?event_type=APPROVAL_DECISION')
+})
+
+test('a listing that fits says nothing about a cap', async () => {
+  mocks.api.mockResolvedValue({ items: [request] })
+  renderApprovals()
+
+  expect(await screen.findByText('Role 할당')).toBeInTheDocument()
+  expect(screen.queryByText(/500건만 표시합니다/)).not.toBeInTheDocument()
 })

@@ -3,7 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, expect, test, vi } from 'vitest'
-import { LogsPage } from './OperationsPages'
+import { AuditPage, LogsPage } from './OperationsPages'
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }))
 
@@ -75,4 +75,19 @@ test('the log table says what it lists', async () => {
   renderLogs()
   const table = await screen.findByRole('table', { name: '서버 로그 목록' })
   expect(table).toBeInTheDocument()
+})
+
+// Another screen links here to show the approval decisions its own listing had
+// to cut. A link that arrives unfiltered leaves the reader to find them again,
+// so the event type is read from the URL rather than kept as local state.
+test('the audit screen opens on the event type a link names', async () => {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  render(<QueryClientProvider client={queryClient}>
+    <MemoryRouter initialEntries={['/admin/audit?event_type=APPROVAL_DECISION']}><AuditPage /></MemoryRouter>
+  </QueryClientProvider>)
+
+  await waitFor(() => {
+    const asked = mocks.api.mock.calls.map(([path]) => String(path))
+    expect(asked.some((path) => path.includes('/audit?') && path.includes('event_type=APPROVAL_DECISION'))).toBe(true)
+  })
 })

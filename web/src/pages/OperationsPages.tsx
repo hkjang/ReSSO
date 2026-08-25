@@ -20,12 +20,24 @@ interface LogRow { id: number; occurred_at: string; level: string; component: st
 export function AuditPage() {
   const navigate = useNavigate()
   const [selected, setSelected] = useState<AuditRow | null>(null)
-  const [eventType, setEventType] = useState('')
   const [result, setResult] = useState('')
   const [actorInput, setActorInput] = useState('')
   const [actor, setActor] = useState('')
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(100)
+  // The event type lives in the URL so other screens can link straight to one
+  // kind of event. The approvals screen shows the most recent requests and cuts
+  // the rest; the decisions it cannot show are recorded here, and a link that
+  // arrives unfiltered leaves the reader to find them again.
+  const [params, setParams] = useSearchParams()
+  const eventType = params.get('event_type') ?? ''
+  const setEventType = (value: string) => {
+    const next = new URLSearchParams(params)
+    if (value) next.set('event_type', value)
+    else next.delete('event_type')
+    setParams(next, { replace: true })
+    setPage(0)
+  }
   const [oldestFirst, setOldestFirst] = useState(false)
   // The search box is debounced: without it every keystroke was a request.
   useEffect(() => {
