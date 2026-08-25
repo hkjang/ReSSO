@@ -1278,6 +1278,51 @@ func TestIntegrationAuditOrderDirection(t *testing.T) {
 	}
 }
 
+// An audit trail answers "what happened, in what order". The listing ordered
+// by the wall clock first and only broke ties with the row id, so a clock that
+// steps backwards — NTP correcting an appliance that was offline for a while, a
+// resumed VM — reorders events that already happened. This service already
+// treats clock skew as a fact of operation: the dashboard reports it. The row
+// id is a bigserial assigned when the row is written and WriteAudit never sets
+// occurred_at itself, so insertion order is the recorded sequence and is not
+// something an operator or an NTP daemon can move.
+func TestIntegrationAuditOrderSurvivesAClockStepBackwards(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	for _, name := range []string{"before the step", "after the step"} {
+		if err := data.WriteAudit(ctx, AuditEvent{RealmID: &bootstrap.RealmID, ActorName: name,
+			EventType: "CLOCK_STEP_TEST", Result: "SUCCESS"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The clock is corrected between the two writes, so the second event carries
+	// the earlier timestamp. Moving the newer row back is exactly what the clock
+	// would have written, and it leaves everything else untouched.
+	if _, err := data.Pool.Exec(ctx, `UPDATE audit_events SET occurred_at =
+		(SELECT min(occurred_at) FROM audit_events WHERE event_type='CLOCK_STEP_TEST') - interval '5 minutes'
+		WHERE id = (SELECT max(id) FROM audit_events WHERE event_type='CLOCK_STEP_TEST')`); err != nil {
+		t.Fatal(err)
+	}
+
+	newest, err := data.ListAudit(ctx, AuditFilter{RealmID: &bootstrap.RealmID, EventType: "CLOCK_STEP_TEST"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newest.Items[0].ActorName != "after the step" {
+		t.Errorf("newest-first started with %q: the event written last was listed below an "+
+			"earlier one because its timestamp moved", newest.Items[0].ActorName)
+	}
+	oldest, err := data.ListAudit(ctx, AuditFilter{RealmID: &bootstrap.RealmID,
+		EventType: "CLOCK_STEP_TEST", Ascending: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldest.Items[0].ActorName != "before the step" {
+		t.Errorf("oldest-first started with %q", oldest.Items[0].ActorName)
+	}
+}
+
 func TestIntegrationLDAPSyncOutcomeReachesTheAuditTrail(t *testing.T) {
 	data := openIntegrationStore(t, integrationSealer(t))
 	bootstrap := bootstrapIntegrationStore(t, data)

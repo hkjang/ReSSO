@@ -113,9 +113,16 @@ func (s *Store) ListAudit(ctx context.Context, filter AuditFilter) (AuditPage, e
 		filter.RealmID, filter.EventType, filter.Result, filter.Actor, filter.TraceID).Scan(&page.Total); err != nil {
 		return AuditPage{}, err
 	}
+	// Ordered by the row id, not by the timestamp. The id is a bigserial assigned
+	// when the entry is written and WriteAudit never sets occurred_at itself, so
+	// under a sound clock the two agree — and when the clock steps backwards, only
+	// the id still says which event came first. An appliance that was offline for
+	// a while and then has its clock corrected is exactly this case, and this
+	// service already reports clock skew on its dashboard. The timestamp is still
+	// what the entry shows; it is just not what decides the order.
 	rows, err := s.Pool.Query(ctx, `SELECT id,occurred_at,realm_id,actor_name,event_type,result,target_type,
         target_id,ip_address,trace_id,detail FROM audit_events `+auditWhere+`
-        ORDER BY occurred_at `+filter.order()+`, id `+filter.order()+` LIMIT $6 OFFSET $7`,
+        ORDER BY id `+filter.order()+` LIMIT $6 OFFSET $7`,
 		filter.RealmID, filter.EventType, filter.Result, filter.Actor, filter.TraceID, filter.Limit, filter.Offset)
 	if err != nil {
 		return AuditPage{}, err

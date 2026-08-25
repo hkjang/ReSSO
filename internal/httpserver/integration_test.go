@@ -1900,15 +1900,18 @@ func TestIntegrationPasswordChangeAdmitsWhenSessionsSurvive(t *testing.T) {
 	}
 	result, detail := lastAudit()
 	if result != "PARTIAL" || detail["other_sessions_ended"] != false || detail["error"] == nil {
-		// This has failed intermittently, twice, and "SUCCESS with an empty
-		// detail" is exactly what the first change of this test writes — so
-		// either the revoking UPDATE matched no row, or the wrong entry was
-		// read. Ruled out so far: reading the wrong entry, because the listing
-		// orders by occurred_at then by id, and id is a bigserial, so a tie on
-		// the timestamp still yields the newer row; and the test alone, which
-		// survived forty consecutive runs. That points at something another
-		// test in the package leaves behind, and the counts below are what
-		// would show it.
+		// This failed intermittently with "SUCCESS and an empty detail", which
+		// is exactly what the first change of this test writes. Reading the
+		// wrong entry was written off here on the grounds that the listing
+		// broke timestamp ties with the bigserial id — but a tie was never
+		// what it took. The audit response and the audit result are the same
+		// variable (partialIfNot(ended)), and the response assertion above
+		// passed, so the second entry could not have said SUCCESS; with both
+		// entries present, the only way to read SUCCESS was for the listing to
+		// return the older row, which needs the first row's timestamp to be
+		// the larger one. The listing now orders by id, which no clock can
+		// move. The counts below stay because they name their own cause if
+		// this ever fails again.
 		var liveNow, blockedByTrigger, auditEntries int
 		if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM sso_sessions
 			WHERE user_id=$1 AND revoked_at IS NULL`, bootstrap.AdminUserID).Scan(&liveNow); err != nil {
