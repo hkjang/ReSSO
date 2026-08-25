@@ -25,6 +25,7 @@ var ldapFederationColumns = `id,realm_id,name,vendor,priority,enabled,connection
     group_role_mappings,import_enabled,sync_registrations,missing_user_action,edit_mode,batch_size,
     sync_period_seconds,next_sync_at,last_sync_at,last_sync_status,last_sync_error,last_sync_added,
     last_sync_updated,last_sync_failed,last_sync_disabled,last_sync_unknown_roles,
+    last_sync_group_memberships,
     (last_sync_status='RUNNING' AND updated_at >= now()-make_interval(secs => ` + staleSyncAfterSeconds + `)),
     created_at,updated_at`
 
@@ -79,6 +80,12 @@ type LDAPSyncSummary struct {
 	// people in that group simply never receive the Role, every run reports
 	// success, and nothing says why. Naming them is what makes it fixable.
 	UnknownRoles []string `json:"unknown_roles,omitempty"`
+	// GroupMemberships is how many of the users read carried any group at all.
+	// A mapping can name a Role that exists and still grant nothing when the
+	// directory returns no membership — the attribute is named wrong, or the
+	// overlay that produces it is off. Zero here, with mappings configured,
+	// says the mappings had nothing to match rather than that they are wrong.
+	GroupMemberships int `json:"group_memberships"`
 	// Failures names the users a run could not synchronize and why, up to
 	// namedSyncFailures of them. The count alone could not be acted on: the
 	// reason is known where it happens — a username already held by a local
@@ -123,7 +130,8 @@ func (s *Store) scanLDAPFederation(row pgx.Row) (ldapRuntime, error) {
 		&runtime.Provider.NextSyncAt, &runtime.Provider.LastSyncAt, &runtime.Provider.LastSyncStatus,
 		&runtime.Provider.LastSyncError, &runtime.Provider.LastSyncAdded, &runtime.Provider.LastSyncUpdated,
 		&runtime.Provider.LastSyncFailed, &runtime.Provider.LastSyncDisabled,
-		&runtime.Provider.LastSyncUnknownRoles, &runtime.Provider.SyncRunning,
+		&runtime.Provider.LastSyncUnknownRoles, &runtime.Provider.LastSyncGroupMemberships,
+		&runtime.Provider.SyncRunning,
 		&runtime.Provider.CreatedAt, &runtime.Provider.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ldapRuntime{}, ErrNotFound
@@ -566,6 +574,9 @@ func (s *Store) SyncLDAPFederation(ctx context.Context, id uuid.UUID) (LDAPSyncS
 	}
 	summary.Read = len(users)
 	for _, external := range users {
+		if len(external.MemberOf) > 0 {
+			summary.GroupMemberships++
+		}
 		added, upsertErr := s.upsertFederatedUser(ctx, runtime.Provider, external, summary.StartedAt)
 		if upsertErr != nil {
 			summary.Failed++
@@ -732,10 +743,10 @@ func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederati
 	var failures []error
 	if _, err := s.Pool.Exec(ctx, `UPDATE user_federations SET last_sync_at=now(),last_sync_status=$2,last_sync_error=$3,
         last_sync_added=$4,last_sync_updated=$5,last_sync_failed=$6,last_sync_disabled=$7,
-        last_sync_unknown_roles=$8,
+        last_sync_unknown_roles=$8,last_sync_group_memberships=$9,
         next_sync_at=CASE WHEN sync_period_seconds>0 THEN now()+make_interval(secs=>sync_period_seconds) END,
         updated_at=now() WHERE id=$1`, provider.ID, status, message,
-		summary.Added, summary.Updated, summary.Failed, summary.Disabled, unknownRoles); err != nil {
+		summary.Added, summary.Updated, summary.Failed, summary.Disabled, unknownRoles, summary.GroupMemberships); err != nil {
 		failures = append(failures, fmt.Errorf("record the outcome on the provider: %w", err))
 	}
 
@@ -746,7 +757,8 @@ func (s *Store) finishLDAPSync(ctx context.Context, provider domain.LDAPFederati
 	// which reported its result to the trail before.
 	realmID := provider.RealmID
 	detail := map[string]any{"provider": provider.Name, "read": summary.Read, "added": summary.Added,
-		"updated": summary.Updated, "failed": summary.Failed, "disabled": summary.Disabled}
+		"updated": summary.Updated, "failed": summary.Failed, "disabled": summary.Disabled,
+		"group_memberships": summary.GroupMemberships}
 	if len(summary.UnknownRoles) > 0 {
 		detail["unknown_roles"] = summary.UnknownRoles
 	}

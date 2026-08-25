@@ -106,6 +106,10 @@ type LDAPFederation struct {
 	// failures: the sync succeeds and grants nothing, so without naming them
 	// there is nothing to act on.
 	LastSyncUnknownRoles []string `json:"last_sync_unknown_roles,omitempty"`
+	// LastSyncGroupMemberships is how many of the users the last run read
+	// carried any group. Zero, with mappings configured, means the mappings had
+	// nothing to match against rather than that they name the wrong Role.
+	LastSyncGroupMemberships int `json:"last_sync_group_memberships"`
 	// SyncRunning is the reconciled answer to "is a run happening now", not
 	// the raw status column. A run whose process died leaves that column
 	// saying RUNNING for ever, and the console used to believe it: the sync

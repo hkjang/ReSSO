@@ -91,6 +91,7 @@ export interface LDAPFederation {
   last_sync_failed: number
   last_sync_disabled: number
   last_sync_unknown_roles?: string[]
+  last_sync_group_memberships: number
   sync_running: boolean
   created_at: string
   updated_at: string

@@ -2742,6 +2742,11 @@ func TestIntegrationFederationSyncNamesRoleMappingsThatResolveToNothing(t *testi
 	ctx := context.Background()
 	branch := "ou=sync-mappings,dc=example,dc=test"
 	createDirectoryBranch(t, branch, "mapped")
+	// A real group, so the run has memberships to match against: a mapping can
+	// name a Role that exists and still grant nothing when the directory
+	// returns none, and the two have to be told apart.
+	createDirectoryGroup(t, "ou=mapping-groups,dc=example,dc=test",
+		"cn=warehouse,ou=mapping-groups,dc=example,dc=test", "uid=mapped,"+branch)
 	if _, err := data.CreateRole(ctx, bootstrap.RealmID, "warehouse", "창고"); err != nil {
 		t.Fatal(err)
 	}
@@ -2803,7 +2808,7 @@ func TestIntegrationFederationSyncNamesRoleMappingsThatResolveToNothing(t *testi
 		EmailLDAPAttribute: "mail", DisplayNameLDAPAttribute: "cn",
 		MemberOfLDAPAttribute: "memberOf",
 		GroupRoleMappings: map[string]string{
-			"cn=warehouse,ou=groups,dc=example,dc=test": "warehouse",
+			"cn=warehouse,ou=mapping-groups,dc=example,dc=test": "warehouse",
 		},
 		ImportEnabled: true, Enabled: true,
 	}); err != nil {
@@ -2815,6 +2820,35 @@ func TestIntegrationFederationSyncNamesRoleMappingsThatResolveToNothing(t *testi
 	}
 	if len(corrected.UnknownRoles) != 0 {
 		t.Errorf("a configuration whose mappings all resolve reported %v", corrected.UnknownRoles)
+	}
+
+	// A mapping can name a Role that exists and still grant nothing, because
+	// the directory returned no membership: the memberOf attribute is named
+	// wrong, or the overlay producing it is off — it is not on by default in
+	// OpenLDAP. The run succeeds either way, so the two cases have to be told
+	// apart. This directory publishes no memberOf for these entries.
+	if corrected.GroupMemberships != 1 {
+		t.Errorf("%d of the users read carried a group, want 1: without this the count cannot "+
+			"separate a wrong mapping from a directory that returns no membership",
+			corrected.GroupMemberships)
+	}
+	after, err := data.LDAPFederationByID(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.LastSyncGroupMemberships != 1 || len(after.LastSyncUnknownRoles) != 0 {
+		t.Errorf("the provider reports memberships=%d unknown=%v after a clean run",
+			after.LastSyncGroupMemberships, after.LastSyncUnknownRoles)
+	}
+	// And the mapping actually granted the Role, which is the point of all of it.
+	var granted int
+	if err := data.Pool.QueryRow(ctx, `SELECT count(*) FROM user_roles ur
+		JOIN users u ON u.id=ur.user_id JOIN roles r ON r.id=ur.role_id
+		WHERE u.username='mapped' AND r.name='warehouse'`).Scan(&granted); err != nil {
+		t.Fatal(err)
+	}
+	if granted != 1 {
+		t.Errorf("the group mapping granted %d roles, want 1", granted)
 	}
 }
 
