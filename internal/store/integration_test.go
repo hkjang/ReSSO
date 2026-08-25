@@ -1323,6 +1323,39 @@ func TestIntegrationAuditOrderSurvivesAClockStepBackwards(t *testing.T) {
 	}
 }
 
+// Ordering the audit listing by id needs an index that ends in id, or a
+// filtered listing walks the primary key backwards discarding rows that do not
+// match. Measured on 400k rows, a filter matching 0.5% of them cost 0.09ms with
+// the old index, 1.57ms with none that fits, and 0.12ms with this one — and the
+// gap widens with the table and with how rare the filtered value is. Nothing
+// else would notice the index going away, so it is asserted here.
+func TestIntegrationAuditListingHasAnIndexForItsOrder(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	present := func(name string) bool {
+		t.Helper()
+		var exists bool
+		if err := data.Pool.QueryRow(ctx, `SELECT EXISTS(
+			SELECT 1 FROM pg_indexes WHERE indexname=$1 AND schemaname=current_schema())`,
+			name).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		return exists
+	}
+	if !present("idx_audit_realm_event_id") {
+		t.Error("the audit listing filters by realm and event type and orders by id, " +
+			"and no index covers that")
+	}
+	// The retention delete is the only thing left that reads occurred_at.
+	if !present("idx_audit_occurred") {
+		t.Error("the 365-day retention delete has no index on occurred_at")
+	}
+	// Superseded: it orders by occurred_at, which the listing no longer does.
+	if present("idx_audit_realm_event") {
+		t.Error("the index built for the previous ordering is still being maintained on every write")
+	}
+}
+
 func TestIntegrationLDAPSyncOutcomeReachesTheAuditTrail(t *testing.T) {
 	data := openIntegrationStore(t, integrationSealer(t))
 	bootstrap := bootstrapIntegrationStore(t, data)
