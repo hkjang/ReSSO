@@ -370,6 +370,9 @@ type ApprovalRequestView struct {
 	TargetRoleName string `json:"target_role_name,omitempty"`
 }
 
+// ListApprovalRequests lists approval requests, optionally narrowed to a Realm,
+// a requester or a reviewer.
+//
 // It also reports whether more matched than it returned, so the screen does not
 // have to guess from the row count — which claims something is hidden when the
 // Realm holds exactly the cap. One extra row is read and dropped.
