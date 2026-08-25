@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { beforeEach, expect, test, vi } from 'vitest'
 import { UsersPage } from './UsersPage'
 
@@ -176,4 +176,35 @@ test('a reset that could not end the sessions says so instead of claiming it did
 
   expect(await screen.findByText('비밀번호는 재설정되었지만 이 계정의 세션을 종료하지 못했습니다.')).toBeInTheDocument()
   expect(screen.queryByText('비밀번호를 재설정하고 세션을 종료했습니다.')).not.toBeInTheDocument()
+})
+
+// The quick-search palette opens over whatever screen is showing, including
+// this one, and hands the matched term over in the URL so the destination
+// "opens on the match". Landing on a route the browser is already on does not
+// remount anything, so a term read once at mount is read only for the first
+// search — the second one leaves the field, the request and the address bar
+// disagreeing with each other.
+test('a second quick search applies its term to the list already open', async () => {
+  const user = userEvent.setup()
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  function HandOver() {
+    const navigate = useNavigate()
+    return <button onClick={() => navigate('/admin/users?q=bob')}>hand over bob</button>
+  }
+  render(<QueryClientProvider client={queryClient}>
+    <MemoryRouter initialEntries={['/admin/users?q=alice']}>
+      <HandOver />
+      <Routes><Route path="/admin/users" element={<UsersPage />} /></Routes>
+    </MemoryRouter>
+  </QueryClientProvider>)
+
+  expect(await screen.findByDisplayValue('alice')).toBeInTheDocument()
+
+  await user.click(screen.getByRole('button', { name: 'hand over bob' }))
+
+  expect(await screen.findByDisplayValue('bob')).toBeInTheDocument()
+  await vi.waitFor(() => {
+    const asked = mocks.api.mock.calls.map(([path]) => String(path))
+    expect(asked.some((path) => path.includes('/users?q=bob'))).toBe(true)
+  })
 })

@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import LockOpenRoundedIcon from '@mui/icons-material/LockOpenRounded'
 import SearchRoundedIcon from '@mui/icons-material/SearchRounded'
 import { Alert, Box, Button, Checkbox, Chip, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, InputAdornment, MenuItem, Stack, Switch, Table, TableBody, TableCell, TableContainer, TableHead, TablePagination, TableRow, TextField, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from '@mui/material'
@@ -29,8 +30,13 @@ export function UsersPage() {
   const realms = useRealms()
   const selection = useRealmSelection(realms.data?.items)
   // The command palette hands over the term it matched, so the page opens on
-  // the user that was selected rather than on an unfiltered list.
-  const [handedOverTerm] = useState(() => new URLSearchParams(window.location.search).get('q') ?? '')
+  // the user that was selected rather than on an unfiltered list. Read from the
+  // router on every change, not once at mount: the palette opens over this
+  // screen too, and landing on the route the browser is already on remounts
+  // nothing. A term read once is applied to the first hand-over only, leaving
+  // the field, the request and the address bar saying three different things.
+  const [searchParams] = useSearchParams()
+  const handedOverTerm = searchParams.get('q') ?? ''
   const [searchInput, setSearchInput] = useState(handedOverTerm)
   const [search, setSearch] = useState(handedOverTerm)
   const [page, setPage] = useState(0)
@@ -64,6 +70,16 @@ export function UsersPage() {
     const timer = window.setTimeout(() => { setSearch(searchInput.trim()); setPage(0) }, 300)
     return () => window.clearTimeout(timer)
   }, [searchInput])
+  // Adjusted during render rather than in an effect, the same way the realm
+  // change below is: the extra render happens before the browser paints, so the
+  // list never shows a frame filtered by the previous term.
+  const [appliedTerm, setAppliedTerm] = useState(handedOverTerm)
+  if (appliedTerm !== handedOverTerm) {
+    setAppliedTerm(handedOverTerm)
+    setSearchInput(handedOverTerm)
+    setSearch(handedOverTerm)
+    setPage(0)
+  }
   // These three derive editor state from data that arrives asynchronously.
   // Adjusting during render instead of in an effect is React's documented
   // pattern for it: the extra render happens before the browser paints, so it

@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import SearchRoundedIcon from '@mui/icons-material/SearchRounded'
 import { Alert, Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, InputAdornment, MenuItem, Stack, Switch, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -28,8 +29,21 @@ export function ClientsPage() {
   const [createForm, setCreateForm] = useState(blankClient)
   const [selected, setSelected] = useState<Client | null>(null)
   const [edit, setEdit] = useState<(Client & { redirectText: string; logoutText: string; originsText: string; scopesText: string }) | null>(null)
-  // Seeded by the command palette so the selected client is already filtered.
-  const [search, setSearch] = useState(() => new URLSearchParams(window.location.search).get('q') ?? '')
+  // Handed over by the command palette so the selected client is already
+  // filtered. Read from the router on every change, not once at mount: the
+  // palette opens over this screen too, and landing on the route the browser is
+  // already on remounts nothing, so a term read once applies to the first
+  // hand-over only and every later one leaves the list showing the old filter.
+  const [searchParams] = useSearchParams()
+  const handedOverTerm = searchParams.get('q') ?? ''
+  const [search, setSearch] = useState(handedOverTerm)
+  // Adjusted during render rather than in an effect, so the list never shows a
+  // frame still filtered by the previous term.
+  const [appliedTerm, setAppliedTerm] = useState(handedOverTerm)
+  if (appliedTerm !== handedOverTerm) {
+    setAppliedTerm(handedOverTerm)
+    setSearch(handedOverTerm)
+  }
   const [sort, setSort] = useState<SortState<'name' | 'client_id' | 'type'>>({ column: 'name', descending: false })
   const [oneTimeSecret, setOneTimeSecret] = useState('')
   // Rotating a secret takes effect immediately and breaks every deployment
