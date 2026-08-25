@@ -210,7 +210,7 @@ func writeSessionsEnded(w http.ResponseWriter, ended bool, detail map[string]any
 
 func (s *Server) mySessions(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFrom(r.Context())
-	sessions, err := s.store.ListSessions(r.Context(), nil, &principal.UserID, "", 100)
+	sessions, _, err := s.store.ListSessions(r.Context(), nil, &principal.UserID, "", 100)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
@@ -370,12 +370,12 @@ func (s *Server) myRequestableRoles(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listMyRequests(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFrom(r.Context())
-	requests, err := s.store.ListApprovalRequests(r.Context(), nil, &principal.UserID, nil)
+	requests, more, err := s.store.ListApprovalRequests(r.Context(), nil, &principal.UserID, nil)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": requests})
+	writeJSON(w, http.StatusOK, map[string]any{"items": requests, "truncated": more})
 }
 
 func (s *Server) createMyRequest(w http.ResponseWriter, r *http.Request) {
@@ -407,12 +407,12 @@ func (s *Server) createMyRequest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listMyReviews(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFrom(r.Context())
-	requests, err := s.store.ListApprovalRequests(r.Context(), nil, nil, &principal.UserID)
+	requests, more, err := s.store.ListApprovalRequests(r.Context(), nil, nil, &principal.UserID)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": requests})
+	writeJSON(w, http.StatusOK, map[string]any{"items": requests, "truncated": more})
 }
 
 func (s *Server) decideMyReview(w http.ResponseWriter, r *http.Request) {

@@ -693,12 +693,16 @@ func (s *Server) adminListRealmSessions(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	items, err := s.store.ListSessions(r.Context(), &realmID, nil, r.URL.Query().Get("q"), queryInt(r, "limit", 200))
+	items, more, err := s.store.ListSessions(r.Context(), &realmID, nil,
+		r.URL.Query().Get("q"), queryInt(r, "limit", 200))
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	// Whether the answer was cut is the server's to know. The console inferring
+	// it from the row count says "there is more" for a Realm holding exactly the
+	// limit, and a notice that cries wolf stops being read.
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "truncated": more})
 }
 
 func (s *Server) adminRevokeSession(w http.ResponseWriter, r *http.Request) {
@@ -780,12 +784,12 @@ func (s *Server) adminListApprovals(w http.ResponseWriter, r *http.Request) {
 		}
 		realmID = &parsed
 	}
-	items, err := s.store.ListApprovalRequests(r.Context(), realmID, nil, nil)
+	items, more, err := s.store.ListApprovalRequests(r.Context(), realmID, nil, nil)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "truncated": more})
 }
 
 func (s *Server) adminDecideApproval(w http.ResponseWriter, r *http.Request) {

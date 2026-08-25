@@ -353,10 +353,18 @@ func (s *Store) BackchannelLogoutTargets(ctx context.Context, realmID, sessionID
 // the most recently used sessions, and reports "none" for a session that is
 // open but further down. The screen exists to answer "which sessions does this
 // person have open", which is exactly the case that failed.
-func (s *Store) ListSessions(ctx context.Context, realmID *uuid.UUID, userID *uuid.UUID, query string, limit int) ([]domain.Session, error) {
+// It also reports whether there are more matches than it returned. The console
+// used to infer that from the row count reaching the limit, which says "there
+// is more" for a Realm holding exactly that many — and a screen that claims to
+// be hiding something when it is not teaches the reader to ignore the notice.
+// One extra row is read and dropped, which answers it without a second count.
+func (s *Store) ListSessions(ctx context.Context, realmID *uuid.UUID, userID *uuid.UUID, query string, limit int) ([]domain.Session, bool, error) {
 	if limit < 1 || limit > 500 {
 		limit = 100
 	}
+	// One more than asked for: if it comes back, there are more to be had.
+	probe := limit + 1
+
 	// Whether a session is still usable is answered here with the same
 	// predicate that decides it everywhere else. A reader cannot derive it
 	// from the columns: idle expiry refuses a session while expires_at is
@@ -371,9 +379,9 @@ func (s *Store) ListSessions(ctx context.Context, realmID *uuid.UUID, userID *uu
         AND ($3='' OR lower(u.username) LIKE $4 OR lower(s.ip_address) LIKE $4)
         ORDER BY s.last_access DESC LIMIT $5`,
 		realmID, userID, strings.TrimSpace(query),
-		"%"+strings.ToLower(strings.TrimSpace(query))+"%", limit)
+		"%"+strings.ToLower(strings.TrimSpace(query))+"%", probe)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
 	sessions := make([]domain.Session, 0)
@@ -382,9 +390,15 @@ func (s *Store) ListSessions(ctx context.Context, realmID *uuid.UUID, userID *uu
 		if err := rows.Scan(&session.ID, &session.RealmID, &session.UserID, &session.Username,
 			&session.IPAddress, &session.UserAgent, &session.AuthMethod, &session.CreatedAt,
 			&session.LastAccess, &session.ExpiresAt, &session.RevokedAt, &session.Active); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		sessions = append(sessions, session)
 	}
-	return sessions, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(sessions) > limit {
+		return sessions[:limit], true, nil
+	}
+	return sessions, false, nil
 }

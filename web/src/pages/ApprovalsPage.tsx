@@ -15,12 +15,14 @@ export function ApprovalsPage() {
   const [target, setTarget] = useState<ApprovalRequest | null>(null)
   const [decision, setDecision] = useState<'approve' | 'reject'>('approve')
   const [note, setNote] = useState('')
-  const requests = useQuery({ queryKey: ['approvals'], queryFn: () => api<{ items: ApprovalRequest[] }>('/api/admin/v1/approvals'), refetchInterval: 20_000 })
+  const requests = useQuery({ queryKey: ['approvals'], queryFn: () => api<{ items: ApprovalRequest[]; truncated: boolean }>('/api/admin/v1/approvals'), refetchInterval: 20_000 })
   // The listing is capped at 500 with waiting requests ordered first, so what
   // it drops is the oldest decided ones. Saying nothing makes a cut list look
   // like the whole history; the decisions it cannot show are in the audit
-  // trail, which keeps a year of them and can be paged.
-  const truncated = (requests.data?.items.length ?? 0) >= 500
+  // trail, which keeps a year of them and can be paged. Whether it was cut is
+  // the server's answer — counting the rows here claims something is hidden
+  // when the Realm holds exactly 500.
+  const truncated = requests.data?.truncated ?? false
   const decide = useMutation({ mutationFn: () => api<ApprovalRequest>(`/api/admin/v1/approvals/${target!.id}/decision`, { method: 'POST', ...jsonBody({ decision, note }) }), onSuccess: async () => { setTarget(null); setNote(''); await queryClient.invalidateQueries({ queryKey: ['approvals'] }) } })
   if (requests.isLoading) return <PageLoading />
   if (requests.error) return <ErrorAlert error={requests.error} onRetry={() => void requests.refetch()} />

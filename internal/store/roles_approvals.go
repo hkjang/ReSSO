@@ -370,7 +370,11 @@ type ApprovalRequestView struct {
 	TargetRoleName string `json:"target_role_name,omitempty"`
 }
 
-func (s *Store) ListApprovalRequests(ctx context.Context, realmID *uuid.UUID, requesterID, reviewerID *uuid.UUID) ([]ApprovalRequestView, error) {
+// It also reports whether more matched than it returned, so the screen does not
+// have to guess from the row count — which claims something is hidden when the
+// Realm holds exactly the cap. One extra row is read and dropped.
+func (s *Store) ListApprovalRequests(ctx context.Context, realmID *uuid.UUID, requesterID, reviewerID *uuid.UUID) ([]ApprovalRequestView, bool, error) {
+	const cap = 500
 	// The role identifier inside the payload is compared as text: it is
 	// untrusted JSON, and casting it to uuid would fail the whole query on a
 	// malformed value rather than simply not matching.
@@ -391,9 +395,9 @@ func (s *Store) ListApprovalRequests(ctx context.Context, realmID *uuid.UUID, re
         LEFT JOIN roles ro ON a.kind='ROLE_ASSIGNMENT' AND ro.id::text=a.payload->>'role_id'
         WHERE ($1::uuid IS NULL OR a.realm_id=$1) AND ($2::uuid IS NULL OR a.requester_id=$2)
         AND ($3::uuid IS NULL OR a.reviewer_id=$3)
-        ORDER BY (a.status='PENDING') DESC, a.created_at DESC LIMIT 500`, realmID, requesterID, reviewerID)
+        ORDER BY (a.status='PENDING') DESC, a.created_at DESC LIMIT $4`, realmID, requesterID, reviewerID, cap+1)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
 	requests := make([]ApprovalRequestView, 0)
@@ -403,11 +407,17 @@ func (s *Store) ListApprovalRequests(ctx context.Context, realmID *uuid.UUID, re
 			&view.Payload, &view.Reason, &view.Status, &view.DecisionNote, &view.CreatedAt, &view.DecidedAt,
 			&view.RealmName, &view.RequesterUsername, &view.RequesterDisplayName,
 			&view.ReviewerUsername, &view.TargetRoleName); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		requests = append(requests, view)
 	}
-	return requests, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(requests) > cap {
+		return requests[:cap], true, nil
+	}
+	return requests, false, nil
 }
 
 func (s *Store) DecideApprovalRequest(ctx context.Context, requestID, reviewerID uuid.UUID,

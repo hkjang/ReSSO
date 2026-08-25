@@ -998,7 +998,7 @@ func TestIntegrationApprovalListResolvesRequesterAndTargetRole(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	views, err := data.ListApprovalRequests(ctx, &bootstrap.RealmID, nil, nil)
+	views, _, err := data.ListApprovalRequests(ctx, &bootstrap.RealmID, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1027,7 +1027,7 @@ func TestIntegrationApprovalListResolvesRequesterAndTargetRole(t *testing.T) {
 		uuid.New(), bootstrap.RealmID, requester.ID); err != nil {
 		t.Fatal(err)
 	}
-	views, err = data.ListApprovalRequests(ctx, &bootstrap.RealmID, nil, nil)
+	views, _, err = data.ListApprovalRequests(ctx, &bootstrap.RealmID, nil, nil)
 	if err != nil {
 		t.Fatalf("a malformed payload broke the listing: %v", err)
 	}
@@ -1082,12 +1082,25 @@ func TestIntegrationSessionSearchReachesPastTheListingCap(t *testing.T) {
 	// A cap smaller than the number of sessions, which is the situation the
 	// screen is in on any Realm with more sessions than it asks for.
 	const cap = 3
-	page, err := data.ListSessions(ctx, &realm, nil, "", cap)
+	page, more, err := data.ListSessions(ctx, &realm, nil, "", cap)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page) != cap {
 		t.Fatalf("the capped listing returned %d sessions, want %d", len(page), cap)
+	}
+	// Whether it was cut is answered here rather than guessed from the row
+	// count: a Realm holding exactly the cap is not hiding anything.
+	if !more {
+		t.Error("the listing was cut and did not report it")
+	}
+	exact, exactMore, err := data.ListSessions(ctx, &realm, nil, "", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exact) != 6 || exactMore {
+		t.Errorf("a listing holding exactly its limit returned %d rows and reported more=%v",
+			len(exact), exactMore)
 	}
 	for _, session := range page {
 		if session.Username == "quiet-contractor" {
@@ -1095,7 +1108,7 @@ func TestIntegrationSessionSearchReachesPastTheListingCap(t *testing.T) {
 		}
 	}
 
-	found, err := data.ListSessions(ctx, &realm, nil, "quiet-contractor", cap)
+	found, _, err := data.ListSessions(ctx, &realm, nil, "quiet-contractor", cap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1105,7 +1118,7 @@ func TestIntegrationSessionSearchReachesPastTheListingCap(t *testing.T) {
 	}
 
 	// The address is the other thing an administrator searches by.
-	byAddress, err := data.ListSessions(ctx, &realm, nil, "10.0.0.9", cap)
+	byAddress, _, err := data.ListSessions(ctx, &realm, nil, "10.0.0.9", cap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1114,7 +1127,7 @@ func TestIntegrationSessionSearchReachesPastTheListingCap(t *testing.T) {
 	}
 
 	// Case is not something an administrator should have to match.
-	upper, err := data.ListSessions(ctx, &realm, nil, "QUIET-Contractor", cap)
+	upper, _, err := data.ListSessions(ctx, &realm, nil, "QUIET-Contractor", cap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2607,7 +2620,7 @@ func TestIntegrationListedSessionReportsWhetherItStillWorks(t *testing.T) {
 	}
 	listed := func() domain.Session {
 		t.Helper()
-		items, listErr := data.ListSessions(ctx, &bootstrap.RealmID, nil, "", 10)
+		items, _, listErr := data.ListSessions(ctx, &bootstrap.RealmID, nil, "", 10)
 		if listErr != nil {
 			t.Fatal(listErr)
 		}
@@ -4333,7 +4346,7 @@ func TestIntegrationWaitingApprovalsSurviveTheListingCap(t *testing.T) {
 	}
 
 	realmID := bootstrap.RealmID
-	listed, err := data.ListApprovalRequests(ctx, &realmID, nil, nil)
+	listed, _, err := data.ListApprovalRequests(ctx, &realmID, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

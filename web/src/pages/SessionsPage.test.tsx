@@ -87,11 +87,20 @@ test('the search goes to the server rather than filtering the page already fetch
 })
 
 // A cut-off list that says nothing looks like the whole list.
-test('a listing that hits the cap says so', async () => {
-  mocks.api.mockResolvedValue({ items: Array.from({ length: 500 }, (_, index) => ({
-    ...session, id: `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`,
-  })) })
+test('a listing the server reports as cut says so', async () => {
+  mocks.api.mockResolvedValue({ items: [session], truncated: true })
   renderSessions()
 
   expect(await screen.findByText(/500건만 표시합니다/)).toBeInTheDocument()
+})
+
+// Counting the rows here said "there is more" for a Realm holding exactly the
+// limit. The server knows which it is, and a notice that cries wolf stops
+// being read.
+test('a listing that is complete says nothing about a cap', async () => {
+  mocks.api.mockResolvedValue({ items: [session], truncated: false })
+  renderSessions()
+
+  expect(await screen.findByText(session.username)).toBeInTheDocument()
+  expect(screen.queryByText(/500건만 표시합니다/)).not.toBeInTheDocument()
 })

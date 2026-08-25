@@ -28,7 +28,7 @@ export function SessionsPage() {
     const timer = window.setTimeout(() => setSearch(searchInput.trim()), 300)
     return () => window.clearTimeout(timer)
   }, [searchInput])
-  const sessions = useQuery({ queryKey: ['sessions', selection.realmID, search], queryFn: () => api<{ items: Session[] }>(`/api/admin/v1/realms/${selection.realmID}/sessions?limit=500&q=${encodeURIComponent(search)}`), enabled: Boolean(selection.realmID), refetchInterval: 20_000 })
+  const sessions = useQuery({ queryKey: ['sessions', selection.realmID, search], queryFn: () => api<{ items: Session[]; truncated: boolean }>(`/api/admin/v1/realms/${selection.realmID}/sessions?limit=500&q=${encodeURIComponent(search)}`), enabled: Boolean(selection.realmID), refetchInterval: 20_000 })
   // The dialog promises this revokes the refresh tokens linked to the session,
   // and that is the half that can fail on its own after the session has ended.
   // Closing quietly leaves the operator believing the promise was kept while a
@@ -50,8 +50,10 @@ export function SessionsPage() {
   // said a session further down did not exist.
   const visibleSessions = sessions.data?.items ?? []
   // And when there are more than the screen asked for, it has to say so rather
-  // than let the missing ones look like they are not there.
-  const truncated = visibleSessions.length >= 500
+  // than let the missing ones look like they are not there. The server answers
+  // that; counting the rows here says "there is more" for a Realm holding
+  // exactly 500, and a notice that cries wolf stops being read.
+  const truncated = sessions.data?.truncated ?? false
   if (realms.isLoading) return <PageLoading />
   return <><PageHeader title="SSO 세션" description="사용자가 로그인한 브라우저와 활동 상태를 확인하고 강제로 종료합니다." /><Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} sx={{ mb: 2 }}><RealmPicker realms={realms.data?.items ?? []} value={selection.realmID} onChange={selection.setRealmID} /><TextField value={searchInput} onChange={(e) => setSearchInput(e.target.value)} placeholder="사용자, IP 검색" sx={{ maxWidth: 360 }} inputProps={{ 'aria-label': '세션 검색' }} InputProps={{ startAdornment: <InputAdornment position="start"><SearchRoundedIcon /></InputAdornment> }} /></Stack>
     {truncated && <Alert severity="info" sx={{ mb: 2 }}>최근 사용 순으로 500건만 표시합니다. 사용자나 IP로 검색하면 이 범위 밖의 세션도 찾을 수 있습니다.</Alert>}

@@ -20,9 +20,6 @@ interface LogRow { id: number; occurred_at: string; level: string; component: st
 export function AuditPage() {
   const navigate = useNavigate()
   const [selected, setSelected] = useState<AuditRow | null>(null)
-  const [result, setResult] = useState('')
-  const [actorInput, setActorInput] = useState('')
-  const [actor, setActor] = useState('')
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(100)
   // The event type lives in the URL so other screens can link straight to one
@@ -30,20 +27,37 @@ export function AuditPage() {
   // the rest; the decisions it cannot show are recorded here, and a link that
   // arrives unfiltered leaves the reader to find them again.
   const [params, setParams] = useSearchParams()
-  const eventType = params.get('event_type') ?? ''
-  const setEventType = (value: string) => {
+  const narrow = (key: string, value: string) => {
     const next = new URLSearchParams(params)
-    if (value) next.set('event_type', value)
-    else next.delete('event_type')
+    if (value) next.set(key, value)
+    else next.delete(key)
+    // Replace: narrowing a list is not a place the back button should stop.
     setParams(next, { replace: true })
     setPage(0)
   }
+  const eventType = params.get('event_type') ?? ''
+  const setEventType = (value: string) => narrow('event_type', value)
+  const result = params.get('result') ?? ''
+  const setResult = (value: string) => narrow('result', value)
+  const actor = params.get('actor') ?? ''
+  // The box is local so typing is not fought by the URL; the settled value is
+  // what travels. Seeded from the link so a shared view arrives filled in.
+  const [actorInput, setActorInput] = useState(actor)
   const [oldestFirst, setOldestFirst] = useState(false)
   // The search box is debounced: without it every keystroke was a request.
   useEffect(() => {
-    const timer = window.setTimeout(() => { setActor(actorInput.trim()); setPage(0) }, 300)
+    const timer = window.setTimeout(() => {
+      setParams((previous) => {
+        const next = new URLSearchParams(previous)
+        const value = actorInput.trim()
+        if (value) next.set('actor', value)
+        else next.delete('actor')
+        return next
+      }, { replace: true })
+      setPage(0)
+    }, 300)
     return () => window.clearTimeout(timer)
-  }, [actorInput])
+  }, [actorInput, setParams])
   const eventTypes = useQuery({
     queryKey: ['audit-event-types'],
     queryFn: () => api<{ items: string[] }>('/api/admin/v1/audit/event-types'),
@@ -57,7 +71,15 @@ export function AuditPage() {
     refetchInterval: 30_000,
   })
   const filtered = Boolean(eventType || result || actor)
-  const clear = () => { setEventType(''); setResult(''); setActorInput(''); setActor(''); setPage(0) }
+  // One write rather than three, so the filters cannot race each other in the
+  // URL and leave one of them behind.
+  const clear = () => {
+    setActorInput('')
+    const next = new URLSearchParams(params)
+    for (const key of ['event_type', 'result', 'actor']) next.delete(key)
+    setParams(next, { replace: true })
+    setPage(0)
+  }
   return <><PageHeader title="감사 이벤트" description="로그인, Token, 관리자 변경과 키 회전을 보안 감사 관점에서 추적합니다." badge="365일 보존" />
     <Stack direction={{ xs: 'column', md: 'row' }} spacing={1.5} sx={{ mb: 2 }}>
       <TextField select label="이벤트" value={eventType} onChange={(e) => { setEventType(e.target.value); setPage(0) }} sx={{ minWidth: 220 }}>

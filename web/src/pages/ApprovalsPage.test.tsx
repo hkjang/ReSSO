@@ -73,9 +73,7 @@ test('a request whose role no longer exists is flagged rather than shown blank',
 // keeps a year of them — and the link has to arrive there already narrowed to
 // approval decisions, or the reader is left to find them again.
 test('a listing that hits the cap says so and points at the decisions it dropped', async () => {
-  mocks.api.mockResolvedValue({ items: Array.from({ length: 500 }, (_, index) => ({
-    ...request, id: `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`, status: 'APPROVED',
-  })) })
+  mocks.api.mockResolvedValue({ items: [{ ...request, status: 'APPROVED' }], truncated: true })
   renderApprovals()
 
   expect(await screen.findByText(/500건만 표시합니다/)).toBeInTheDocument()
@@ -84,7 +82,7 @@ test('a listing that hits the cap says so and points at the decisions it dropped
 })
 
 test('a listing that fits says nothing about a cap', async () => {
-  mocks.api.mockResolvedValue({ items: [request] })
+  mocks.api.mockResolvedValue({ items: [request], truncated: false })
   renderApprovals()
 
   expect(await screen.findByText('Role 할당')).toBeInTheDocument()
