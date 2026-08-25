@@ -19,6 +19,11 @@ BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 # exists and ships a vendored Go package that must not be linted.
 GO_PACKAGES = ./cmd/... ./internal/... ./webui/...
 
+# Pinned to what CI installs. A different linter locally is worse than none:
+# `make lint` passes, the push fails, and the message names a rule the local
+# binary does not have. A test keeps this equal to the version in ci.yaml.
+GOLANGCI_VERSION = v2.13.1
+
 # Every frontend target below needs node_modules. Without this a fresh clone
 # meets "vitest: not found" from `make test` — the command the README gives as
 # the way to check your work — instead of the install it was missing. CI runs
@@ -35,8 +40,28 @@ web/node_modules: web/package-lock.json web/package.json
 # The image builds on the version in the toolchain directive and CI resolves
 # the same from go.mod; asking for it here makes all three agree.
 lint: web/node_modules
-	golangci-lint run $(GO_PACKAGES)
-	GOTOOLCHAIN=auto govulncheck $(GO_PACKAGES)
+# Same reasoning as the node_modules target above: the tools being absent is the
+# ordinary state of a fresh clone, and "command not found" does not say that
+# `go install` fixes it or which version to ask for. Both install into GOBIN,
+# which is not on PATH by default, so the recipe looks there as well as on PATH
+# and says so once for whichever is missing rather than failing a line at a time.
+	@missing=""; \
+	for tool in golangci-lint govulncheck; do \
+		command -v $$tool >/dev/null 2>&1 || test -x "$$(go env GOPATH)/bin/$$tool" || missing="$$missing $$tool"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "not installed:$$missing"; \
+		case "$$missing" in *golangci-lint*) \
+			echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)";; \
+		esac; \
+		case "$$missing" in *govulncheck*) \
+			echo "  go install golang.org/x/vuln/cmd/govulncheck@latest";; \
+		esac; \
+		echo "  export PATH=\"\$$(go env GOPATH)/bin:\$$PATH\""; \
+		exit 1; \
+	fi
+	PATH="$$(go env GOPATH)/bin:$$PATH" golangci-lint run $(GO_PACKAGES)
+	PATH="$$(go env GOPATH)/bin:$$PATH" GOTOOLCHAIN=auto govulncheck $(GO_PACKAGES)
 	cd web && npm run lint
 
 # A skipped test still lets `go test` print ok, and sixty of these are gated on
