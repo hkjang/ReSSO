@@ -149,3 +149,40 @@ test('a run that saw memberships says nothing about them', async () => {
   expect(await screen.findByText(/비활성화 3/)).toBeInTheDocument()
   expect(screen.queryByText(/그룹 소속을 가진 사용자가/)).not.toBeInTheDocument()
 })
+
+// "연결됨" used to be the whole answer, and it is the smaller half: an
+// attribute name that is well formed but absent from this directory passes
+// every check made when the provider is saved, and then imports everyone
+// without the value.
+test('a connection test that finds empty attributes says which', async () => {
+  const user = userEvent.setup()
+  const { api } = await import('../lib/api')
+  vi.mocked(api).mockImplementation((path: unknown) =>
+    String(path).includes('test-connection')
+      ? Promise.resolve({ connected: true, duration_ms: 12, sampled: 5, attributes: { username: 5, email: 0, display_name: 0 } })
+      : Promise.resolve({ items: [provider] }) as never)
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  render(<QueryClientProvider client={queryClient}><MemoryRouter><UserFederationPage /></MemoryRouter></QueryClientProvider>)
+
+  await user.click(await screen.findByText('corp'))
+  await user.click(screen.getByRole('button', { name: '연결 테스트' }))
+
+  expect(await screen.findByText(/email, display_name|display_name, email/)).toBeInTheDocument()
+  expect(screen.getByText(/형식이 맞아도 없는 이름이면/)).toBeInTheDocument()
+})
+
+test('a connection test whose attributes all yield values says so plainly', async () => {
+  const user = userEvent.setup()
+  const { api } = await import('../lib/api')
+  vi.mocked(api).mockImplementation((path: unknown) =>
+    String(path).includes('test-connection')
+      ? Promise.resolve({ connected: true, duration_ms: 9, sampled: 5, attributes: { username: 5, email: 5 } })
+      : Promise.resolve({ items: [provider] }) as never)
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  render(<QueryClientProvider client={queryClient}><MemoryRouter><UserFederationPage /></MemoryRouter></QueryClientProvider>)
+
+  await user.click(await screen.findByText('corp'))
+  await user.click(screen.getByRole('button', { name: '연결 테스트' }))
+
+  expect(await screen.findByText(/속성이 모두 값을 가집니다/)).toBeInTheDocument()
+})

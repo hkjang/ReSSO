@@ -41,15 +41,43 @@ func directoryConfig(t *testing.T) RuntimeConfig {
 
 func TestDirectoryConnectionReachesTheConfiguredBase(t *testing.T) {
 	config := directoryConfig(t)
-	if err := TestConnection(context.Background(), config); err != nil {
+	check, err := TestConnection(context.Background(), config)
+	if err != nil {
 		t.Fatalf("connecting to the configured base failed: %v", err)
+	}
+	// Connecting is the smaller half. The names in the configuration have to
+	// name something this directory has, and their syntax being valid says
+	// nothing about that: mail spelled maill passes every check made when the
+	// provider is saved and then imports everyone without an e-mail.
+	if check.Sampled == 0 {
+		t.Fatal("the check sampled no entries, so what follows says nothing")
+	}
+	for _, attribute := range []string{"username", "uuid", "email", "display_name"} {
+		if check.Attributes[attribute] == 0 {
+			t.Errorf("%s came back empty for all %d sampled entries", attribute, check.Sampled)
+		}
+	}
+
+	// A name that is well formed and wrong is the case worth catching.
+	mistyped := config
+	mistyped.Provider.EmailLDAPAttribute = "maill"
+	mistypedCheck, err := TestConnection(context.Background(), mistyped)
+	if err != nil {
+		t.Fatalf("a mistyped attribute failed the connection instead of being reported: %v", err)
+	}
+	if mistypedCheck.Attributes["email"] != 0 {
+		t.Errorf("a mistyped e-mail attribute reported %d entries carrying it",
+			mistypedCheck.Attributes["email"])
+	}
+	if mistypedCheck.Attributes["username"] == 0 {
+		t.Error("the other attributes stopped being reported, so the result cannot be read")
 	}
 
 	// A base that does not exist has to be reported, because this is the check
 	// an administrator runs to find out whether they typed it correctly.
 	wrong := config
 	wrong.Provider.UsersDN = "ou=nobody,dc=example,dc=test"
-	if err := TestConnection(context.Background(), wrong); err == nil {
+	if _, err := TestConnection(context.Background(), wrong); err == nil {
 		t.Error("a users DN that does not exist was reported as reachable")
 	}
 
@@ -57,7 +85,7 @@ func TestDirectoryConnectionReachesTheConfiguredBase(t *testing.T) {
 	// which would make the check pass while nothing else worked.
 	badBind := config
 	badBind.BindCredential = "not-the-password"
-	if err := TestConnection(context.Background(), badBind); err == nil {
+	if _, err := TestConnection(context.Background(), badBind); err == nil {
 		t.Error("an incorrect bind credential was accepted")
 	}
 }
@@ -239,14 +267,14 @@ func TestDirectoryOverTLSRequiresACertificateItCanVerify(t *testing.T) {
 
 	// Without the authority the certificate is signed by nobody this machine
 	// trusts, and the connection has to fail.
-	if err := TestConnection(context.Background(), config); err == nil {
+	if _, err := TestConnection(context.Background(), config); err == nil {
 		t.Fatal("a certificate from an unknown authority was accepted")
 	}
 
 	// With it, the same server is reachable — so the refusal above is the
 	// verification working, not TLS being broken outright.
 	config.Provider.CACertificate = string(authority)
-	if err := TestConnection(context.Background(), config); err != nil {
+	if _, err := TestConnection(context.Background(), config); err != nil {
 		t.Fatalf("a certificate signed by the configured authority was refused: %v", err)
 	}
 	if _, ok, err := Authenticate(context.Background(), config, "alice", "alice-pass-1234"); err != nil || !ok {
@@ -257,7 +285,7 @@ func TestDirectoryOverTLSRequiresACertificateItCanVerify(t *testing.T) {
 	// rather than being ignored and leaving the connection unverified.
 	broken := config
 	broken.Provider.CACertificate = "-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n"
-	if err := TestConnection(context.Background(), broken); err == nil {
+	if _, err := TestConnection(context.Background(), broken); err == nil {
 		t.Error("an unparseable CA certificate was accepted")
 	}
 }

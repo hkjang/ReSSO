@@ -151,7 +151,7 @@ export function UserFederationPage() {
     },
   })
   const testConnection = useMutation({
-    mutationFn: () => api<{ connected: boolean; duration_ms: number }>(`/api/admin/v1/realms/${selection.realmID}/user-federations/${editing!.id}/test-connection`, { method: 'POST' }),
+    mutationFn: () => api<{ connected: boolean; duration_ms: number; sampled: number; attributes: Record<string, number> }>(`/api/admin/v1/realms/${selection.realmID}/user-federations/${editing!.id}/test-connection`, { method: 'POST' }),
   })
   // The server starts the run and answers immediately; progress is followed
   // through the provider's own status rather than by holding the request open.
@@ -258,7 +258,15 @@ export function UserFederationPage() {
 
           {editing && liveEditing && <><Divider /><Section title="연결 검증 및 동기화" description="저장된 설정으로 실제 LDAP 서버에 연결합니다. 인증 테스트 비밀번호는 저장하거나 감사로그에 기록하지 않습니다.">
             <Stack spacing={2}>
-              {testConnection.error && <ErrorAlert error={testConnection.error} />}{testConnection.data && <Alert severity="success">LDAP 연결 성공 · {testConnection.data.duration_ms}ms</Alert>}
+              {testConnection.error && <ErrorAlert error={testConnection.error} />}{testConnection.data && (() => {
+                const { sampled, attributes, duration_ms: took } = testConnection.data
+                // 이름이 형식상 맞아도 이 디렉터리에 없으면 값이 비어서 들어온다.
+                // 연결됐다는 사실보다 무엇이 들어올지가 확인하려던 것이다.
+                const empty = Object.entries(attributes ?? {}).filter(([, present]) => present === 0).map(([name]) => name)
+                if (sampled === 0) return <Alert severity="warning">LDAP 연결 성공 · {took}ms · 다만 이 Users DN과 조건에 맞는 사용자를 한 명도 찾지 못했습니다. Users DN, 검색 범위, Object Class, 필터를 확인하세요.</Alert>
+                if (empty.length > 0) return <Alert severity="warning">LDAP 연결 성공 · {took}ms · 표본 {sampled}명 중 다음 속성이 모두 비어 있습니다: {empty.join(', ')}. 속성 이름이 이 디렉터리에 실제로 있는지 확인하세요 — 형식이 맞아도 없는 이름이면 값 없이 가져옵니다.</Alert>
+                return <Alert severity="success">LDAP 연결 성공 · {took}ms · 표본 {sampled}명에서 설정한 속성이 모두 값을 가집니다.</Alert>
+              })()}
               {sync.error && <ErrorAlert error={sync.error} />}
               {syncRunning
                 ? <Alert severity="info" icon={<CircularProgress size={18} />}>동기화가 진행 중입니다. 완료되면 아래 결과가 갱신됩니다.</Alert>

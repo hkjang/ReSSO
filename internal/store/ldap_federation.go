@@ -476,10 +476,10 @@ func normalizeMappings(mappings map[string]string) map[string]string {
 	return result
 }
 
-func (s *Store) TestLDAPFederation(ctx context.Context, id uuid.UUID) error {
+func (s *Store) TestLDAPFederation(ctx context.Context, id uuid.UUID) (federation.ConnectionCheck, error) {
 	runtime, err := s.ldapRuntimeByID(ctx, id)
 	if err != nil {
-		return err
+		return federation.ConnectionCheck{}, err
 	}
 	return federation.TestConnection(ctx, federation.RuntimeConfig{Provider: runtime.Provider, BindCredential: runtime.BindCredential})
 }

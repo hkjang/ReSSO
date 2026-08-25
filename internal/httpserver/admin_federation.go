@@ -179,7 +179,7 @@ func (s *Server) adminTestLDAPConnection(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	started := time.Now()
-	err := s.store.TestLDAPFederation(r.Context(), federationID)
+	check, err := s.store.TestLDAPFederation(r.Context(), federationID)
 	principal, _ := principalFrom(r.Context())
 	result := "SUCCESS"
 	if err != nil {
@@ -191,7 +191,12 @@ func (s *Server) adminTestLDAPConnection(w http.ResponseWriter, r *http.Request)
 		writeError(w, r, http.StatusUnprocessableEntity, "ldap_connection_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"connected": true, "duration_ms": time.Since(started).Milliseconds()})
+	// What came back, not only that something did: a well-formed attribute name
+	// that this directory does not have reads as a successful test and then
+	// imports everyone without an e-mail.
+	writeJSON(w, http.StatusOK, map[string]any{"connected": true,
+		"duration_ms": time.Since(started).Milliseconds(),
+		"sampled":     check.Sampled, "attributes": check.Attributes})
 }
 
 func (s *Server) adminTestLDAPAuthentication(w http.ResponseWriter, r *http.Request) {

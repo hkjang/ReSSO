@@ -109,18 +109,67 @@ func Validate(provider domain.LDAPFederation, bindCredential string, credentialR
 	return nil
 }
 
-func TestConnection(ctx context.Context, config RuntimeConfig) error {
+// ConnectionCheck is what a connection test found, beyond being able to
+// connect. Attributes counts, for each configured attribute name, how many of
+// the sampled entries actually carried a value.
+type ConnectionCheck struct {
+	Sampled    int            `json:"sampled"`
+	Attributes map[string]int `json:"attributes"`
+}
+
+// TestConnection binds, confirms the users DN exists, and then looks at what
+// the configuration would actually import.
+//
+// It used to stop after the DN: bound, DN present, "연결됨". None of the
+// attribute names were asked for — the search requested no attributes at all —
+// so a name that is well formed but wrong, mail spelled maill, passed the test
+// and then imported everyone with no e-mail. The syntax of these names is
+// already checked when they are saved; what is not checked anywhere is whether
+// they name something this directory has. Sampling a handful of entries and
+// reporting which names came back empty is the difference between "the
+// credentials work" and "this is what you are about to import".
+func TestConnection(ctx context.Context, config RuntimeConfig) (ConnectionCheck, error) {
 	connection, err := connect(ctx, config)
 	if err != nil {
-		return err
+		return ConnectionCheck{}, err
 	}
 	defer func() { _ = connection.Close() }()
-	request := ldap.NewSearchRequest(config.Provider.UsersDN, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+	provider := config.Provider
+	request := ldap.NewSearchRequest(provider.UsersDN, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
 		1, 5, false, "(objectClass=*)", []string{"1.1"}, nil)
 	if _, err := connection.Search(request); err != nil {
-		return fmt.Errorf("search users DN: %w", err)
+		return ConnectionCheck{}, fmt.Errorf("search users DN: %w", err)
 	}
-	return nil
+
+	// A sample, not the directory: this runs while someone waits on a button.
+	const sampleSize = 5
+	result, err := search(connection, provider, "", sampleSize)
+	if err != nil {
+		// The DN is there and the bind works; not being able to list users is
+		// worth reporting as a connection result rather than as a failure of
+		// the whole test, which would hide the two facts already established.
+		return ConnectionCheck{Attributes: map[string]int{}}, nil
+	}
+	check := ConnectionCheck{Sampled: len(result.Entries), Attributes: map[string]int{}}
+	named := map[string]string{
+		"username": provider.UsernameLDAPAttribute, "uuid": provider.UUIDLDAPAttribute,
+		"email": provider.EmailLDAPAttribute, "first_name": provider.FirstNameLDAPAttribute,
+		"last_name": provider.LastNameLDAPAttribute, "display_name": provider.DisplayNameLDAPAttribute,
+		"member_of": provider.MemberOfLDAPAttribute,
+	}
+	for label, attribute := range named {
+		if strings.TrimSpace(attribute) == "" {
+			continue
+		}
+		present := 0
+		for _, entry := range result.Entries {
+			if len(entry.GetAttributeValues(attribute)) > 0 {
+				present++
+			}
+		}
+		check.Attributes[label] = present
+	}
+	return check, nil
 }
 
 func Authenticate(ctx context.Context, config RuntimeConfig, username, password string) (User, bool, error) {
