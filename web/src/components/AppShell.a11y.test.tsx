@@ -19,7 +19,7 @@ vi.mock('../lib/auth-context', () => ({
 mocks.api.mockResolvedValue({ items: [], enabled: false })
 
 // jsdom에는 matchMedia가 없어 MUI가 좁은 화면으로 판단하고 사이드바를 닫힌 Drawer에
-// 넣어버린다. 스킵 링크가 실제로 필요한 쪽은 메뉴 12개가 본문 앞에 펼쳐진 데스크톱
+// 넣어버린다. 스킵 링크가 실제로 필요한 쪽은 메뉴 전체가 본문 앞에 펼쳐진 데스크톱
 // 레이아웃이므로, 그 화면을 재현한다.
 window.matchMedia = ((query: string) => ({
   matches: true, media: query, onchange: null,
@@ -42,7 +42,7 @@ function renderShell(initial = '/admin') {
   )
 }
 
-// 사이드바에는 메뉴가 12개 있고 그 앞에 헤더 조작부까지 있다. 스킵 링크가 없으면
+// 사이드바 메뉴 전체와 그 앞의 헤더 조작부를 지나야 본문에 닿는다. 스킵 링크가 없으면
 // 키보드 사용자는 화면을 옮길 때마다 그 전부를 Tab으로 지나쳐야 본문에 닿는다.
 test('첫 Tab이 본문으로 건너뛰는 링크에 닿는다', async () => {
   const user = userEvent.setup()

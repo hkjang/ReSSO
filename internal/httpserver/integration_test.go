@@ -1760,6 +1760,130 @@ func TestIntegrationSuspendingARealmReachesSessionsAndKeys(t *testing.T) {
 // password has already changed, and both endpoints dropped its error: the
 // response was 204, the audit entry said SUCCESS, and nothing was logged. The
 // console states the promise on the page while the sessions stayed live.
+// The dashboard reports how many personal API keys in the Realm stop working
+// within the week and offers a link to see them. The link used to go to the
+// audit log, which records what was done to a key and cannot show which keys
+// are about to expire — and the only screen listing API keys lists the
+// caller's own, so an administrator could read the number and had no way to
+// find out whose keys they were. A key that expires unnoticed stops an
+// integration without warning.
+//
+// The number and the rows are asserted against each other here rather than
+// against a constant, because the failure worth catching is the two drifting
+// apart: they now share one predicate, and a copy of it made in either place
+// would pass its own test while contradicting the other.
+func TestIntegrationDashboardExpiringKeysAreTheOnesTheLinkShows(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	owner, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "integrator", Password: "integrator-password-123", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three days out counts, thirty does not, and a key already revoked is not
+	// something anyone needs to renew.
+	for _, key := range []struct {
+		name    string
+		days    int
+		revoked bool
+	}{{"expiring soon", 3, false}, {"expiring later", 30, false}, {"already revoked", 3, true}} {
+		expiresAt := time.Now().UTC().Add(time.Duration(key.days) * 24 * time.Hour)
+		created, keyErr := data.CreatePersonalAPIKey(ctx, owner.ID, key.name, []string{"api:read"}, &expiresAt, nil)
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		if key.revoked {
+			if _, execErr := data.Pool.Exec(ctx,
+				"UPDATE personal_api_keys SET revoked_at=now() WHERE id=$1", created.Key.ID); execErr != nil {
+				t.Fatal(execErr)
+			}
+		}
+	}
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := &http.Client{Jar: jar}
+	login := postIntegrationLogin(t, browser, server.URL, "admin", "bootstrap-password-123")
+	_ = login.Body.Close()
+
+	get := func(path string, into any) {
+		t.Helper()
+		response, getErr := browser.Get(server.URL + path)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s answered %d", path, response.StatusCode)
+		}
+		if decodeErr := json.NewDecoder(response.Body).Decode(into); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+	}
+
+	var dashboard struct {
+		Readiness struct {
+			ExpiringAPIKeys int `json:"expiring_api_keys"`
+		} `json:"readiness"`
+	}
+	get("/api/admin/v1/dashboard?realm="+bootstrap.RealmID.String(), &dashboard)
+
+	var listing struct {
+		Items []struct {
+			Name     string `json:"name"`
+			Username string `json:"username"`
+			Prefix   string `json:"prefix"`
+			Secret   string `json:"secret"`
+		} `json:"items"`
+	}
+	get("/api/admin/v1/realms/"+bootstrap.RealmID.String()+"/api-keys?expiring=true", &listing)
+
+	if dashboard.Readiness.ExpiringAPIKeys != len(listing.Items) {
+		t.Fatalf("the dashboard counted %d keys expiring within the week and the screen it "+
+			"links to lists %d", dashboard.Readiness.ExpiringAPIKeys, len(listing.Items))
+	}
+	if len(listing.Items) != 1 {
+		t.Fatalf("listed %d keys, want only the one expiring within the week", len(listing.Items))
+	}
+	if listing.Items[0].Name != "expiring soon" {
+		t.Errorf("listed %q", listing.Items[0].Name)
+	}
+	// Whose key it is, which is the thing an administrator came for.
+	if listing.Items[0].Username != "integrator" {
+		t.Errorf("the listing does not say whose key it is: %q", listing.Items[0].Username)
+	}
+	// Metadata only. The prefix identifies a key to its owner; the secret is
+	// not stored in a readable form and must not appear here.
+	if listing.Items[0].Prefix == "" {
+		t.Error("the listing carries no prefix, so the owner cannot tell which key it is")
+	}
+	if listing.Items[0].Secret != "" {
+		t.Error("the listing returned a secret")
+	}
+
+	// Without the filter it is the Realm's keys, so an administrator can also
+	// answer "who holds keys at all".
+	var all struct {
+		Items []struct {
+			Name string `json:"name"`
+		} `json:"items"`
+	}
+	get("/api/admin/v1/realms/"+bootstrap.RealmID.String()+"/api-keys", &all)
+	if len(all.Items) != 3 {
+		t.Errorf("the unfiltered listing returned %d keys, want all 3", len(all.Items))
+	}
+}
+
 func TestIntegrationPasswordChangeAdmitsWhenSessionsSurvive(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()

@@ -105,7 +105,11 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}/test-authentication": openAPIParameterizedPath("post", "User Federation", "LDAP 사용자 인증 테스트", true, "realmID", "federationID"),
 			"/api/admin/v1/realms/{realmID}/user-federations/{federationID}/sync":                openAPIParameterizedPath("post", "User Federation", "LDAP 전체 사용자 동기화", true, "realmID", "federationID"),
 			"/api/admin/v1/realms/{realmID}/keys/rotate":                                         openAPIParameterizedPath("post", "Administration", "Realm 서명 키 회전", true, "realmID"),
-			"/api/admin/v1/audit":       openAPIReadPath("Administration", "감사 이벤트 조회"),
+			"/api/admin/v1/audit": openAPIReadPath("Administration", "감사 이벤트 조회"),
+			"/api/admin/v1/realms/{realmID}/api-keys": map[string]any{
+				"parameters": []any{openAPIPathParameter("realmID")},
+				"get":        openAPIReadOperation("Administration", "Realm의 개인 API 키 조회 (metadata)"),
+			},
 			"/api/admin/v1/system-logs": openAPIReadPath("Administration", "서버 구조화 로그 조회"),
 			"/mcp":                      openAPIPath("post", "MCP", "MCP Streamable HTTP JSON-RPC endpoint", true),
 

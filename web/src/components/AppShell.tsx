@@ -39,6 +39,7 @@ const adminItems: NavItem[] = [
   { label: 'Role', path: '/admin/roles', icon: BadgeRoundedIcon, keywords: '권한 RBAC' },
   { label: '세션', path: '/admin/sessions', icon: SecurityRoundedIcon, keywords: '로그인 강제 로그아웃' },
   { label: '서명 키', path: '/admin/keys', icon: KeyRoundedIcon, keywords: 'JWKS rotation' },
+  { label: 'API 키', path: '/admin/api-keys', icon: BadgeRoundedIcon, keywords: 'personal token 만료 회전' },
   { label: '승인함', path: '/admin/approvals', icon: ApprovalRoundedIcon, keywords: '검토 승인 반려' },
   { label: '감사 이벤트', path: '/admin/audit', icon: PolicyRoundedIcon, keywords: '보안 audit' },
   { label: '서버 로그', path: '/admin/logs', icon: ArticleRoundedIcon, keywords: '운영 오류 trace' },

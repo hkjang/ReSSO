@@ -7,7 +7,7 @@ ReSSO는 Go와 React로 만든 오프라인 운영용 Keycloak-compatible OIDC S
 - Keycloak URL 형태의 OIDC Discovery, Authorization, Token, UserInfo, JWKS, Logout, Introspection, Revocation
 - Authorization Code + PKCE S256, Refresh Token rotation/reuse detection, Client Credentials
 - Keycloak 호환 주요 Claim: `azp`, `sid`, `preferred_username`, `realm_access`, `resource_access`
-- Realm, 사용자, Client, Role, SSO Session, 서명 키와 감사 이벤트 관리
+- Realm, 사용자, Client, Role, SSO Session, 서명 키, 개인 API 키와 감사 이벤트 관리
 - Realm별 비밀번호·계정 잠금 정책 설정과 잠긴 계정의 즉시 잠금 해제
 - Realm Role·Client Role 할당/회수와 Realm 범위 관리자 위임
 - 등록된 Web Origin 기반 OIDC CORS 및 Scope 기반 Claim 최소화

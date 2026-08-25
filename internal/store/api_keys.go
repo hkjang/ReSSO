@@ -100,6 +100,54 @@ func newPersonalAPIKey(sealer *cryptoutil.Sealer, name string, scopes []string, 
 		CreatedAt: time.Now().UTC(), ExpiresAt: expiresAt, RotatedFrom: rotatedFrom, Active: true}, secret, nil
 }
 
+// ExpiringAPIKeyFilter is what "this key stops working soon" means. The
+// dashboard counts with it and the listing it links to selects with it, so the
+// number an operator is shown and the rows they are sent to cannot drift apart.
+// Seven days is the notice; the alias k is the personal_api_keys table.
+const ExpiringAPIKeyFilter = `k.revoked_at IS NULL AND k.expires_at BETWEEN now() AND now() + interval '7 days'`
+
+// RealmAPIKey is a personal API key seen from the administration side: the same
+// record, plus who it belongs to.
+//
+// The dashboard reports how many keys in the Realm expire within the week, and
+// an expired key stops an integration without warning. Until now there was
+// nowhere for an administrator to see which keys those were — the only screen
+// showing API keys shows the caller's own — so the count named a problem and
+// left no way to find it. The secret is not in this type and never leaves the
+// database; the prefix is what identifies a key to its owner.
+type RealmAPIKey struct {
+	PersonalAPIKey
+	UserID   uuid.UUID `json:"user_id"`
+	Username string    `json:"username"`
+}
+
+// ListRealmAPIKeys lists the personal API keys of everyone in a Realm, or only
+// the ones the dashboard is counting when expiringOnly is set.
+func (s *Store) ListRealmAPIKeys(ctx context.Context, realmID uuid.UUID, expiringOnly bool) ([]RealmAPIKey, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT k.id,k.name,k.prefix,k.scopes,k.created_at,k.expires_at,
+        k.last_used_at,k.revoked_at,k.rotated_from,
+        (k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > now())),
+        u.id,u.username
+        FROM personal_api_keys k JOIN users u ON u.id=k.user_id
+        WHERE u.realm_id=$1 AND ($2=false OR (`+ExpiringAPIKeyFilter+`))
+        ORDER BY k.expires_at ASC NULLS LAST, lower(u.username), lower(k.name)`, realmID, expiringOnly)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	keys := make([]RealmAPIKey, 0)
+	for rows.Next() {
+		var key RealmAPIKey
+		if err := rows.Scan(&key.ID, &key.Name, &key.Prefix, &key.Scopes, &key.CreatedAt,
+			&key.ExpiresAt, &key.LastUsedAt, &key.RevokedAt, &key.RotatedFrom, &key.Active,
+			&key.UserID, &key.Username); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
 func (s *Store) ListPersonalAPIKeys(ctx context.Context, userID uuid.UUID) ([]PersonalAPIKey, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT id,name,prefix,scopes,created_at,expires_at,last_used_at,revoked_at,rotated_from,
         (revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now()))

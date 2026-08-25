@@ -26,6 +26,9 @@ func (s *Server) adminRoutes(r chi.Router) {
 		r.Put("/users/{userID}", s.adminUpdateUser)
 		r.Put("/users/{userID}/password", s.adminResetPassword)
 		r.Post("/users/{userID}/unlock", s.adminUnlockUser)
+		// The dashboard counts the keys in this Realm that expire within the
+		// week; this is where an administrator can see which they are.
+		r.Get("/api-keys", s.adminListRealmAPIKeys)
 		r.Get("/users/{userID}/role-mappings", s.adminGetUserRoleMappings)
 		r.Put("/users/{userID}/role-mappings", s.adminReplaceUserRoleMappings)
 		r.Get("/user-federations", s.adminListLDAPFederations)
@@ -119,7 +122,7 @@ func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
 		    AND ($1::uuid IS NULL OR realm_id=$1)),
 		(SELECT count(*) FROM users WHERE locked_until>now() AND ($1::uuid IS NULL OR realm_id=$1)),
 		(SELECT count(*) FROM personal_api_keys k JOIN users u ON u.id=k.user_id
-		    WHERE k.revoked_at IS NULL AND k.expires_at BETWEEN now() AND now()+interval '7 days'
+		    WHERE `+store.ExpiringAPIKeyFilter+`
 		    AND ($1::uuid IS NULL OR u.realm_id=$1)),
 		(SELECT count(*) FROM signing_keys k JOIN realms r ON r.id=k.realm_id
 		    WHERE k.status='ACTIVE' AND r.enabled=true AND k.created_at < now()-make_interval(days => $2)
@@ -856,6 +859,26 @@ func (s *Server) adminListAuditEventTypes(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": types})
+}
+
+// adminListRealmAPIKeys answers which personal API keys exist in a Realm.
+//
+// Read-only and metadata only: the secret is not stored in a readable form and
+// never appears here. It exists because the dashboard reports how many keys
+// stop working within the week, and an administrator had no way to find out
+// whose they were — the only screen showing API keys shows the caller's own.
+func (s *Server) adminListRealmAPIKeys(w http.ResponseWriter, r *http.Request) {
+	realmID, err := uuid.Parse(chi.URLParam(r, "realmID"))
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_realm", "Realm 식별자가 올바르지 않습니다.")
+		return
+	}
+	items, err := s.store.ListRealmAPIKeys(r.Context(), realmID, r.URL.Query().Get("expiring") == "true")
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (s *Server) adminListSystemLogs(w http.ResponseWriter, r *http.Request) {

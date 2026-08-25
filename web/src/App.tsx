@@ -12,6 +12,7 @@ const ClientsPage = lazy(() => import('./pages/ClientsPage').then((module) => ({
 const RolesPage = lazy(() => import('./pages/RolesPage').then((module) => ({ default: module.RolesPage })))
 const SessionsPage = lazy(() => import('./pages/SessionsPage').then((module) => ({ default: module.SessionsPage })))
 const KeysPage = lazy(() => import('./pages/KeysPage').then((module) => ({ default: module.KeysPage })))
+const RealmAPIKeysPage = lazy(() => import('./pages/RealmAPIKeysPage').then((module) => ({ default: module.RealmAPIKeysPage })))
 const ApprovalsPage = lazy(() => import('./pages/ApprovalsPage').then((module) => ({ default: module.ApprovalsPage })))
 const AuditPage = lazy(() => import('./pages/OperationsPages').then((module) => ({ default: module.AuditPage })))
 const LogsPage = lazy(() => import('./pages/OperationsPages').then((module) => ({ default: module.LogsPage })))
@@ -56,6 +57,7 @@ export default function App() {
         <Route path="/admin/roles" element={<AdminOnly><RolesPage /></AdminOnly>} />
         <Route path="/admin/sessions" element={<AdminOnly><SessionsPage /></AdminOnly>} />
         <Route path="/admin/keys" element={<AdminOnly><KeysPage /></AdminOnly>} />
+        <Route path="/admin/api-keys" element={<AdminOnly><RealmAPIKeysPage /></AdminOnly>} />
         <Route path="/admin/approvals" element={<AdminOnly><ApprovalsPage /></AdminOnly>} />
         <Route path="/admin/audit" element={<AdminOnly><AuditPage /></AdminOnly>} />
         <Route path="/admin/logs" element={<AdminOnly><LogsPage /></AdminOnly>} />
