@@ -235,8 +235,16 @@ search_call='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"res
 mcp_call "$api_key" "$tools_list" \
   | jq -e '[.result.tools[].name] | index("resso_search_users") and index("resso_list_clients")' >/dev/null \
   || { echo "an admin:read key was not offered the directory tools" >&2; exit 1; }
-mcp_call "$api_key" "$search_call" | jq -e '.result.isError == false and (.result.structuredContent | length > 0)' >/dev/null \
-  || { echo "an admin:read key could not search users over MCP" >&2; exit 1; }
+# items, not the envelope: this tool answers with an object now, and `length`
+# on an object counts its keys — so the old check passed on a search that found
+# nobody. matched is asserted too, because a cut answer that does not say it is
+# cut is what an agent reports as the whole directory.
+mcp_call "$api_key" "$search_call" \
+  | jq -e '.result.isError == false
+      and (.result.structuredContent.items | length > 0)
+      and (.result.structuredContent.matched >= (.result.structuredContent.items | length))
+      and (.result.structuredContent | has("truncated"))' >/dev/null \
+  || { echo "an admin:read key could not search users over MCP, or the answer did not say how much it left out" >&2; exit 1; }
 
 reader_key_payload='{"name":"Smoke MCP reader","scopes":["mcp:read"],"expires_days":1}'
 reader_key="$(curl -fsS -b "$cookie_jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
