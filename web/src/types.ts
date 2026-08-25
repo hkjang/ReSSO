@@ -186,6 +186,7 @@ export interface APIKey {
   rotated_from?: string
   /** Whether the server would still accept this key. */
   active: boolean
+  inactive_reason?: string
 }
 
 export interface ApprovalRequest {

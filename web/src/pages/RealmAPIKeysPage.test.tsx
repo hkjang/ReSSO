@@ -68,3 +68,30 @@ test('the filter can be cleared to see every key in the Realm', async () => {
 
   expect(await screen.findByText('nightly export')).toBeInTheDocument()
 })
+
+// The screen used to work the label out from the fields it had, and called a
+// key stopped by a disabled account "만료" — which sends someone to renew a key
+// that would not work if they did. The reason comes from the server, decided
+// by the clock that wrote the timestamps.
+test('a key stopped by a disabled account is not called expired', async () => {
+  mocks.api.mockImplementation(() => Promise.resolve({ items: [{
+    ...key('mcp client', 'integrator'), active: false, inactive_reason: 'account_disabled',
+  }] }))
+  renderAt('/admin/api-keys')
+
+  expect(await screen.findByText('계정 비활성')).toBeInTheDocument()
+  // 만료 is also a column header, so the chip is the second occurrence when it
+  // is there at all; one occurrence means the header alone.
+  expect(screen.getAllByText('만료')).toHaveLength(1)
+})
+
+test('a revoked key still says revoked and an expired one expired', async () => {
+  mocks.api.mockImplementation(() => Promise.resolve({ items: [
+    { ...key('a', 'x'), id: 'k1', active: false, inactive_reason: 'revoked' },
+    { ...key('b', 'y'), id: 'k2', active: false, inactive_reason: 'expired' },
+  ] }))
+  renderAt('/admin/api-keys')
+
+  expect(await screen.findByText('폐기')).toBeInTheDocument()
+  expect(screen.getAllByText('만료')).toHaveLength(2)
+})

@@ -18,6 +18,7 @@ interface RealmAPIKey {
   last_used_at?: string
   revoked_at?: string
   active: boolean
+  inactive_reason?: string
   user_id: string
   username: string
 }
@@ -26,6 +27,20 @@ interface RealmAPIKey {
 // the screen it links to. Whether it opened filtered has to come from the URL
 // so that link can arrive here already narrowed, the same way the locked
 // accounts do.
+// The server says which condition stopped the key, decided by the clock that
+// wrote the timestamps. Working it out here from expires_at would use this
+// browser's clock, and would call a disabled account's key expired — which
+// sends someone to renew a key that would not work if they did.
+const inactiveLabel = (reason?: string) => {
+  switch (reason) {
+    case 'revoked': return '폐기'
+    case 'expired': return '만료'
+    case 'account_disabled': return '계정 비활성'
+    case 'realm_suspended': return 'Realm 정지'
+    default: return '사용 불가'
+  }
+}
+
 export function RealmAPIKeysPage() {
   const realms = useRealms()
   const selection = useRealmSelection(realms.data?.items)
@@ -74,7 +89,7 @@ export function RealmAPIKeysPage() {
                 <TableCell>{key.scopes.map((scope) => <Chip key={scope} label={scope} size="small" sx={{ mr: .5, mb: .5 }} />)}</TableCell>
                 <TableCell>{formatDate(key.last_used_at)}</TableCell>
                 <TableCell>{formatDate(key.expires_at)}</TableCell>
-                <TableCell><StatusChip active={key.active} activeLabel="활성" inactiveLabel={key.revoked_at ? '폐기' : '만료'} /></TableCell>
+                <TableCell><StatusChip active={key.active} activeLabel="활성" inactiveLabel={inactiveLabel(key.inactive_reason)} /></TableCell>
               </TableRow>)}</TableBody>
             </Table></TableContainer>}
     </ContentCard>

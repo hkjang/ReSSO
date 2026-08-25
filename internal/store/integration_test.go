@@ -2544,6 +2544,121 @@ func TestIntegrationExpiredPendingAuthorizationsAreSweptPromptly(t *testing.T) {
 // column saying RUNNING for ever, so the console disabled the sync button and
 // polled every few seconds with no way back, while the server would have
 // accepted a new run all along.
+// "Is this key still active" is asked in two places and has to have one answer:
+// the listing an administrator reads, and the check that decides whether a
+// request carrying the key is served. The listing asked the shorter question —
+// not revoked, not expired — so after an account was disabled, which is the
+// emergency stop, the screen went on calling that person's key active while
+// the key had already stopped working. Someone verifying an offboarding was
+// told the opposite of the truth.
+func TestIntegrationListedAPIKeyAgreesWithWhatAuthenticationAccepts(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	bootstrap := bootstrapIntegrationStore(t, data)
+	ctx := context.Background()
+	leaver, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "leaver", Password: "leaver-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreatePersonalAPIKey(ctx, leaver.ID, "agent", []string{"api:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listedActive := func() bool {
+		t.Helper()
+		keys, listErr := data.ListRealmAPIKeys(ctx, bootstrap.RealmID, false)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		for _, key := range keys {
+			if key.ID == created.Key.ID {
+				return key.Active
+			}
+		}
+		t.Fatal("the key was not listed at all")
+		return false
+	}
+	accepted := func() bool {
+		t.Helper()
+		_, authErr := data.AuthenticateAPIKey(ctx, created.Secret)
+		if authErr != nil && !errors.Is(authErr, ErrNotFound) {
+			t.Fatal(authErr)
+		}
+		return authErr == nil
+	}
+
+	if !listedActive() || !accepted() {
+		t.Fatalf("a fresh key: listed active=%v, accepted=%v", listedActive(), accepted())
+	}
+
+	// The emergency stop.
+	if _, err := data.Pool.Exec(ctx, "UPDATE users SET enabled=false WHERE id=$1", leaver.ID); err != nil {
+		t.Fatal(err)
+	}
+	if accepted() {
+		t.Fatal("a disabled account's key still authenticated, so this proves nothing about the listing")
+	}
+	if listedActive() {
+		t.Error("the listing calls a disabled account's key active while authentication refuses it: " +
+			"an administrator checking an offboarding is told the opposite of the truth")
+	}
+
+	// And a suspended Realm, which the operations guide says stops API keys too.
+	if _, err := data.Pool.Exec(ctx, "UPDATE users SET enabled=true WHERE id=$1", leaver.ID); err != nil {
+		t.Fatal(err)
+	}
+	if !listedActive() || !accepted() {
+		t.Fatal("re-enabling the account did not restore the key, so the next check says nothing")
+	}
+	if _, err := data.Pool.Exec(ctx, "UPDATE realms SET enabled=false WHERE id=$1", bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	if accepted() {
+		t.Fatal("a suspended Realm's key still authenticated")
+	}
+	if listedActive() {
+		t.Error("the listing calls a suspended Realm's key active")
+	}
+
+	// And it says which condition stopped it. "Not active" alone leaves the
+	// screen to guess, and guessing from expires_at labelled a disabled
+	// account's key as expired — sending someone to renew a key that would not
+	// work if they did.
+	reason := func() string {
+		t.Helper()
+		keys, listErr := data.ListRealmAPIKeys(ctx, bootstrap.RealmID, false)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		for _, key := range keys {
+			if key.ID == created.Key.ID {
+				return key.InactiveReason
+			}
+		}
+		t.Fatal("the key was not listed at all")
+		return ""
+	}
+	if got := reason(); got != "realm_suspended" {
+		t.Errorf("a key stopped by a suspended Realm reports %q", got)
+	}
+	if _, err := data.Pool.Exec(ctx, "UPDATE realms SET enabled=true WHERE id=$1", bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, "UPDATE users SET enabled=false WHERE id=$1", leaver.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := reason(); got != "account_disabled" {
+		t.Errorf("a key stopped by a disabled account reports %q", got)
+	}
+	if _, err := data.Pool.Exec(ctx, "UPDATE users SET enabled=true WHERE id=$1", leaver.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := reason(); got != "" {
+		t.Errorf("a usable key reports %q as the reason it is not", got)
+	}
+}
+
 func TestIntegrationStaleSyncIsNotReportedAsRunning(t *testing.T) {
 	data := openIntegrationStore(t, integrationSealer(t))
 	bootstrap := bootstrapIntegrationStore(t, data)

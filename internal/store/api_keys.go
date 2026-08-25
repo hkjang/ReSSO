@@ -19,16 +19,20 @@ type PersonalAPIKey struct {
 	// that by comparing expires_at against the browser's clock, and it gates
 	// the rotate and revoke actions — so a machine running fast showed a key
 	// that still worked as expired and offered no way to withdraw it.
-	Active      bool       `json:"active"`
-	ID          uuid.UUID  `json:"id"`
-	Name        string     `json:"name"`
-	Prefix      string     `json:"prefix"`
-	Scopes      []string   `json:"scopes"`
-	CreatedAt   time.Time  `json:"created_at"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
-	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
-	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
-	RotatedFrom *uuid.UUID `json:"rotated_from,omitempty"`
+	Active bool `json:"active"`
+	// InactiveReason names which condition stopped it, empty while it is
+	// usable. A screen with only "not active" has to guess, and guessing from
+	// expires_at means using the reader's clock on a value the database wrote.
+	InactiveReason string     `json:"inactive_reason,omitempty"`
+	ID             uuid.UUID  `json:"id"`
+	Name           string     `json:"name"`
+	Prefix         string     `json:"prefix"`
+	Scopes         []string   `json:"scopes"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt     *time.Time `json:"last_used_at,omitempty"`
+	RevokedAt      *time.Time `json:"revoked_at,omitempty"`
+	RotatedFrom    *uuid.UUID `json:"rotated_from,omitempty"`
 }
 
 type CreatedAPIKey struct {
@@ -100,6 +104,31 @@ func newPersonalAPIKey(sealer *cryptoutil.Sealer, name string, scopes []string, 
 		CreatedAt: time.Now().UTC(), ExpiresAt: expiresAt, RotatedFrom: rotatedFrom, Active: true}, secret, nil
 }
 
+// apiKeyIsUsable is what "this key still works" means, and it is the question
+// authentication asks: not revoked, not expired, and belonging to an account
+// and a Realm that are both switched on.
+//
+// The listings answered a shorter version of it — revoked and expired only —
+// so a key belonging to a disabled account was shown as active. Disabling an
+// account is the emergency stop, and the screen an administrator checks
+// afterwards told them the key was still working when it had already stopped.
+// The aliases are k for personal_api_keys, u for users and rlm for realms, the
+// same shape sessionIsLive uses.
+const apiKeyIsUsable = `k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>now())
+        AND u.enabled AND rlm.enabled`
+
+// apiKeyInactiveReason says which of the conditions above is the one that
+// stopped the key, decided by the database's clock rather than the reader's.
+// Without it a screen has only "not active" and guesses: a key belonging to a
+// disabled account was labelled expired, which sends someone to renew a key
+// that would not work if they did.
+const apiKeyInactiveReason = `CASE
+        WHEN k.revoked_at IS NOT NULL THEN 'revoked'
+        WHEN k.expires_at IS NOT NULL AND k.expires_at<=now() THEN 'expired'
+        WHEN NOT u.enabled THEN 'account_disabled'
+        WHEN NOT rlm.enabled THEN 'realm_suspended'
+        ELSE '' END`
+
 // ExpiringAPIKeyFilter is what "this key stops working soon" means. The
 // dashboard counts with it and the listing it links to selects with it, so the
 // number an operator is shown and the rows they are sent to cannot drift apart.
@@ -126,9 +155,9 @@ type RealmAPIKey struct {
 func (s *Store) ListRealmAPIKeys(ctx context.Context, realmID uuid.UUID, expiringOnly bool) ([]RealmAPIKey, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT k.id,k.name,k.prefix,k.scopes,k.created_at,k.expires_at,
         k.last_used_at,k.revoked_at,k.rotated_from,
-        (k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > now())),
+        (`+apiKeyIsUsable+`),`+apiKeyInactiveReason+`,
         u.id,u.username
-        FROM personal_api_keys k JOIN users u ON u.id=k.user_id
+        FROM personal_api_keys k JOIN users u ON u.id=k.user_id JOIN realms rlm ON rlm.id=u.realm_id
         WHERE u.realm_id=$1 AND ($2=false OR (`+ExpiringAPIKeyFilter+`))
         ORDER BY k.expires_at ASC NULLS LAST, lower(u.username), lower(k.name)`, realmID, expiringOnly)
 	if err != nil {
@@ -139,7 +168,7 @@ func (s *Store) ListRealmAPIKeys(ctx context.Context, realmID uuid.UUID, expirin
 	for rows.Next() {
 		var key RealmAPIKey
 		if err := rows.Scan(&key.ID, &key.Name, &key.Prefix, &key.Scopes, &key.CreatedAt,
-			&key.ExpiresAt, &key.LastUsedAt, &key.RevokedAt, &key.RotatedFrom, &key.Active,
+			&key.ExpiresAt, &key.LastUsedAt, &key.RevokedAt, &key.RotatedFrom, &key.Active, &key.InactiveReason,
 			&key.UserID, &key.Username); err != nil {
 			return nil, err
 		}
@@ -149,9 +178,11 @@ func (s *Store) ListRealmAPIKeys(ctx context.Context, realmID uuid.UUID, expirin
 }
 
 func (s *Store) ListPersonalAPIKeys(ctx context.Context, userID uuid.UUID) ([]PersonalAPIKey, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id,name,prefix,scopes,created_at,expires_at,last_used_at,revoked_at,rotated_from,
-        (revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now()))
-        FROM personal_api_keys WHERE user_id=$1 ORDER BY created_at DESC`, userID)
+	rows, err := s.Pool.Query(ctx, `SELECT k.id,k.name,k.prefix,k.scopes,k.created_at,k.expires_at,
+        k.last_used_at,k.revoked_at,k.rotated_from,
+        (`+apiKeyIsUsable+`),`+apiKeyInactiveReason+`
+        FROM personal_api_keys k JOIN users u ON u.id=k.user_id JOIN realms rlm ON rlm.id=u.realm_id
+        WHERE k.user_id=$1 ORDER BY k.created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +191,8 @@ func (s *Store) ListPersonalAPIKeys(ctx context.Context, userID uuid.UUID) ([]Pe
 	for rows.Next() {
 		var key PersonalAPIKey
 		if err := rows.Scan(&key.ID, &key.Name, &key.Prefix, &key.Scopes, &key.CreatedAt,
-			&key.ExpiresAt, &key.LastUsedAt, &key.RevokedAt, &key.RotatedFrom, &key.Active); err != nil {
+			&key.ExpiresAt, &key.LastUsedAt, &key.RevokedAt, &key.RotatedFrom, &key.Active,
+			&key.InactiveReason); err != nil {
 			return nil, err
 		}
 		keys = append(keys, key)
@@ -185,8 +217,7 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (domain.Prin
 		EXISTS(SELECT 1 FROM user_roles ur JOIN roles r ON r.id=ur.role_id
 		    WHERE ur.user_id=u.id AND r.name='realm-admin'),k.scopes,k.secret_hash
         FROM personal_api_keys k JOIN users u ON u.id=k.user_id JOIN realms rlm ON rlm.id=u.realm_id
-        WHERE k.prefix=$1 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>now())
-        AND u.enabled=true AND rlm.enabled`, prefix).Scan(&principal.UserID, &principal.RealmID, &principal.Username,
+        WHERE k.prefix=$1 AND `+apiKeyIsUsable, prefix).Scan(&principal.UserID, &principal.RealmID, &principal.Username,
 		&principal.PlatformAdmin, &principal.RealmAdmin, &principal.Scopes, &expected)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !s.Sealer.MatchDigest(raw, expected)) {
 		return domain.Principal{}, ErrNotFound
