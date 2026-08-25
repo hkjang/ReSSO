@@ -1349,6 +1349,82 @@ func TestIntegrationTokenIssuanceFailuresAreCounted(t *testing.T) {
 // disclosure about that access could not be answered — nobody could say
 // whether it had happened. Both outcomes are worth recording: the read itself,
 // and the attempt that was turned away.
+// Every other tool on this surface returns everything it found, so an agent
+// reading a bare array is entitled to treat it as the whole answer. The user
+// search is capped, and said nothing about it: asked how many people are called
+// Kim, an agent would have answered twenty when there were more. It now reports
+// what matched alongside what it returned.
+func TestIntegrationMCPUserSearchSaysWhenItIsTruncated(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const matching = 25
+	for index := 0; index < matching; index++ {
+		if _, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+			Username: fmt.Sprintf("kim%02d", index), Password: "kim-password-1234",
+			Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key, err := data.CreatePersonalAPIKey(ctx, bootstrap.AdminUserID, "agent",
+		[]string{"mcp:read", "admin:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	read := func(query string) (items int, matched int, truncated bool) {
+		t.Helper()
+		body := callIntegrationMCP(t, server.Client(), server.URL, key.Secret,
+			fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resso_search_users","arguments":{"query":%q}}}`, query))
+		var envelope struct {
+			Result struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+			t.Fatalf("decoding the MCP envelope: %v (body=%s)", err, body)
+		}
+		if len(envelope.Result.Content) == 0 {
+			t.Fatalf("the tool returned no content: %s", body)
+		}
+		var payload struct {
+			Items     []map[string]any `json:"items"`
+			Matched   int              `json:"matched"`
+			Truncated bool             `json:"truncated"`
+		}
+		if err := json.Unmarshal([]byte(envelope.Result.Content[0].Text), &payload); err != nil {
+			t.Fatalf("the tool answered with something that is not the documented shape: %v (%s)",
+				err, envelope.Result.Content[0].Text)
+		}
+		return len(payload.Items), payload.Matched, payload.Truncated
+	}
+
+	items, matched, truncated := read("kim")
+	if matched != matching {
+		t.Errorf("the tool reported %d matching users, want %d", matched, matching)
+	}
+	if items >= matched {
+		t.Errorf("returned %d of %d: this proves nothing about reporting a cap", items, matched)
+	}
+	if !truncated {
+		t.Error("the answer was cut and did not say so, which is what makes an agent report it as complete")
+	}
+
+	// And an answer that fits is not labelled as cut.
+	items, matched, truncated = read("admin")
+	if truncated || items != matched {
+		t.Errorf("a complete answer reported items=%d matched=%d truncated=%v", items, matched, truncated)
+	}
+}
+
 func TestIntegrationMCPDirectoryReadsAreRecorded(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()

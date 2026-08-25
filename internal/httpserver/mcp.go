@@ -219,7 +219,7 @@ func (s *Server) mcpTools(principal domain.Principal) []any {
 		tools = append(tools,
 			map[string]any{"name": "resso_list_clients", "description": "접근 가능한 Realm의 OIDC Client 목록을 조회합니다. Secret은 반환하지 않습니다.",
 				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"realm_id": map[string]any{"type": "string", "format": "uuid"}}, "additionalProperties": false}},
-			map[string]any{"name": "resso_search_users", "description": "접근 가능한 Realm에서 사용자를 검색합니다.",
+			map[string]any{"name": "resso_search_users", "description": "접근 가능한 Realm에서 사용자를 검색합니다. 최대 20건을 items로 돌려주고, 조건에 맞는 전체 수는 matched, 잘렸는지는 truncated로 알립니다.",
 				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
 					"realm_id": map[string]any{"type": "string", "format": "uuid"}, "query": map[string]any{"type": "string", "minLength": 2}},
 					"required": []string{"query"}, "additionalProperties": false}})
@@ -295,7 +295,23 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 		if permitErr != nil {
 			return nil, permitErr
 		}
-		output, err = s.store.ListUsers(r.Context(), realmID, args.Query, store.UserStatusAny, store.UserSort{}, 20, 0)
+		// Capped, and the cap is reported. Every other tool here returns
+		// everything it found, so an agent reading a bare array is entitled to
+		// treat it as the whole answer — and would have said "there are twenty
+		// users called Kim" to someone who asked, when there were three
+		// hundred. The count comes from the same filter as the rows.
+		const searchLimit = 20
+		found, listErr := s.store.ListUsers(r.Context(), realmID, args.Query, store.UserStatusAny,
+			store.UserSort{}, searchLimit, 0)
+		if listErr != nil {
+			return nil, errors.New("도구 실행 중 데이터를 조회하지 못했습니다")
+		}
+		matched, countErr := s.store.CountUsers(r.Context(), realmID, args.Query, store.UserStatusAny)
+		if countErr != nil {
+			return nil, errors.New("도구 실행 중 데이터를 조회하지 못했습니다")
+		}
+		output = map[string]any{"items": found, "matched": matched, "returned": len(found),
+			"truncated": matched > len(found), "limit": searchLimit}
 	default:
 		return nil, errors.New("등록되지 않은 도구입니다")
 	}
