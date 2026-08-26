@@ -255,3 +255,47 @@ func TestEveryOfferedSettingReachesTheDeployment(t *testing.T) {
 		}
 	}
 }
+
+// Dropping a digest key that something still resolves under does not degrade
+// anything gracefully: the value simply stops matching. The operations guide
+// gets this right and says so in three bullets, the last of which decides the
+// timing — client secrets never expire, so the key cannot go until every one
+// of them has been rotated.
+//
+// A shorter telling of the same rule that leaves that out is not a smaller
+// version of it, it is a different rule: followed literally, an operator waits
+// out the session and token lifetimes, removes the key, and every confidential
+// client whose secret predates the change stops authenticating at the token,
+// introspection and revocation endpoints at once.
+func TestEveryTellingOfTheDigestKeyRuleNamesClientSecrets(t *testing.T) {
+	root := filepath.Join("..", "..")
+	checked := 0
+	for _, name := range []string{"README.md", filepath.Join("docs", "operations.md")} {
+		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A paragraph that says how long to keep a digest key, together with
+		// the list and the sentences that follow it: the guide states the rule
+		// as a sentence and then names the items in bullets, so reading the
+		// paragraph alone would call the complete telling incomplete.
+		blocks := strings.Split(string(content), "\n\n")
+		for index, block := range blocks {
+			if !strings.Contains(block, "Digest Key") || !strings.Contains(block, "유지") {
+				continue
+			}
+			for offset := 1; offset <= 2 && index+offset < len(blocks); offset++ {
+				block += "\n\n" + blocks[index+offset]
+			}
+			checked++
+			if !strings.Contains(block, "Client Secret") {
+				t.Errorf("%s tells the digest key retention rule without naming Client Secret, which is "+
+					"the item that decides when the key can go — every other one expires on its own:\n%s",
+					name, block)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no telling of the digest key retention rule was found, so nothing is being compared")
+	}
+}

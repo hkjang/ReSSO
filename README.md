@@ -43,7 +43,7 @@ printf 'DATA_ENCRYPTION_KEYS=data-2026-08:%s\n' "$(openssl rand -base64 32)"
 printf 'DIGEST_KEYS=digest-2026-08:%s\n' "$(openssl rand -base64 32)"
 ```
 
-두 Keyring은 각각 최소 하나의 32바이트 키가 필요합니다. 기존 `ENCRYPTION_KEY` 단일 키 모드는 v0.2.0 암호문 형식을 유지하므로 모든 인스턴스를 먼저 새 버전으로 안전하게 올릴 수 있습니다. 이후 기존 키를 `legacy` 읽기 키로 유지하며 분리형 Keyring을 활성화하세요. 암호문에는 Data Encryption Key ID가 저장되므로 ID는 키 재료와 함께 불변 식별자로 관리하고, 같은 키 재료라도 ID를 바꾸거나 다른 키에 재사용하지 마세요. `crypto rewrap`은 Signing Private Key와 LDAP Bind Credential만 활성 Data Encryption Key로 다시 암호화합니다. 암호화 키는 rewrap과 진단을 마친 뒤 제거할 수 있지만, Digest Key는 재작성할 수 없으므로 해당 키로 만든 Session·Token·API Key가 모두 만료되거나 회전될 때까지 유지해야 합니다.
+두 Keyring은 각각 최소 하나의 32바이트 키가 필요합니다. 기존 `ENCRYPTION_KEY` 단일 키 모드는 v0.2.0 암호문 형식을 유지하므로 모든 인스턴스를 먼저 새 버전으로 안전하게 올릴 수 있습니다. 이후 기존 키를 `legacy` 읽기 키로 유지하며 분리형 Keyring을 활성화하세요. 암호문에는 Data Encryption Key ID가 저장되므로 ID는 키 재료와 함께 불변 식별자로 관리하고, 같은 키 재료라도 ID를 바꾸거나 다른 키에 재사용하지 마세요. `crypto rewrap`은 Signing Private Key와 LDAP Bind Credential만 활성 Data Encryption Key로 다시 암호화합니다. 암호화 키는 rewrap과 진단을 마친 뒤 제거할 수 있지만, Digest Key는 재작성할 수 없으므로 해당 키로 만든 Session·Token·개인 API Key가 모두 만료되거나 회전되고, **해당 키로 만든 Client Secret이 모두 회전될 때까지** 유지해야 합니다. Client Secret은 만료되지 않으므로 사실상 마지막 항목이 제거 시점을 정합니다 — 절차는 [운영 가이드](docs/operations.md)의 Keyring 회전 절을 따르세요.
 
 ## 실행
 
