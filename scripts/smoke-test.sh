@@ -16,6 +16,25 @@ cookie_jar="$work_dir/cookies"
 meta="$(curl -fsS "$base_url/api/v1/meta")"
 echo "$meta" | jq -e '.product == "ReSSO" and (.version | startswith("v"))' >/dev/null
 
+# The administration console is the surface an administrator opens first, and
+# every check below reaches past it to the API. An image built without running
+# the console build carries the document alone - webui/dist is ignored apart
+# from index.html - and serves it happily while the script it names is not
+# there. Everything below still passed, so a deployment with a blank console
+# was reported as a working one.
+#
+# The document names its own bundle, so ask it rather than a filename written
+# here: the hash changes with every build.
+console="$(curl -fsS "$base_url/")"
+console_script="$(printf '%s' "$console" | sed -n 's/.*<script[^>]*src="\([^"]*\)".*/\1/p' | head -1)"
+[ -n "$console_script" ] || { echo "the console document names no script" >&2; exit 1; }
+console_type="$(curl -fsS -o /dev/null -w '%{content_type}' "$base_url$console_script")" || {
+  echo "the console names $console_script and the server does not have it" >&2; exit 1; }
+case "$console_type" in
+  *javascript*) ;;
+  *) echo "the console's own script answered as $console_type, not JavaScript" >&2; exit 1 ;;
+esac
+
 login_payload="$(jq -nc --arg username "$admin" --arg password "$password" '{realm:"master",username:$username,password:$password,request:""}')"
 login="$(curl -fsS -c "$cookie_jar" -H 'Content-Type: application/json' -d "$login_payload" "$base_url/api/v1/auth/login")"
 csrf="$(echo "$login" | jq -er '.csrf_token')"
