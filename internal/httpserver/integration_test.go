@@ -4728,3 +4728,86 @@ func TestIntegrationMCPFederationReportsWhatTheSyncDid(t *testing.T) {
 		t.Errorf("federation listing carried a credential: %s", reported)
 	}
 }
+
+// CSRF is enforced in one place, by the middleware that resolves the browser
+// session, so no handler can forget it — but a route registered outside that
+// group never reaches the middleware at all, and nothing said so. The check is
+// therefore about where routes are registered rather than what they do: every
+// method under /api that changes something must refuse a request carrying a
+// valid session and no token.
+//
+// Login is the one exception, and it is one by definition: there is no session
+// to protect yet. Logout is not - it is behind a session, so it is covered
+// here. Paths outside /api are bearer-token surfaces, which carry no ambient
+// credential for another site to borrow.
+func TestIntegrationEveryMutatingAPIRouteRequiresACSRFToken(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	signIn, err := server.Client().Post(server.URL+"/api/v1/auth/login", "application/json",
+		strings.NewReader(`{"realm":"master","username":"admin","password":"bootstrap-password-123","request":""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(signIn.Body)
+	_ = signIn.Body.Close()
+	if signIn.StatusCode != http.StatusOK {
+		t.Fatalf("signing in for the probe failed: %d %s", signIn.StatusCode, body)
+	}
+	cookies := signIn.Cookies()
+
+	router, ok := handler.(*chi.Mux)
+	if !ok {
+		t.Fatal("handler is not a chi router")
+	}
+	// Any placeholder, not a list of the names used today: a route with a new
+	// parameter name would otherwise be requested with braces in its path and
+	// quietly leave the set this covers.
+	placeholder := regexp.MustCompile(`\{[^}]*\}|\*`)
+	probed := 0
+	walkErr := chi.Walk(router, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
+			return nil
+		}
+		if !strings.HasPrefix(route, "/api/") || route == "/api/v1/auth/login" {
+			return nil
+		}
+		path := placeholder.ReplaceAllString(route, "00000000-0000-0000-0000-000000000001")
+		request, err := http.NewRequest(method, server.URL+path, strings.NewReader("{}"))
+		if err != nil {
+			t.Errorf("%s %s could not be requested: %v", method, route, err)
+			return nil
+		}
+		request.Header.Set("Content-Type", "application/json")
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Errorf("%s %s: %v", method, route, err)
+			return nil
+		}
+		answer, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		probed++
+		if response.StatusCode != http.StatusForbidden || !strings.Contains(string(answer), "invalid_csrf") {
+			t.Errorf("%s %s answered %d %.100s without a CSRF token: a request another site can "+
+				"make with the operator's cookie changes state", method, route, response.StatusCode, answer)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatal(walkErr)
+	}
+	if probed == 0 {
+		t.Fatal("no mutating API route was probed, so nothing is being checked")
+	}
+	t.Logf("%d mutating API routes refuse a request without a CSRF token", probed)
+}
