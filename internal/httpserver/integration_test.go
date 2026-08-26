@@ -5754,3 +5754,122 @@ func TestIntegrationARefusedSignInDoesNotSayWhichReason(t *testing.T) {
 	// sixty milliseconds either way in this environment, which is the same
 	// order as the hashing it would have to reveal.
 }
+
+// An empty list has to be an empty list. Go marshals a slice nobody appended
+// to as null, and the console reads these straight into .length and .map, so a
+// listing that comes back null does not render an empty table — it throws and
+// the screen goes blank.
+//
+// The signing keys screen was that: a Realm whose key could not be created,
+// which this service records as a partial creation and sends the operator here
+// to put right, answered with null and took the page down on arrival. Every
+// collection is checked rather than that one, because the next listing to be
+// written is the one this is for.
+func TestIntegrationEveryListingAnswersWithAListEvenWhenEmpty(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	empty, err := data.CreateRealm(ctx, store.CreateRealmInput{
+		Name: "empty", DisplayName: "Empty", IssuerURL: "http://localhost:8080/realms/empty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	cookies, _ := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+
+	realmParam := regexp.MustCompile(`\{realmID\}`)
+	otherParams := regexp.MustCompile(`\{[^}]*\}|\*`)
+	// Gathered first and read after, so that what each answer means is decided
+	// here rather than inside a callback whose return value steers the walk.
+	listings := make([]string, 0)
+	walkErr := chi.Walk(handler.(*chi.Mux), func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		if method != http.MethodGet || !strings.HasPrefix(route, "/api/admin/") {
+			return nil
+		}
+		// The collection reads only. A route naming a sub-resource needs a real
+		// identifier, and a made-up one answers 404, which says nothing here.
+		if !otherParams.MatchString(realmParam.ReplaceAllString(route, "")) {
+			listings = append(listings, route)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatal(walkErr)
+	}
+	checked := 0
+	for _, route := range listings {
+		request, err := http.NewRequest(http.MethodGet,
+			server.URL+realmParam.ReplaceAllString(route, empty.ID.String()), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err != nil {
+			t.Errorf("%s answered something that is not a JSON object: %.90s", route, body)
+			continue
+		}
+		items, carries := fields["items"]
+		if !carries {
+			continue
+		}
+		checked++
+		if string(items) == "null" {
+			t.Errorf("%s answered items:null on a Realm with nothing in it, which the console reads "+
+				"into .length and does not survive", route)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no listing was reached, so nothing is being checked")
+	}
+	t.Logf("%d listings answer with a list when empty", checked)
+}
+
+// realm_access.roles is a list every relying party reads, and one that asks
+// whether it contains something breaks on null rather than finding nothing.
+// An account holds the Realm's user Role from the moment it is made, so this
+// is the account whose Roles were all taken away.
+func TestIntegrationAnAccountWithNoRolesStillClaimsAList(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "roleless", Password: "roleless-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, "DELETE FROM user_roles WHERE user_id=$1", user.ID); err != nil {
+		t.Fatal(err)
+	}
+	roles, err := data.RealmRolesForUser(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(map[string]any{"roles": roles})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `{"roles":[]}` {
+		t.Errorf("an account with no Roles claims %s, and a relying party asking whether that contains "+
+			"something breaks on null rather than finding nothing", encoded)
+	}
+}

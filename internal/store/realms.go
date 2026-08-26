@@ -147,7 +147,7 @@ func (s *Store) ListRealms(ctx context.Context) ([]domain.Realm, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var realms []domain.Realm
+	realms := make([]domain.Realm, 0)
 	for rows.Next() {
 		realm, err := scanRealm(rows)
 		if err != nil {

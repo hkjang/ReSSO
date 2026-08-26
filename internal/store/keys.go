@@ -302,7 +302,11 @@ func (s *Store) ListSigningKeys(ctx context.Context, realmID uuid.UUID) ([]domai
 		return nil, err
 	}
 	defer rows.Close()
-	var keys []domain.SigningKey
+	// Empty is an empty list, not the absence of one: the console reads this
+	// straight into .length, and a Realm whose key could not be created — which
+	// this service records as a partial creation and sends the operator here to
+	// put right — is exactly when it is empty.
+	keys := make([]domain.SigningKey, 0)
 	for rows.Next() {
 		var key domain.SigningKey
 		if err := rows.Scan(&key.ID, &key.RealmID, &key.KID, &key.Algorithm, &key.Status,

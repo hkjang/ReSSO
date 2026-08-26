@@ -598,7 +598,11 @@ func (s *Store) RealmRolesForUser(ctx context.Context, userID uuid.UUID) ([]stri
 		return nil, err
 	}
 	defer rows.Close()
-	var roles []string
+	// realm_access.roles is a list every relying party reads, and a caller
+	// that asks whether it contains something breaks on null rather than
+	// finding nothing. An account holds the Realm's user Role from the moment
+	// it is made, so this is the account whose Roles were all taken away.
+	roles := make([]string, 0)
 	for rows.Next() {
 		var role string
 		if err := rows.Scan(&role); err != nil {
