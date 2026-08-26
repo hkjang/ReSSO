@@ -6330,3 +6330,80 @@ func TestIntegrationAnUnknownNameCostsAsMuchAsAWrongPassword(t *testing.T) {
 			wrong, unknown)
 	}
 }
+
+// "resso admin diagnose" is what an operator reads before removing the old
+// encryption key: it opens every sealed value it knows of and reports how many
+// still need rewrapping. A class of secret it does not read contributes 0 to
+// that count, so the report reads the same as "everything is on the new key" -
+// and the key those values still need is the thing the operator is about to
+// delete.
+//
+// TestIntegrationRewrapCoversEveryEncryptedColumn holds the rewrap to the
+// schema, but nothing held the diagnosis to it. So this asks the database how
+// many sealed values it holds, without naming the columns, and requires the
+// diagnosis to have opened exactly that many. A newly sealed column is then
+// counted here whether or not anyone remembered this file.
+func TestIntegrationDiagnoseOpensEverySealedValueThereIs(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	credential := "bind-secret-value"
+	if _, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldap://directory.invalid:389",
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid",
+		RDNLDAPAttribute: "uid", UUIDLDAPAttribute: "entryUUID",
+		UserObjectClasses: []string{"inetOrgPerson"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Count what the database actually holds, without naming the columns.
+	rows, err := data.Pool.Query(ctx, `SELECT table_name,column_name FROM information_schema.columns
+		WHERE table_schema=current_schema() AND data_type='bytea' AND column_name LIKE '%\_cipher'
+		ORDER BY table_name,column_name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type column struct{ table, name string }
+	var columns []column
+	for rows.Next() {
+		var c column
+		if err := rows.Scan(&c.table, &c.name); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		columns = append(columns, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, c := range columns {
+		var count int
+		query := fmt.Sprintf(`SELECT count(*) FROM %q WHERE %q IS NOT NULL`, c.table, c.name)
+		if err := data.Pool.QueryRow(ctx, query).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		total += count
+	}
+
+	diagnosis, err := data.DiagnoseRecovery(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total == 0 {
+		t.Fatal("nothing sealed was seeded, so this guard is checking nothing")
+	}
+	if diagnosis.EncryptedValuesVerified != total {
+		t.Errorf("the diagnosis opened %d sealed values and the database holds %d; "+
+			"what it does not read reports as needing no rewrap, and the operator removes the old key on that",
+			diagnosis.EncryptedValuesVerified, total)
+	}
+}
