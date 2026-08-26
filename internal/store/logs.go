@@ -175,15 +175,23 @@ func (s *Store) PruneOperationalData(ctx context.Context) error {
 			"DELETE FROM audit_events WHERE occurred_at < now() - interval '365 days'"},
 	}
 	var failures []error
-	for _, statement := range statements {
+	for index, statement := range statements {
 		if _, err := s.Pool.Exec(ctx, statement.sql); err != nil {
 			failures = append(failures, fmt.Errorf("%s: %w", statement.what, err))
 			// A spent deadline is the one failure that does carry to the rest:
 			// every remaining statement would fail the same way and say so
 			// nine times over.
 			if ctx.Err() != nil {
-				failures = append(failures, fmt.Errorf(
-					"%d further retention statements were not attempted", len(statements)-len(failures)))
+				// What is left is counted from where the deadline landed, not
+				// from how many statements had failed by then. Those are the
+				// same number only when every earlier statement also failed:
+				// with the deadline on the last statement the old count said
+				// eight were skipped when the other eight had all just run,
+				// which reads as a sweep that barely happened.
+				if remaining := len(statements) - index - 1; remaining > 0 {
+					failures = append(failures, fmt.Errorf(
+						"%d further retention statements were not attempted", remaining))
+				}
 				break
 			}
 		}

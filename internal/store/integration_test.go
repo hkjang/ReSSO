@@ -6407,3 +6407,54 @@ func TestIntegrationDiagnoseOpensEverySealedValueThereIs(t *testing.T) {
 			diagnosis.EncryptedValuesVerified, total)
 	}
 }
+
+// stallPruneOn holds an exclusive lock on one table so the retention statement
+// that touches it blocks until the prune's deadline passes, and returns what
+// the prune reported.
+func stallPruneOn(t *testing.T, table string) string {
+	t.Helper()
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	holder, err := data.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
+	if _, err := holder.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Exec(ctx, `LOCK TABLE `+table+` IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	pruneCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	err = data.PruneOperationalData(pruneCtx)
+	if err == nil {
+		t.Fatalf("the prune held up on %s still reported success", table)
+	}
+	return err.Error()
+}
+
+// When the retention sweep runs out of time it stops, and says how many of its
+// statements it never got to. That number was worked out from how many had
+// failed by then, which is the same as how many had run only if every earlier
+// statement also failed.
+//
+// So a deadline landing on the last statement - the other eight having just
+// run - was reported as "8 further retention statements were not attempted".
+// An operator reading that concludes the sweep barely happened and their
+// retention is not being applied, when all that was cut short was the final
+// delete.
+const pruneSkipNotice = "further retention statements were not attempted"
+
+func TestIntegrationTheRetentionSweepSaysOnlyWhatItSkipped(t *testing.T) {
+	// audit_events is the last statement, so nothing comes after it.
+	if reported := stallPruneOn(t, "audit_events"); strings.Contains(reported, pruneSkipNotice) {
+		t.Errorf("the last statement ran out of time, so nothing was left to attempt, and the sweep reported:\n%s",
+			reported)
+	}
+	// sso_sessions is reached partway through, so statements really do remain.
+	if reported := stallPruneOn(t, "sso_sessions"); !strings.Contains(reported, pruneSkipNotice) {
+		t.Errorf("the sweep stopped partway and did not say what it had not reached:\n%s", reported)
+	}
+}
