@@ -222,3 +222,36 @@ func TestThePostgresVersionIsTheSameEverywhereItIsNamed(t *testing.T) {
 			"where there is no time left to meet it", len(found), found)
 	}
 }
+
+// .env.example is the file the README tells an operator to copy to .env before
+// bringing the compose deployment up, so every name in it is an invitation to
+// set something. A name compose never reads is an invitation to nothing: the
+// value is accepted, no error is raised, and the deployment goes on behaving
+// as though it were never written - which is worse than not offering it, since
+// the operator now believes they changed it.
+func TestEveryOfferedSettingReachesTheDeployment(t *testing.T) {
+	root := filepath.Join("..", "..")
+	example, err := os.ReadFile(filepath.Join(root, ".env.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compose strings.Builder
+	for _, name := range []string{"compose.offline.yaml", "compose.maintenance.yaml"} {
+		content, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		compose.Write(content)
+	}
+	offered := regexp.MustCompile(`(?m)^#?\s*([A-Z][A-Z0-9_]+)=`).FindAllStringSubmatch(string(example), -1)
+	if len(offered) == 0 {
+		t.Fatal(".env.example offers no settings, so nothing is being compared")
+	}
+	for _, match := range offered {
+		if !strings.Contains(compose.String(), "${"+match[1]) {
+			t.Errorf(".env.example offers %s and no compose file reads it: setting it in .env "+
+				"changes nothing and says nothing, so the operator is left believing it took "+
+				"effect", match[1])
+		}
+	}
+}

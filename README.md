@@ -32,7 +32,7 @@ PostgreSQL과 최초 관리자 값이 필요하며, 키 보호 설정은 분리�
 | `DIGEST_KEYS` | 권장. Session·Token·API Key HMAC Keyring. 형식은 위와 같고 첫 키가 신규 Digest에 사용됩니다. |
 | `ENCRYPTION_KEY` | v0.2.0 호환 단일 32바이트 키. 분리형 Keyring이 없으면 양쪽 용도로 사용하며, Keyring과 함께 설정하면 Upgrade용 읽기 키로 자동 추가됩니다. |
 | `TRUSTED_PROXY_CIDRS` | 선택. 쉼표로 구분한 Reverse Proxy CIDR. 설정된 Proxy에서 온 `X-Forwarded-For`와 `X-Forwarded-Proto`만 신뢰합니다. |
-| `LISTEN_ADDRESS` | 선택. `host:port` 형식의 Listen 주소. 기본값은 `:8080`이며 Container Health Check도 이 값을 따릅니다. |
+| `LISTEN_ADDRESS` | 선택. `host:port` 형식의 Listen 주소. 기본값은 `:8080`이며 Container Health Check도 이 값을 따릅니다. 바이너리를 직접 실행할 때 쓰며, compose 배포에서는 컨테이너가 항상 `:8080`에 바인딩하므로 `.env`의 `PUBLISHED_PORT`로 호스트 포트를 바꿉니다. |
 
 `BOOTSTRAP_ADMIN_PASSWORD`는 최초 계정 생성에만 사용됩니다. 컨테이너 재시작이나 값 변경으로 기존 비밀번호가 재설정되지 않습니다.
 
