@@ -9,7 +9,13 @@ COPY webui ./webui
 RUN cd web && npm run build
 
 FROM golang:1.26.7-alpine AS go-builder
-ARG VERSION=v0.4.1-dev
+# A placeholder, not a version. Both `make image` and the release workflow pass
+# VERSION explicitly; this only applies to a bare `docker build .`, and a real
+# number here goes stale the moment the next release lands — it had been sitting
+# at v0.4.1-dev five releases later, so an image built that way reported a
+# version that shipped months earlier. For an appliance whose images are copied
+# between machines, the label is how you tell what you are holding.
+ARG VERSION=v0.0.0-dev
 ARG COMMIT=unknown
 ARG BUILD_TIME=unknown
 WORKDIR /src
@@ -25,7 +31,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     -o /out/resso ./cmd/resso
 
 FROM scratch
-ARG VERSION=v0.4.1-dev
+ARG VERSION=v0.0.0-dev
 ARG COMMIT=unknown
 LABEL org.opencontainers.image.title="ReSSO" \
       org.opencontainers.image.description="Offline-ready Keycloak-compatible OIDC SSO service" \
