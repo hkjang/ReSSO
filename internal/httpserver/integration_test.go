@@ -6772,3 +6772,61 @@ func TestIntegrationEveryAdvertisedCapabilityIsHonoured(t *testing.T) {
 		t.Errorf("revocation answered 200 but the refresh token still works: %s", refreshRaw)
 	}
 }
+
+// The store names which setting is out of range; this is the half that decides
+// whether the operator ever sees it. writeStoreError passes a message through
+// only for a *MessagedError, so a refusal built any other way arrives as the
+// generic sentence and the console shows it beside seven number fields with no
+// indication which one to change.
+func TestIntegrationAnOutOfRangeSettingSaysWhichOne(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+
+	save := func(body string) (int, string) {
+		t.Helper()
+		request, reqErr := http.NewRequest(http.MethodPut,
+			fmt.Sprintf("%s/api/admin/v1/realms/%s", server.URL, bootstrap.RealmID), strings.NewReader(body))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		raw, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode, string(raw)
+	}
+
+	settings := func(accessTTL int) string {
+		return fmt.Sprintf(`{"display_name":"Master","issuer_url":"https://sso.example.test/realms/master",
+			"enabled":true,"access_token_ttl_seconds":%d,"refresh_token_ttl_seconds":1800,
+			"session_ttl_seconds":28800,"password_min_length":12,"max_login_attempts":5,
+			"lockout_seconds":900,"idle_timeout_seconds":0}`, accessTTL)
+	}
+	// A value the CHECK constraint allows, so the refusal below is the range
+	// and not something else about the request.
+	if status, body := save(settings(300)); status != http.StatusOK {
+		t.Fatalf("a valid save was refused, so the probe below proves nothing: %d %s", status, body)
+	}
+	status, body := save(settings(1))
+	if status != http.StatusBadRequest {
+		t.Fatalf("an out-of-range TTL answered %d %s", status, body)
+	}
+	if !strings.Contains(body, "access_token_ttl_seconds") {
+		t.Errorf("the refusal does not name the setting the operator has to change: %s", body)
+	}
+}

@@ -6458,3 +6458,79 @@ func TestIntegrationTheRetentionSweepSaysOnlyWhatItSkipped(t *testing.T) {
 		t.Errorf("the sweep stopped partway and did not say what it had not reached:\n%s", reported)
 	}
 }
+
+// Every one of these settings is a number on one screen of the console, and a
+// refusal that does not name one of them leaves the operator to find it by
+// changing fields until the save goes through.
+//
+// The validator writes exactly that sentence - which setting, and what range -
+// but built it with fmt.Errorf around the bare sentinel. writeStoreError
+// passes a message through only when it is a *MessagedError, so the sentence
+// was discarded and all seven answered "입력값이 올바르지 않습니다." In the same
+// submit, issuer_url named itself, because its refusal was built the other way.
+func TestRealmPolicyRefusalsNameTheSetting(t *testing.T) {
+	valid := UpdateRealmInput{
+		DisplayName: "Master", IssuerURL: "https://sso.example.test/realms/master",
+		PasswordMinLength: 12, MaxLoginAttempts: 5, LockoutSeconds: 900,
+		AccessTokenTTLSeconds: 300, RefreshTokenTTLSeconds: 1800,
+		SessionTTLSeconds: 28800, IdleTimeoutSeconds: 0,
+	}
+	if err := validateRealmPolicy(valid); err != nil {
+		t.Fatalf("the baseline is not valid, so nothing below tests the bounds: %v", err)
+	}
+	for _, bound := range realmPolicyBounds {
+		input := valid
+		tooLow := bound.Low - 1
+		switch bound.Label {
+		case "password_min_length":
+			input.PasswordMinLength = tooLow
+		case "max_login_attempts":
+			input.MaxLoginAttempts = tooLow
+		case "lockout_seconds":
+			input.LockoutSeconds = tooLow
+		case "access_token_ttl_seconds":
+			input.AccessTokenTTLSeconds = tooLow
+		case "refresh_token_ttl_seconds":
+			input.RefreshTokenTTLSeconds = tooLow
+		case "session_ttl_seconds":
+			input.SessionTTLSeconds = tooLow
+		case "idle_timeout_seconds":
+			input.IdleTimeoutSeconds = tooLow
+		default:
+			t.Errorf("%s was added to realmPolicyBounds and this test does not drive it", bound.Label)
+			continue
+		}
+		err := validateRealmPolicy(input)
+		if !errors.Is(err, ErrInvalidInput) {
+			t.Errorf("%s = %d was accepted, and the CHECK constraint would have refused it",
+				bound.Label, tooLow)
+			continue
+		}
+		var messaged *MessagedError
+		if !errors.As(err, &messaged) {
+			t.Errorf("the refusal for %s carries no message, so the caller is told only that "+
+				"something was wrong: %v", bound.Label, err)
+			continue
+		}
+		if !strings.Contains(messaged.Message, bound.Label) {
+			t.Errorf("the refusal for %s does not name it: %q", bound.Label, messaged.Message)
+		}
+	}
+}
+
+func TestAnEmailRefusalSaysWhatIsWrongWithIt(t *testing.T) {
+	for _, probe := range []struct{ what, value string }{
+		{"an address that is too long", strings.Repeat("a", 400) + "@example.test"},
+		{"something that is not an address", "not an address"},
+	} {
+		_, err := normalizeOptionalEmail(probe.value)
+		var messaged *MessagedError
+		if !errors.As(err, &messaged) {
+			t.Errorf("%s is refused without a message the caller can read: %v", probe.what, err)
+			continue
+		}
+		if !strings.Contains(messaged.Message, "이메일") {
+			t.Errorf("%s is refused without saying it is the email: %q", probe.what, messaged.Message)
+		}
+	}
+}

@@ -349,10 +349,10 @@ func normalizeOptionalEmail(value string) (string, error) {
 		return "", nil
 	}
 	if len([]rune(email)) > maxEmailLength {
-		return "", fmt.Errorf("%w: email must contain at most %d characters", ErrInvalidInput, maxEmailLength)
+		return "", invalidf("이메일 주소는 %d자를 넘을 수 없습니다.", maxEmailLength)
 	}
 	if !validMailbox(email) {
-		return "", fmt.Errorf("%w: email must be a single RFC address", ErrInvalidInput)
+		return "", invalidf("이메일 주소 형식이 올바르지 않습니다. 주소 하나만 입력해 주세요.")
 	}
 	return email, nil
 }

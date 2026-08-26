@@ -273,15 +273,14 @@ func validateRealmPolicy(input UpdateRealmInput) error {
 		}
 		if value < bound.Low || value > bound.High {
 			if bound.Label == "idle_timeout_seconds" {
-				return fmt.Errorf("%w: idle_timeout_seconds must be 0 or between %d and %d",
-					ErrInvalidInput, bound.Low, bound.High)
+				return invalidf("idle_timeout_seconds 값은 0이거나 %d에서 %d 사이여야 합니다.",
+					bound.Low, bound.High)
 			}
-			return fmt.Errorf("%w: %s must be between %d and %d", ErrInvalidInput,
-				bound.Label, bound.Low, bound.High)
+			return invalidf("%s 값은 %d에서 %d 사이여야 합니다.", bound.Label, bound.Low, bound.High)
 		}
 	}
 	if input.IdleTimeoutSeconds != 0 && input.IdleTimeoutSeconds > input.SessionTTLSeconds {
-		return fmt.Errorf("%w: idle_timeout_seconds must not exceed session_ttl_seconds", ErrInvalidInput)
+		return invalidf("idle_timeout_seconds 값은 session_ttl_seconds 값보다 클 수 없습니다.")
 	}
 	return nil
 }
