@@ -146,3 +146,46 @@ func TestPublicRoutesAreReachable(t *testing.T) {
 		t.Errorf("GET /api/v1/me = %d, want %d", response.Code, http.StatusUnauthorized)
 	}
 }
+
+// The console is served by a catch-all: anything the bundle does not contain
+// is answered with index.html so that a deep link like /admin/users reaches
+// the router in the browser. Applied to a versioned asset that is missing,
+// that rule hands the browser HTML with 200 where it asked for JavaScript.
+// The parse fails, the screen stays blank, and the network tab shows every
+// request succeeding — the one place a person would look says nothing is
+// wrong.
+//
+// An index.html outliving the bundle it names is not hypothetical: a cache or
+// proxy holding the previous document after a deploy asks for asset hashes
+// that are gone, and a binary built without the console ships the document
+// alone, since webui/dist/* is ignored apart from index.html.
+func TestMissingAssetIsRefusedRatherThanAnsweredWithTheDocument(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(nil, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	response, err := server.Client().Get(server.URL + "/assets/index-thisIsGone.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Errorf("a missing asset answered %d, want %d", response.StatusCode, http.StatusNotFound)
+	}
+	if strings.Contains(string(body), "<!doctype html") || strings.Contains(string(body), "<html") {
+		t.Errorf("a missing asset was answered with the console document: %s", body)
+	}
+
+	// And the console's own routes still get the document, which is the whole
+	// point of the catch-all and the half that must not change.
+	shell, err := server.Client().Get(server.URL + "/admin/users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shellBody, _ := io.ReadAll(shell.Body)
+	_ = shell.Body.Close()
+	if shell.StatusCode != http.StatusOK || !strings.Contains(string(shellBody), "<html") {
+		t.Errorf("a console route answered %d with %.60s, want the document", shell.StatusCode, shellBody)
+	}
+}

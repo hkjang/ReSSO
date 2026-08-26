@@ -171,15 +171,29 @@ func (s *Server) spaHandler() http.Handler {
 	files := http.FileServer(http.FS(dist))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/")
+		// A dot is what separates a file from a console route: every route the
+		// console has is made of path segments without one.
+		namesAFile := strings.Contains(path, ".")
 		if path != "" {
 			if file, err := dist.Open(path); err == nil {
 				_ = file.Close()
-				if strings.Contains(path, ".") {
+				if namesAFile {
 					w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 				}
 				files.ServeHTTP(w, r)
 				return
 			}
+		}
+		// Falling back to the document is for console routes only. A browser
+		// that asked for a script and is handed HTML with 200 fails to parse
+		// it and shows nothing, while the network tab reports every request as
+		// a success — so the one place a person looks says nothing is wrong.
+		// This is what an index.html outliving its bundle looks like: a cache
+		// or proxy holding the previous document across a deploy, or a binary
+		// built without the console.
+		if namesAFile {
+			http.NotFound(w, r)
+			return
 		}
 		w.Header().Set("Cache-Control", "no-cache")
 		r.URL.Path = "/"
