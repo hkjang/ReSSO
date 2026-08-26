@@ -5873,3 +5873,107 @@ func TestIntegrationAnAccountWithNoRolesStillClaimsAList(t *testing.T) {
 			"something breaks on null rather than finding nothing", encoded)
 	}
 }
+
+// An authorization code is a credential minted a moment before it is spent,
+// and what it stands for can be taken away in between: the Client switched
+// off, the Realm suspended, the session ended from another screen. Each of
+// those is a decision somebody made, and honouring a code issued before it
+// hands out tokens the decision was meant to stop.
+//
+// The exchange that changes nothing runs first and has to succeed. Written
+// without it this would have passed while proving nothing: the first version
+// left PKCE out of the exchange, so every attempt was refused for that instead
+// and all four looked like the boundary holding.
+func TestIntegrationACodeIsRefusedAfterWhatItStandsForIsTakenAway(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmID := bootstrap.RealmID
+	if err := data.EnsureActiveSigningKey(ctx, realmID); err != nil {
+		t.Fatal(err)
+	}
+	rp, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "midflow", Name: "Midflow", Type: "public", RedirectURIs: []string{"https://m.test/cb"},
+		GrantTypes: []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "flow", Password: "flow-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realmID, user.ID, time.Hour, "127.0.0.1", "midflow-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The verifier and challenge of RFC 7636's own example.
+	const (
+		verifier  = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+		challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+	)
+	mint := func() string {
+		t.Helper()
+		raw, err := data.CreateAuthorizationCode(ctx, store.AuthorizationCode{
+			RealmID: realmID, ClientID: rp.Client.ID, UserID: user.ID, SessionID: session.Session.ID,
+			RedirectURI: "https://m.test/cb", Scope: []string{"openid"},
+			CodeChallenge: challenge, CodeChallengeMethod: "S256",
+			ExpiresAt: time.Now().UTC().Add(5 * time.Minute)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	spend := func(code string) int {
+		t.Helper()
+		response, err := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token",
+			url.Values{"grant_type": {"authorization_code"}, "code": {code},
+				"redirect_uri": {"https://m.test/cb"}, "client_id": {"midflow"},
+				"code_verifier": {verifier}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+
+	if status := spend(mint()); status != http.StatusOK {
+		t.Fatalf("a code with nothing changed answered %d, so every refusal below would prove nothing",
+			status)
+	}
+	for _, taken := range []struct {
+		what           string
+		away, giveBack string
+	}{
+		{"the Client was switched off",
+			"UPDATE clients SET enabled=false WHERE id='" + rp.Client.ID.String() + "'",
+			"UPDATE clients SET enabled=true WHERE id='" + rp.Client.ID.String() + "'"},
+		{"the Realm was suspended",
+			"UPDATE realms SET enabled=false WHERE id='" + realmID.String() + "'",
+			"UPDATE realms SET enabled=true WHERE id='" + realmID.String() + "'"},
+		{"the session was ended",
+			"UPDATE sso_sessions SET revoked_at=now() WHERE id='" + session.Session.ID.String() + "'",
+			"UPDATE sso_sessions SET revoked_at=NULL WHERE id='" + session.Session.ID.String() + "'"},
+	} {
+		code := mint()
+		if _, err := data.Pool.Exec(ctx, taken.away); err != nil {
+			t.Fatal(err)
+		}
+		status := spend(code)
+		if _, err := data.Pool.Exec(ctx, taken.giveBack); err != nil {
+			t.Fatal(err)
+		}
+		if status == http.StatusOK {
+			t.Errorf("a code minted before %s was still spent for tokens, which is what the decision "+
+				"was meant to stop", taken.what)
+		}
+	}
+}
