@@ -103,8 +103,21 @@ func (l *FailureLimiter) Reset(key string) {
 }
 
 // evictLocked keeps the map bounded. Expired windows go first; if the map is
-// still full, the oldest window is dropped. Dropping the oldest is safe because
-// it is the closest to expiring anyway.
+// still full, the window furthest from blocking anyone is dropped, and the
+// oldest among equals.
+//
+// Dropping the plain oldest was the wrong order, because a key that is already
+// blocked is by then the oldest one there is. The client bucket's key is the
+// client_id the request carried, so a caller chooses it: guess a secret until
+// the key blocks, then send one request each under fresh identifiers until the
+// blocked window is pushed out, and carry on guessing. The per-client bound
+// this exists for was gone, leaving only the per-address one it was added to
+// strengthen.
+//
+// Fewest failures first means displacing a blocked key now costs as many
+// failed attempts as the block itself did, for every key used to displace it -
+// and those attempts are counted against the caller's address at the same
+// time.
 func (l *FailureLimiter) evictLocked(now time.Time) {
 	if len(l.windows) < l.capacity {
 		return
@@ -115,13 +128,14 @@ func (l *FailureLimiter) evictLocked(now time.Time) {
 		}
 	}
 	for len(l.windows) >= l.capacity {
-		var oldestKey string
-		var oldest time.Time
+		var chosenKey string
+		var chosen window
 		for key, value := range l.windows {
-			if oldest.IsZero() || value.startedAt.Before(oldest) {
-				oldestKey, oldest = key, value.startedAt
+			if chosenKey == "" || value.failures < chosen.failures ||
+				(value.failures == chosen.failures && value.startedAt.Before(chosen.startedAt)) {
+				chosenKey, chosen = key, value
 			}
 		}
-		delete(l.windows, oldestKey)
+		delete(l.windows, chosenKey)
 	}
 }
