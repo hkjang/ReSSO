@@ -42,42 +42,71 @@ func Hash(value string) (string, error) {
 }
 
 func Verify(value, encoded string) (bool, error) {
+	p, salt, expected, err := decode(encoded)
+	if err != nil {
+		return false, err
+	}
+	actual := argon2.IDKey([]byte(value), salt, p.Iterations, p.Memory, p.Parallelism, uint32(len(expected)))
+	return subtle.ConstantTimeCompare(actual, expected) == 1, nil
+}
+
+// NeedsUpgrade reports whether a stored hash was made with less work than
+// DefaultParams asks for now.
+//
+// DefaultParams is a variable so that the cost can be raised as hardware gets
+// cheaper, and raising it only ever protected passwords set afterwards: every
+// account whose owner never changed theirs kept the cost of the day it was
+// created, with nothing saying so. Rehashing on a successful sign-in is the
+// only moment the plaintext is in hand to do it with.
+//
+// A hash that cannot be read at all is not an upgrade candidate — Verify will
+// refuse it, and rewriting something unparsed is not this function's business.
+// Neither is one that asks for more work than the default: lowering the cost
+// of an existing password is not an upgrade.
+func NeedsUpgrade(encoded string) bool {
+	p, _, _, err := decode(encoded)
+	if err != nil {
+		return false
+	}
+	return p.Memory < DefaultParams.Memory || p.Iterations < DefaultParams.Iterations
+}
+
+func decode(encoded string) (Params, []byte, []byte, error) {
 	parts := strings.Split(encoded, "$")
 	if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" {
-		return false, errors.New("unsupported password hash")
+		return Params{}, nil, nil, errors.New("unsupported password hash")
 	}
 	var p Params
 	params := strings.Split(parts[3], ",")
 	if len(params) != 3 {
-		return false, errors.New("invalid password hash parameters")
+		return Params{}, nil, nil, errors.New("invalid password hash parameters")
 	}
 	memory, err := parseParam(params[0], "m")
 	if err != nil {
-		return false, err
+		return Params{}, nil, nil, err
 	}
 	iterations, err := parseParam(params[1], "t")
 	if err != nil {
-		return false, err
+		return Params{}, nil, nil, err
 	}
 	parallelism, err := parseParam(params[2], "p")
 	if err != nil || parallelism > 255 {
-		return false, errors.New("invalid password hash parallelism")
+		return Params{}, nil, nil, errors.New("invalid password hash parallelism")
 	}
 	p.Memory, p.Iterations, p.Parallelism = uint32(memory), uint32(iterations), uint8(parallelism)
 	if p.Memory < 8*1024 || p.Memory > 1024*1024 || p.Iterations < 1 || p.Iterations > 20 || p.Parallelism < 1 || p.Parallelism > 32 {
-		return false, errors.New("password hash parameters outside safe bounds")
+		return Params{}, nil, nil, errors.New("password hash parameters outside safe bounds")
 	}
 	b64 := base64.RawStdEncoding
 	salt, err := b64.DecodeString(parts[4])
 	if err != nil || len(salt) < 8 || len(salt) > 64 {
-		return false, errors.New("invalid password hash salt")
+		return Params{}, nil, nil, errors.New("invalid password hash salt")
 	}
 	expected, err := b64.DecodeString(parts[5])
 	if err != nil || len(expected) < 16 || len(expected) > 64 {
-		return false, errors.New("invalid password hash value")
+		return Params{}, nil, nil, errors.New("invalid password hash value")
 	}
-	actual := argon2.IDKey([]byte(value), salt, p.Iterations, p.Memory, p.Parallelism, uint32(len(expected)))
-	return subtle.ConstantTimeCompare(actual, expected) == 1, nil
+	return p, salt, expected, nil
 }
 
 func parseParam(value, name string) (uint64, error) {

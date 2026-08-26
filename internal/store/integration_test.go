@@ -6169,3 +6169,59 @@ func TestIntegrationHotPathsDoNotReadWholeTables(t *testing.T) {
 		}
 	}
 }
+
+// DefaultParams is a variable so the hashing cost can be raised as hardware
+// gets cheaper. Raising it used to protect only passwords set afterwards:
+// every account whose owner never changed theirs kept the cost of the day it
+// was made, and nothing said so. A successful sign-in is the one moment the
+// plaintext is in hand to put that right.
+func TestIntegrationSigningInBringsAnOldPasswordHashUpToTheCurrentCost(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An account made when the cost was lower.
+	previous := password.DefaultParams
+	password.DefaultParams = password.Params{Memory: 8 * 1024, Iterations: 1, Parallelism: 1,
+		SaltLength: 16, KeyLength: 32}
+	joined, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "long-standing", Password: "long-standing-password-1234", Enabled: true})
+	password.DefaultParams = previous
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := func() string {
+		t.Helper()
+		var hash string
+		if err := data.Pool.QueryRow(ctx, "SELECT password_hash FROM users WHERE id=$1", joined.ID).Scan(&hash); err != nil {
+			t.Fatal(err)
+		}
+		return hash
+	}
+	if !strings.Contains(stored(), "m=8192") {
+		t.Fatalf("the account was not created at the lower cost: %s", stored())
+	}
+
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := data.AuthenticatePassword(ctx, realm, "long-standing", "long-standing-password-1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("signing in failed: %+v", result)
+	}
+	upgraded := stored()
+	if !strings.Contains(upgraded, "m=65536") {
+		t.Errorf("the hash still carries the cost of the day the account was made: %s", upgraded)
+	}
+	// And it is still the same password.
+	again, err := data.AuthenticatePassword(ctx, realm, "long-standing", "long-standing-password-1234")
+	if err != nil || !again.Success {
+		t.Errorf("the rehashed password no longer signs in: %+v %v", again, err)
+	}
+}

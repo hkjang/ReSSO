@@ -510,6 +510,25 @@ func (s *Store) AuthenticatePassword(ctx context.Context, realm domain.Realm, us
 		// attempt was hashing. Refuse rather than clearing the lockout.
 		return AuthenticationResult{User: user, FailureReason: "ACCOUNT_LOCKED"}, nil
 	}
+	// The plaintext is in hand here and nowhere else, so this is the only
+	// moment an account whose hash predates a cost increase can be brought up
+	// to the current one. DefaultParams is a variable so that the cost can be
+	// raised; without this, raising it protected only passwords set afterwards
+	// and everyone who never changed theirs kept the cost of the day their
+	// account was made.
+	//
+	// The failure is dropped on purpose, and this is not the silent
+	// best-effort this codebase removes elsewhere: nothing was undone, the
+	// stored hash is exactly as strong as it was a moment ago, there is
+	// nothing for the person or the operator to do about it, and the next
+	// successful sign-in tries again. The password_hash in the predicate is
+	// what keeps a password changed in the meantime from being written back.
+	if password.NeedsUpgrade(passwordHash) {
+		if upgraded, hashErr := password.HashContext(ctx, suppliedPassword); hashErr == nil {
+			_, _ = s.Pool.Exec(ctx, "UPDATE users SET password_hash=$2 WHERE id=$1 AND password_hash=$3",
+				user.ID, upgraded, passwordHash)
+		}
+	}
 	user.FailedAttempts, user.LockedUntil = 0, nil
 	return AuthenticationResult{User: user, Success: true, SessionSeconds: realm.SessionTTLSeconds}, nil
 }
