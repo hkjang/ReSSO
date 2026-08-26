@@ -1315,10 +1315,10 @@ func TestIntegrationRoleListReportsUsageAndBuiltins(t *testing.T) {
 			t.Fatalf("%s should be reported as built in: %+v", builtin, byName[builtin])
 		}
 	}
-	if err := data.DeleteRole(ctx, bootstrap.RealmID, byName["user"].ID); !errors.Is(err, ErrConflict) {
+	if _, err := data.DeleteRole(ctx, bootstrap.RealmID, byName["user"].ID); !errors.Is(err, ErrConflict) {
 		t.Fatalf("deleting a built-in role: %v", err)
 	}
-	if err := data.DeleteRole(ctx, bootstrap.RealmID, role.ID); err != nil {
+	if _, err := data.DeleteRole(ctx, bootstrap.RealmID, role.ID); err != nil {
 		t.Fatalf("deleting an assigned role: %v", err)
 	}
 }
@@ -4571,7 +4571,7 @@ func TestIntegrationApprovalRequestsAreNotDuplicatedOrMisreported(t *testing.T) 
 
 	// A target that really has gone still fails, which is what that message
 	// was for: the role is deleted while its request waits.
-	if err := data.DeleteRole(ctx, realm.ID, second.ID); err != nil {
+	if _, err := data.DeleteRole(ctx, realm.ID, second.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := data.DecideApprovalRequest(ctx, other.ID, manager.ID, false, false, realm.ID, true, "ok"); err == nil {
@@ -5527,7 +5527,7 @@ func TestIntegrationDeletingARoleSaysWhyItWasRefused(t *testing.T) {
 		t.Fatal("the Realm has no built-in user Role, so this cannot be checked")
 	}
 
-	err = data.DeleteRole(ctx, bootstrap.RealmID, builtin)
+	_, err = data.DeleteRole(ctx, bootstrap.RealmID, builtin)
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("removing a built-in Role reported %v, want a conflict", err)
 	}
@@ -5547,7 +5547,7 @@ func TestIntegrationDeletingARoleSaysWhyItWasRefused(t *testing.T) {
 	// A Role that is not there is absent, not conflicting: the reader is
 	// looking at a screen that is out of date, and telling them something
 	// already exists sends them to look for a duplicate that does not.
-	if err := data.DeleteRole(ctx, bootstrap.RealmID, uuid.New()); !errors.Is(err, ErrNotFound) {
+	if _, err := data.DeleteRole(ctx, bootstrap.RealmID, uuid.New()); !errors.Is(err, ErrNotFound) {
 		t.Errorf("removing a Role that is not there reported %v, want not-found", err)
 	}
 
@@ -5556,7 +5556,7 @@ func TestIntegrationDeletingARoleSaysWhyItWasRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := data.DeleteRole(ctx, bootstrap.RealmID, created.ID); err != nil {
+	if _, err := data.DeleteRole(ctx, bootstrap.RealmID, created.ID); err != nil {
 		t.Errorf("an ordinary Role could not be removed: %v", err)
 	}
 }

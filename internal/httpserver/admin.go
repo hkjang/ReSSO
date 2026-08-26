@@ -535,12 +535,16 @@ func (s *Server) adminDeleteRole(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.store.DeleteRole(r.Context(), realmID, roleID); err != nil {
+	removed, err := s.store.DeleteRole(r.Context(), realmID, roleID)
+	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
 	principal, _ := principalFrom(r.Context())
-	s.audit(r, &realmID, &principal.UserID, principal.Username, "ROLE_DELETE", "SUCCESS", "role", roleID.String(), nil)
+	// The row is gone, so the id below resolves to nothing from here on: what
+	// it was, and how many people it took access from, has to be in the event.
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "ROLE_DELETE", "SUCCESS", "role", roleID.String(),
+		map[string]any{"name": removed.Name, "users_unassigned": removed.UsersUnassigned})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -605,12 +609,14 @@ func (s *Server) adminDeleteClientRole(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.store.DeleteClientRole(r.Context(), realmID, clientID, roleID); err != nil {
+	removed, err := s.store.DeleteClientRole(r.Context(), realmID, clientID, roleID)
+	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
 	principal, _ := principalFrom(r.Context())
-	s.audit(r, &realmID, &principal.UserID, principal.Username, "CLIENT_ROLE_DELETE", "SUCCESS", "client_role", roleID.String(), nil)
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "CLIENT_ROLE_DELETE", "SUCCESS", "client_role", roleID.String(),
+		map[string]any{"name": removed.Name, "users_unassigned": removed.UsersUnassigned})
 	w.WriteHeader(http.StatusNoContent)
 }
 

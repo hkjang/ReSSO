@@ -84,6 +84,14 @@ func (s *Store) UpdateRole(ctx context.Context, realmID, roleID uuid.UUID, descr
 // builtinRoleNames are created with every Realm and cannot be removed.
 var builtinRoleNames = []string{"user", "realm-admin", "offline_access"}
 
+// RoleRemoval is what a deletion took away. The audit event can only name the
+// row by an id that resolves to nothing once it is gone, so what it was and
+// who lost it has to be carried out of here.
+type RoleRemoval struct {
+	Name            string
+	UsersUnassigned int64
+}
+
 // DeleteRole removes a Realm Role that the Realm did not come with.
 //
 // Why it was refused is asked separately from whether a row went, because one
@@ -91,23 +99,37 @@ var builtinRoleNames = []string{"user", "realm-admin", "offline_access"}
 // is "an identical item already exists" — which says nothing true about a
 // deletion. An administrator removing the built-in user Role was told that,
 // and so was one working from a stale screen whose Role is already gone.
-func (s *Store) DeleteRole(ctx context.Context, realmID, roleID uuid.UUID) error {
+func (s *Store) DeleteRole(ctx context.Context, realmID, roleID uuid.UUID) (RoleRemoval, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return RoleRemoval{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	var name string
-	err := s.Pool.QueryRow(ctx, "SELECT name FROM roles WHERE id=$1 AND realm_id=$2",
+	err = tx.QueryRow(ctx, "SELECT name FROM roles WHERE id=$1 AND realm_id=$2 FOR UPDATE",
 		roleID, realmID).Scan(&name)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
+		return RoleRemoval{}, ErrNotFound
 	}
 	if err != nil {
-		return err
+		return RoleRemoval{}, err
 	}
 	if slices.Contains(builtinRoleNames, name) {
-		return conflictf("%q은(는) Realm과 함께 만들어지는 기본 Role이라 삭제할 수 없습니다.", name)
+		return RoleRemoval{}, conflictf("%q은(는) Realm과 함께 만들어지는 기본 Role이라 삭제할 수 없습니다.", name)
 	}
-	if _, err := s.Pool.Exec(ctx, "DELETE FROM roles WHERE id=$1 AND realm_id=$2", roleID, realmID); err != nil {
-		return err
+	// The assignments would go anyway, by cascade. Removing them here instead
+	// is what makes the number exact rather than inferred.
+	unassigned, err := tx.Exec(ctx, "DELETE FROM user_roles WHERE role_id=$1", roleID)
+	if err != nil {
+		return RoleRemoval{}, err
 	}
-	return nil
+	if _, err := tx.Exec(ctx, "DELETE FROM roles WHERE id=$1 AND realm_id=$2", roleID, realmID); err != nil {
+		return RoleRemoval{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return RoleRemoval{}, err
+	}
+	return RoleRemoval{Name: name, UsersUnassigned: unassigned.RowsAffected()}, nil
 }
 
 type ClientRole struct {
@@ -167,16 +189,33 @@ func (s *Store) CreateClientRole(ctx context.Context, realmID, clientID uuid.UUI
 	return role, err
 }
 
-func (s *Store) DeleteClientRole(ctx context.Context, realmID, clientID, roleID uuid.UUID) error {
-	command, err := s.Pool.Exec(ctx, `DELETE FROM client_roles cr USING clients c
-		WHERE cr.id=$1 AND cr.client_id=$2 AND c.id=cr.client_id AND c.realm_id=$3`, roleID, clientID, realmID)
+func (s *Store) DeleteClientRole(ctx context.Context, realmID, clientID, roleID uuid.UUID) (RoleRemoval, error) {
+	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return err
+		return RoleRemoval{}, err
 	}
-	if command.RowsAffected() == 0 {
-		return ErrNotFound
+	defer func() { _ = tx.Rollback(ctx) }()
+	var name string
+	err = tx.QueryRow(ctx, `SELECT cr.name FROM client_roles cr JOIN clients c ON c.id=cr.client_id
+		WHERE cr.id=$1 AND cr.client_id=$2 AND c.realm_id=$3 FOR UPDATE OF cr`,
+		roleID, clientID, realmID).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RoleRemoval{}, ErrNotFound
 	}
-	return nil
+	if err != nil {
+		return RoleRemoval{}, err
+	}
+	unassigned, err := tx.Exec(ctx, "DELETE FROM user_client_roles WHERE client_role_id=$1", roleID)
+	if err != nil {
+		return RoleRemoval{}, err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM client_roles WHERE id=$1", roleID); err != nil {
+		return RoleRemoval{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return RoleRemoval{}, err
+	}
+	return RoleRemoval{Name: name, UsersUnassigned: unassigned.RowsAffected()}, nil
 }
 
 type UserRoleMappings struct {

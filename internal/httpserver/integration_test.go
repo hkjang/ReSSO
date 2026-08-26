@@ -4933,3 +4933,139 @@ func signInForBoundaryProbe(t *testing.T, server *httptest.Server, username, pas
 	}
 	return response.Cookies(), decoded.CSRF
 }
+
+// Deleting a Role removes the row, and the audit event named it by the id of
+// the row that is now gone and recorded nothing else. So the trail could not
+// answer the one question it is kept for - which Role was deleted - and said
+// nothing about the people who lost it, though the delete cascades their
+// assignments away. Every other deletion here already records what it removed:
+// LDAP_FEDERATION_DELETE carries the provider's name and how many accounts it
+// unlinked, and revoking an API key leaves the row behind so its id still
+// resolves.
+func TestIntegrationDeletingARoleSaysWhichOneAndWhoHeldIt(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, err := data.CreateRole(ctx, bootstrap.RealmID, "auditor", "Reads the trail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"holder-one", "holder-two"} {
+		holder, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+			Username: name, Password: "holder-password-1234", Enabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := data.Pool.Exec(ctx,
+			"INSERT INTO user_roles(user_id,role_id) VALUES($1,$2)", holder.ID, role.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+
+	request, err := http.NewRequest(http.MethodDelete,
+		fmt.Sprintf("%s/api/admin/v1/realms/%s/roles/%s", server.URL, bootstrap.RealmID, role.ID), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-CSRF-Token", csrf)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("deleting the Role answered %d %s", response.StatusCode, body)
+	}
+
+	page, err := data.ListAudit(ctx, store.AuditFilter{
+		RealmID: &bootstrap.RealmID, EventType: "ROLE_DELETE", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("ROLE_DELETE events = %d, want 1", len(page.Items))
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(page.Items[0].Detail, &detail); err != nil {
+		t.Fatalf("the event carries no readable detail: %s", page.Items[0].Detail)
+	}
+	if detail["name"] != "auditor" {
+		t.Errorf("the event does not name the Role it removed: %v — the id it carries points at a "+
+			"row that no longer exists, so nothing can recover it", detail)
+	}
+	// json numbers decode as float64.
+	if held, ok := detail["users_unassigned"].(float64); !ok || int(held) != 2 {
+		t.Errorf("the event does not say how many people lost the Role: %v", detail)
+	}
+
+	// A Client Role is deleted the same way and was recorded the same way, so
+	// fixing only the Realm Role would have left the pair disagreeing.
+	client, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+		ClientID: "reporting", Name: "Reporting", Type: "confidential",
+		GrantTypes: []string{"client_credentials"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientRole, err := data.CreateClientRole(ctx, bootstrap.RealmID, client.Client.ID, "reader", "Reads reports")
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "client-role-holder", Password: "holder-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		"INSERT INTO user_client_roles(user_id,client_role_id) VALUES($1,$2)", holder.ID, clientRole.ID); err != nil {
+		t.Fatal(err)
+	}
+	clientRequest, err := http.NewRequest(http.MethodDelete,
+		fmt.Sprintf("%s/api/admin/v1/realms/%s/clients/%s/roles/%s",
+			server.URL, bootstrap.RealmID, client.Client.ID, clientRole.ID), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientRequest.Header.Set("X-CSRF-Token", csrf)
+	for _, cookie := range cookies {
+		clientRequest.AddCookie(cookie)
+	}
+	clientResponse, err := server.Client().Do(clientRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientBody, _ := io.ReadAll(clientResponse.Body)
+	_ = clientResponse.Body.Close()
+	if clientResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("deleting the Client Role answered %d %s", clientResponse.StatusCode, clientBody)
+	}
+	clientPage, err := data.ListAudit(ctx, store.AuditFilter{
+		RealmID: &bootstrap.RealmID, EventType: "CLIENT_ROLE_DELETE", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clientPage.Items) != 1 {
+		t.Fatalf("CLIENT_ROLE_DELETE events = %d, want 1", len(clientPage.Items))
+	}
+	var clientDetail map[string]any
+	if err := json.Unmarshal(clientPage.Items[0].Detail, &clientDetail); err != nil {
+		t.Fatalf("the event carries no readable detail: %s", clientPage.Items[0].Detail)
+	}
+	if clientDetail["name"] != "reader" {
+		t.Errorf("the event does not name the Client Role it removed: %v", clientDetail)
+	}
+	if held, ok := clientDetail["users_unassigned"].(float64); !ok || int(held) != 1 {
+		t.Errorf("the event does not say how many people lost the Client Role: %v", clientDetail)
+	}
+}
