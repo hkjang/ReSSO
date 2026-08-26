@@ -17,6 +17,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -6209,91 +6210,6 @@ func TestIntegrationEachApprovalRefusalSaysWhatItIs(t *testing.T) {
 	}
 }
 
-// No refusal may describe the database to whoever asked. writeStoreError
-// exists to see to that, and its comment says so, but a handler that answers
-// with err.Error() instead of going through it puts back exactly what it keeps
-// out: creating a personal API key with a name a few characters too long came
-// back as "value too long for type character varying(120) (SQLSTATE 22001)",
-// which names the column, its width and the engine to anybody with an account.
-//
-// Every path that takes a name is asked for one too long, so the check is
-// about the class rather than the one that leaked - and a refusal that says
-// nothing at all would be no better, so each has to come back with a sentence.
-func TestIntegrationNoRefusalDescribesTheDatabase(t *testing.T) {
-	data := openHTTPIntegrationStore(t)
-	ctx := context.Background()
-	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
-	if err != nil {
-		t.Fatal(err)
-	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
-	t.Cleanup(server.Close)
-	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
-
-	realm := bootstrap.RealmID.String()
-	long := strings.Repeat("n", 300)
-	for _, probe := range []struct{ what, path, body string }{
-		{"a personal API key", "/api/v1/me/api-keys",
-			fmt.Sprintf(`{"name":%q,"scopes":["api:read"],"expires_days":30}`, long)},
-		{"an account", fmt.Sprintf("/api/admin/v1/realms/%s/users", realm),
-			fmt.Sprintf(`{"username":%q,"password":"a-long-password-1234","enabled":true}`, long)},
-		{"a Role", fmt.Sprintf("/api/admin/v1/realms/%s/roles", realm),
-			fmt.Sprintf(`{"name":%q,"description":""}`, long)},
-		{"a Client", fmt.Sprintf("/api/admin/v1/realms/%s/clients", realm),
-			fmt.Sprintf(`{"client_id":%q,"name":"Probe","type":"public","redirect_uris":["https://a.test/cb"],`+
-				`"grant_types":["authorization_code"],"default_scopes":["openid"]}`, long)},
-		// The provider's name is capped in Go, so a long one never reaches the
-		// database and this probe only exercises the validator. users_dn is
-		// not: a DN that is well formed and simply long passes every check
-		// this service makes and is refused by the column, which is where the
-		// column's width and the engine used to come back from.
-		{"a directory provider whose users DN is too long",
-			fmt.Sprintf("/api/admin/v1/realms/%s/user-federations", realm),
-			fmt.Sprintf(`{"name":"probe","vendor":"OTHER","connection_url":"ldap://x","users_dn":%q,`+
-				`"username_ldap_attribute":"uid","rdn_ldap_attribute":"uid","uuid_ldap_attribute":"entryUUID",`+
-				`"user_object_classes":["inetOrgPerson"],"search_scope":"SUBTREE","batch_size":100,`+
-				`"edit_mode":"READ_ONLY","missing_user_action":"KEEP","import_enabled":true,"enabled":true}`,
-				strings.Repeat("ou=x,", 300)+"dc=test")},
-		{"a directory provider", fmt.Sprintf("/api/admin/v1/realms/%s/user-federations", realm),
-			fmt.Sprintf(`{"name":%q,"vendor":"OTHER","connection_url":"ldap://x","users_dn":"ou=p",`+
-				`"username_ldap_attribute":"uid","rdn_ldap_attribute":"uid","uuid_ldap_attribute":"entryUUID",`+
-				`"user_object_classes":["inetOrgPerson"],"search_scope":"SUBTREE","batch_size":100,`+
-				`"edit_mode":"READ_ONLY","missing_user_action":"KEEP","import_enabled":true,"enabled":true}`, long)},
-	} {
-		request, err := http.NewRequest(http.MethodPost, server.URL+probe.path, strings.NewReader(probe.body))
-		if err != nil {
-			t.Fatal(err)
-		}
-		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("X-CSRF-Token", csrf)
-		for _, cookie := range cookies {
-			request.AddCookie(cookie)
-		}
-		response, err := server.Client().Do(request)
-		if err != nil {
-			t.Fatal(err)
-		}
-		answer, _ := io.ReadAll(response.Body)
-		_ = response.Body.Close()
-		if response.StatusCode == http.StatusCreated {
-			t.Errorf("creating %s with a name of %d characters was accepted", probe.what, len(long))
-			continue
-		}
-		for _, database := range []string{"SQLSTATE", "character varying", "pq:", "ERROR:"} {
-			if strings.Contains(string(answer), database) {
-				t.Errorf("refusing %s described the database to the caller: %s", probe.what, answer)
-			}
-		}
-		var refusal struct {
-			Message string `json:"message"`
-		}
-		if json.Unmarshal(answer, &refusal) != nil || strings.TrimSpace(refusal.Message) == "" {
-			t.Errorf("refusing %s said nothing a person could act on: %s", probe.what, answer)
-		}
-	}
-}
-
 // A Client can only act on what is its own. Two places decide that, and both
 // answer the same way whether it is or not, so a mistake in either is quiet:
 // revocation answers 200 for a token it did not revoke because RFC 7009 says
@@ -6909,4 +6825,182 @@ func TestIntegrationSavingADirectoryProviderRefusesWithoutTheDatabase(t *testing
 			t.Errorf("refusing the save described the database to the caller: %s", body)
 		}
 	}
+}
+
+// A refusal must never hand back the database's own words, and this is the
+// probe that decides whether that is actually checked. Its two halves have
+// both been wrong here before.
+//
+// The value has to be well formed for its field. A previous version of this
+// guard sent 300 characters of "n" at a directory provider's name; the name is
+// capped in Go, so it never reached a column and the probe only exercised the
+// validator, while users_dn - well formed and simply long - went straight
+// through and came back carrying the column's width and the engine. Sending
+// "x" at every field reproduces that mistake everywhere at once: a DN, a URL
+// and a filter are all refused for their shape before their length counts.
+//
+// And the baseline has to be accepted. Omitting bind_credential made all
+// eighteen directory fields answer 400 for a missing credential, so the sweep
+// reported nothing wrong while reaching nothing at all.
+//
+// So the request is created once unchanged and must succeed, each probe
+// differs from it in exactly one field, and the run has to show that every
+// endpoint reached a column - otherwise this is checking the validators again.
+func TestIntegrationNoRefusalDescribesTheDatabase(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+	realm := bootstrap.RealmID.String()
+
+	post := func(path string, body map[string]any) (int, string) {
+		raw, _ := json.Marshal(body)
+		request, reqErr := http.NewRequest(http.MethodPost, server.URL+path, strings.NewReader(string(raw)))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		answer, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode, string(answer)
+	}
+
+	// A value has to be well formed for its field or the validator refuses it
+	// before the column ever sees it - which is how a probe ends up proving
+	// nothing. Each of these is valid for its field and simply too long.
+	longFor := func(field, original string) string {
+		switch field {
+		case "users_dn", "bind_dn":
+			return strings.Repeat("ou=x,", 300) + "dc=test"
+		case "connection_url":
+			return "ldap://" + strings.Repeat("a", 1100) + ".test:389"
+		case "user_ldap_filter":
+			return "(&" + strings.Repeat("(uid=x)", 400) + ")"
+		case "email":
+			return strings.Repeat("a", 300) + "@example.test"
+		case "redirect_uris":
+			return "https://a.test/" + strings.Repeat("p", 2100)
+		default:
+			if original == "" {
+				return strings.Repeat("x", 3000)
+			}
+			return strings.Repeat("x", 3000)
+		}
+	}
+	endpoints := []struct {
+		what string
+		path string
+		body map[string]any
+	}{
+		{"account", "/api/admin/v1/realms/" + realm + "/users", map[string]any{
+			"username": "probe-user", "password": "a-long-password-1234", "enabled": true,
+			"email": "probe@example.test", "display_name": "Probe"}},
+		{"Role", "/api/admin/v1/realms/" + realm + "/roles", map[string]any{
+			"name": "probe-role", "description": "probe"}},
+		{"Client", "/api/admin/v1/realms/" + realm + "/clients", map[string]any{
+			"client_id": "probe-client", "name": "Probe", "type": "public",
+			"redirect_uris": []string{"https://a.test/cb"}, "grant_types": []string{"authorization_code"},
+			"default_scopes": []string{"openid"}}},
+		{"directory provider", "/api/admin/v1/realms/" + realm + "/user-federations", map[string]any{
+			"name": "probe-fed", "vendor": "OTHER", "connection_url": "ldap://directory.invalid:389",
+			"bind_dn": "cn=admin,dc=example,dc=test", "bind_credential": "bind-secret-value",
+			"users_dn":                "ou=people,dc=example,dc=test",
+			"username_ldap_attribute": "uid", "rdn_ldap_attribute": "uid", "uuid_ldap_attribute": "entryUUID",
+			"user_object_classes": []string{"inetOrgPerson"}, "search_scope": "SUBTREE",
+			"batch_size": 500, "edit_mode": "READ_ONLY", "missing_user_action": "KEEP",
+			"import_enabled": true, "enabled": true, "user_ldap_filter": "", "ca_certificate": "",
+			"email_ldap_attribute": "mail", "first_name_ldap_attribute": "givenName",
+			"last_name_ldap_attribute": "sn", "display_name_ldap_attribute": "displayName",
+			"member_of_ldap_attribute": "memberOf"}},
+		{"personal API key", "/api/v1/me/api-keys", map[string]any{
+			"name": "probe-key", "scopes": []string{"api:read"}, "expires_days": 30}},
+	}
+
+	leaks := 0
+	unique := 0
+	for _, endpoint := range endpoints {
+		// A baseline that is refused makes every probe below look refused for
+		// the wrong reason. This has caught the sweep twice already.
+		control := map[string]any{}
+		for key, value := range endpoint.body {
+			control[key] = value
+		}
+		if status, answer := post(endpoint.path, control); status != http.StatusCreated {
+			t.Fatalf("the %s baseline was refused, so nothing below proves anything: %d %s",
+				endpoint.what, status, answer)
+		}
+		fields := make([]string, 0, len(endpoint.body))
+		for key, value := range endpoint.body {
+			if _, ok := value.(string); ok {
+				fields = append(fields, key)
+			}
+		}
+		sort.Strings(fields)
+		reachedColumn := 0
+		for _, field := range fields {
+			probe := map[string]any{}
+			for key, value := range endpoint.body {
+				probe[key] = value
+			}
+			unique++
+			// The identity field has to differ from the baseline just created,
+			// or the probe is refused as a duplicate before its length counts.
+			for _, identity := range []string{"username", "name", "client_id"} {
+				if _, ok := probe[identity]; ok && identity != field {
+					probe[identity] = fmt.Sprintf("probe-%d", unique)
+				}
+			}
+			probe[field] = longFor(field, endpoint.body[field].(string))
+			status, answer := post(endpoint.path, probe)
+			if status == http.StatusCreated {
+				// A password is hashed, a bind credential is sealed and a CA
+				// certificate is stored as text: none of them reaches a
+				// bounded column, so length is not theirs to refuse.
+				switch field {
+				case "password", "bind_credential", "ca_certificate":
+				default:
+					t.Errorf("%s was accepted with an over-long %s", endpoint.what, field)
+				}
+				continue
+			}
+			if strings.Contains(answer, "허용된 길이를 넘습니다") {
+				reachedColumn++
+			}
+			for _, marker := range []string{"SQLSTATE", "character varying", "ERROR:", "pq:"} {
+				if strings.Contains(answer, marker) {
+					leaks++
+					t.Errorf("refusing %s over its %s described the database to the caller: %s",
+						endpoint.what, field, answer)
+					break
+				}
+			}
+			var refusal struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal([]byte(answer), &refusal) != nil || strings.TrimSpace(refusal.Message) == "" {
+				t.Errorf("refusing %s over its %s said nothing a person could act on: %s",
+					endpoint.what, field, answer)
+			}
+		}
+		if reachedColumn == 0 {
+			t.Errorf("no over-long %s field was refused by a column, so this checked the "+
+				"validators and not the mapping that keeps database text out of responses",
+				endpoint.what)
+		}
+	}
+	_ = leaks
 }
