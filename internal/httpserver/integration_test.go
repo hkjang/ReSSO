@@ -5279,6 +5279,36 @@ func TestIntegrationDisablingAnAccountThatCouldNotBeSignedOutSaysSo(t *testing.T
 		t.Errorf("the event does not say the sessions are still live: %v", detail)
 	}
 
+	// The body that came back is a shape a caller has to be told about, so the
+	// document has to carry it. Checked against the answer rather than against
+	// a name written here: a schema that describes a field the response does
+	// not have, or a response with a field the schema never mentions, is the
+	// drift worth catching.
+	spec, err := server.Client().Get(server.URL + "/api/openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, _ := io.ReadAll(spec.Body)
+	_ = spec.Body.Close()
+	var answered map[string]any
+	if err := json.Unmarshal(answer, &answered); err != nil {
+		t.Fatalf("the partial answer is not an object: %s", answer)
+	}
+	documented := documentedFieldsFor(t, document, "/api/admin/v1/realms/{realmID}/users/{userID}", "put")
+	if len(documented) == 0 {
+		t.Fatal("the document describes no 200 body for this operation, so nothing below is compared")
+	}
+	for _, field := range []string{"sessions_ended", "message"} {
+		if _, carried := answered[field]; !carried {
+			t.Errorf("the answer does not carry %s: %s", field, answer)
+			continue
+		}
+		if !documented[field] {
+			t.Errorf("the answer carries %s and this operation's 200 body does not describe it, so a "+
+				"caller reading the contract cannot know this shape exists", field)
+		}
+	}
+
 	// And the retry has to actually retry. The account is already disabled by
 	// now, which is exactly the state that used to make the sweep be skipped.
 	if _, err := data.Pool.Exec(ctx, "DROP TRIGGER refuse_session_revoke ON sso_sessions"); err != nil {
@@ -5296,4 +5326,61 @@ func TestIntegrationDisablingAnAccountThatCouldNotBeSignedOutSaysSo(t *testing.T
 		t.Errorf("%d session(s) of a disabled account are still live after a retry: the second attempt "+
 			"found the account already off and swept nothing", live)
 	}
+}
+
+// documentedFieldsFor names the properties an operation's 200 body can carry,
+// following the $refs it is made of. Searching the whole document instead
+// would find these names in some other schema and pass while this operation
+// says nothing — which is what the first version of this check did.
+func documentedFieldsFor(t *testing.T, document []byte, path, method string) map[string]bool {
+	t.Helper()
+	var spec struct {
+		Paths      map[string]map[string]any `json:"paths"`
+		Components struct {
+			Schemas map[string]any `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(document, &spec); err != nil {
+		t.Fatalf("the OpenAPI document does not decode: %v", err)
+	}
+	operation, ok := spec.Paths[path][method].(map[string]any)
+	if !ok {
+		t.Fatalf("the document has no %s for %s", method, path)
+	}
+	responses, _ := operation["responses"].(map[string]any)
+	ok200, _ := responses["200"].(map[string]any)
+	content, _ := ok200["content"].(map[string]any)
+	body, _ := content["application/json"].(map[string]any)
+	schema, _ := body["schema"].(map[string]any)
+
+	fields := map[string]bool{}
+	var walk func(node map[string]any, depth int)
+	walk = func(node map[string]any, depth int) {
+		if node == nil || depth > 4 {
+			return
+		}
+		if ref, isRef := node["$ref"].(string); isRef {
+			name := ref[strings.LastIndex(ref, "/")+1:]
+			if resolved, found := spec.Components.Schemas[name].(map[string]any); found {
+				walk(resolved, depth+1)
+			}
+			return
+		}
+		if properties, has := node["properties"].(map[string]any); has {
+			for name := range properties {
+				fields[name] = true
+			}
+		}
+		for _, key := range []string{"oneOf", "anyOf", "allOf"} {
+			if list, has := node[key].([]any); has {
+				for _, item := range list {
+					if child, isObject := item.(map[string]any); isObject {
+						walk(child, depth+1)
+					}
+				}
+			}
+		}
+	}
+	walk(schema, 0)
+	return fields
 }

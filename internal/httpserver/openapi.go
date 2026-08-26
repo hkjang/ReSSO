@@ -11,8 +11,8 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 		"UpdateProfileInput", "User", "200", "Updated user")
 	createUser := openAPIJSONOperation("Administration", "사용자 생성", true,
 		"CreateUserInput", "User", "201", "Created user")
-	updateUser := openAPIJSONOperation("Administration", "사용자 변경", true,
-		"UpdateUserInput", "User", "200", "Updated user")
+	updateUser := withUnendedSessions(openAPIJSONOperation("Administration", "사용자 변경", true,
+		"UpdateUserInput", "User", "200", "Updated user"))
 	resetPassword := withPartialSessionRevocation(openAPIJSONOperation("Administration",
 		"사용자 비밀번호 재설정", true, "ResetPasswordInput", "", "204",
 		"Password reset and the account's sessions ended"))
@@ -306,6 +306,17 @@ func openAPIUserSchemas() map[string]any {
 				"message":          map[string]any{"type": "string"},
 			},
 		},
+		"PartialAccountDisable": map[string]any{
+			"type": "object",
+			"description": "계정은 비활성화됐지만 열려 있는 세션을 모두 종료하지 못한 경우의 응답. " +
+				"계정의 모든 필드를 그대로 담고 아래 두 항목이 더해집니다. 감사 이벤트는 PARTIAL로 기록되고 " +
+				"detail.users_signed_out이 false입니다. 같은 요청을 다시 보내면 종료를 다시 시도합니다.",
+			"required": []string{"sessions_ended", "message"},
+			"properties": map[string]any{
+				"sessions_ended": map[string]any{"type": "boolean", "enum": []any{false}},
+				"message":        map[string]any{"type": "string"},
+			},
+		},
 		"PartialProviderDeletion": map[string]any{
 			"type":        "object",
 			"description": "공급자는 삭제됐지만 연결된 계정을 모든 애플리케이션에서 로그아웃시키지 못한 경우의 응답. 감사 이벤트는 PARTIAL로 기록됩니다.",
@@ -349,6 +360,25 @@ func openAPIUserSchemas() map[string]any {
 // runs after the change has landed, so it can fall short on its own — the
 // change is done, and a client that assumes one shape never learns the accounts
 // are still signed in elsewhere.
+// withUnendedSessions declares the second shape the user update can answer
+// with. Disabling an account writes the row first and ends its sessions after,
+// so the account is off either way and only the sweep can fall short — the
+// same split the provider endpoints already describe.
+func withUnendedSessions(operation map[string]any) map[string]any {
+	responses, _ := operation["responses"].(map[string]any)
+	responses["200"] = map[string]any{
+		"description": "The account was updated; if it was disabled and its sessions could not all be ended, " +
+			"the body carries sessions_ended and message beside every field of the account",
+		"content": map[string]any{"application/json": map[string]any{
+			"schema": map[string]any{"oneOf": []any{
+				map[string]any{"$ref": "#/components/schemas/User"},
+				map[string]any{"$ref": "#/components/schemas/PartialAccountDisable"},
+			}},
+		}},
+	}
+	return operation
+}
+
 func withUnfinishedSignOut(operation map[string]any, schema string) map[string]any {
 	responses, _ := operation["responses"].(map[string]any)
 	responses["200"] = map[string]any{
