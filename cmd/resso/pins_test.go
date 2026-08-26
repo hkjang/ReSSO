@@ -82,3 +82,54 @@ func TestImageVersionDefaultCannotPassForARelease(t *testing.T) {
 		}
 	}
 }
+
+// The toolchains are pinned in more than one place: go.mod names the Go
+// version, ci.yaml and the release workflow resolve it from there, and the
+// Dockerfile names its own base image. Node is pinned in the Dockerfile and in
+// both workflows.
+//
+// They agree today. Nothing keeps them agreeing, and the drift is quiet in the
+// direction that matters: raise go.mod's toolchain for a fix in the standard
+// library and forget the Dockerfile, and everything is tested on the new Go
+// while the binary that ships is still built on the old one. The image is the
+// artifact; the tests are not.
+func TestToolchainPinsAgreeAcrossTheBuild(t *testing.T) {
+	root := filepath.Join("..", "..")
+	read := func(name string) string {
+		t.Helper()
+		content, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(content)
+	}
+	dockerfile := read("Dockerfile")
+
+	image := regexp.MustCompile(`FROM golang:(\d+\.\d+\.\d+)`).FindStringSubmatch(dockerfile)
+	if image == nil {
+		t.Fatal("the Dockerfile no longer builds on a pinned golang image")
+	}
+	toolchain := regexp.MustCompile(`(?m)^toolchain go(\d+\.\d+\.\d+)`).FindStringSubmatch(read("go.mod"))
+	if toolchain == nil {
+		t.Fatal("go.mod no longer names a toolchain, so the image has nothing to agree with")
+	}
+	if image[1] != toolchain[1] {
+		t.Errorf("the image builds on Go %s and go.mod names %s: everything is tested on one and "+
+			"the binary that ships is built on the other", image[1], toolchain[1])
+	}
+
+	node := regexp.MustCompile(`FROM node:(\d+\.\d+\.\d+)`).FindStringSubmatch(dockerfile)
+	if node == nil {
+		t.Fatal("the Dockerfile no longer builds the console on a pinned node image")
+	}
+	for _, workflow := range []string{"ci.yaml", "release.yaml"} {
+		path := filepath.Join(".github", "workflows", workflow)
+		for _, match := range regexp.MustCompile(`node-version:\s*(\d+\.\d+\.\d+)`).
+			FindAllStringSubmatch(read(path), -1) {
+			if match[1] != node[1] {
+				t.Errorf("%s builds the console on Node %s and the image uses %s",
+					workflow, match[1], node[1])
+			}
+		}
+	}
+}
