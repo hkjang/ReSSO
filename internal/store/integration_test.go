@@ -6534,3 +6534,90 @@ func TestAnEmailRefusalSaysWhatIsWrongWithIt(t *testing.T) {
 		}
 	}
 }
+
+// A directory entry is matched to an account by the link written when it was
+// imported, and failing that by username. So a directory that carries a name
+// an account here already has reaches a row that was never its to touch, and
+// the only thing between them is one comparison.
+//
+// What that comparison holds back, measured by removing it: an account an
+// administrator had disabled comes back enabled, its email is emptied and its
+// display name overwritten from the directory - and the run reports failed=0,
+// counting it as an ordinary update. Whoever can add an entry to the directory
+// can undo a local account being switched off, and nothing in the summary
+// says it happened.
+func TestIntegrationADirectoryEntryCannotReachALocalAccount(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run this")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A local account whose name the directory also carries.
+	local, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "alice", Password: "local-password-1234", Enabled: true,
+		DisplayName: "Local Alice", Email: "local-alice@example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, "UPDATE users SET enabled=false WHERE id=$1", local.ID); err != nil {
+		t.Fatal(err)
+	}
+	credential := "adminpassword"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: directory,
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid",
+		RDNLDAPAttribute: "uid", UUIDLDAPAttribute: "entryUUID",
+		UserObjectClasses: []string{"inetOrgPerson"}, BatchSize: 500,
+		ImportEnabled: true, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	summary, syncErr := data.SyncLDAPFederation(ctx, provider.ID)
+	// The other directory account has to arrive, or an untouched local one
+	// proves only that the run did nothing.
+	if summary.Added == 0 {
+		t.Fatalf("the run imported nobody, so the account below was not spared by anything: %+v %v",
+			summary, syncErr)
+	}
+	if summary.Failed != 1 || syncErr == nil || !strings.Contains(syncErr.Error(), "alice") {
+		t.Errorf("the run did not report the account it could not take: failed=%d err=%v",
+			summary.Failed, syncErr)
+	}
+
+	var federationID *string
+	var enabled bool
+	var username, email, display, hash string
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT federation_id::text,enabled,username,email,display_name,password_hash FROM users WHERE id=$1`,
+		local.ID).Scan(&federationID, &enabled, &username, &email, &display, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if federationID != nil {
+		t.Errorf("the directory took ownership of a local account: federation_id=%v", *federationID)
+	}
+	if enabled {
+		t.Error("an account an administrator had disabled came back enabled after a directory run")
+	}
+	if email != "local-alice@example.test" || display != "Local Alice" {
+		t.Errorf("the directory overwrote a local account's details: email=%q display=%q", email, display)
+	}
+	if hash == data.dummyPasswordHash {
+		t.Error("the local account's password was replaced with the federated placeholder")
+	}
+
+	var owned int
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM users WHERE federation_id=$1", provider.ID).Scan(&owned); err != nil {
+		t.Fatal(err)
+	}
+	if owned != 1 {
+		t.Errorf("the provider owns %d accounts, want only the one it could import", owned)
+	}
+}
