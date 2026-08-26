@@ -6106,6 +6106,23 @@ func TestIntegrationHotPathsDoNotReadWholeTables(t *testing.T) {
 	if _, err := data.Pool.Exec(ctx, "ANALYZE federation_role_assignments"); err != nil {
 		t.Fatal(err)
 	}
+	// The dashboard counts locked accounts against the whole Realm, so the
+	// Realm has to be large enough that reading all of it is the expensive
+	// answer — with a few hundred rows the planner walks the username index
+	// and the count is cheap either way, which would let this pass with
+	// nothing indexing the lock at all.
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO users(id,realm_id,username,password_hash)
+        SELECT gen_random_uuid(),$1,'bulk-'||g,'x' FROM generate_series(1,20000) g`, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE users SET locked_until=now()+interval '1 hour' WHERE realm_id=$1 AND username='bulk-1'`,
+		realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, "ANALYZE users"); err != nil {
+		t.Fatal(err)
+	}
 	for _, probe := range []struct {
 		name, query string
 		argument    any
@@ -6124,6 +6141,9 @@ func TestIntegrationHotPathsDoNotReadWholeTables(t *testing.T) {
 		{"asking whether a Role came from the directory",
 			`SELECT EXISTS(SELECT 1 FROM federation_role_assignments fra
              WHERE fra.user_id=$1 AND fra.role_id='00000000-0000-0000-0000-0000000000ee'::uuid)`, sweptUser},
+		// Counted on every dashboard load, and almost no account is locked.
+		{"counting the locked accounts for the dashboard",
+			`SELECT count(*) FROM users WHERE locked_until>now() AND ($1::uuid IS NULL OR realm_id=$1)`, realm.ID},
 	} {
 		rows, err := data.Pool.Query(ctx, "EXPLAIN "+probe.query, probe.argument)
 		if err != nil {
@@ -6142,7 +6162,7 @@ func TestIntegrationHotPathsDoNotReadWholeTables(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
-		for _, table := range []string{"refresh_tokens", "sso_sessions", "federation_role_assignments"} {
+		for _, table := range []string{"refresh_tokens", "sso_sessions", "federation_role_assignments", "users"} {
 			if strings.Contains(plan, "Seq Scan on "+table) {
 				t.Errorf("%s reads every row of %s in the deployment:\n%s", probe.name, table, plan)
 			}
