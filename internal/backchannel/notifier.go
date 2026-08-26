@@ -183,7 +183,7 @@ func (n *Notifier) deliver(revoked store.RevokedSession) {
 		go func() {
 			defer group.Done()
 			defer func() { <-gate }()
-			n.post(ctx, realm.Name, client.ClientID, client.BackchannelLogoutURI, token)
+			n.post(ctx, revoked, realm.Name, client.ClientID, client.BackchannelLogoutURI, token)
 		}()
 	}
 	group.Wait()
@@ -200,7 +200,7 @@ var retryBackoff = []time.Duration{2 * time.Second, 8 * time.Second}
 // drive the same knob the retry policy is sized from.
 var attemptTimeout = 10 * time.Second
 
-func (n *Notifier) post(ctx context.Context, realmName, clientID, endpoint, token string) {
+func (n *Notifier) post(ctx context.Context, revoked store.RevokedSession, realmName, clientID, endpoint, token string) {
 	for attempt := 0; ; attempt++ {
 		outcome, retryable := n.attempt(ctx, realmName, clientID, endpoint, token)
 		if !retryable || attempt >= len(retryBackoff) {
@@ -208,6 +208,7 @@ func (n *Notifier) post(ctx context.Context, realmName, clientID, endpoint, toke
 			if outcome != "delivered" {
 				n.logger.Warn("back-channel logout was not delivered",
 					"realm", realmName, "client", clientID, "outcome", outcome, "attempts", attempt+1)
+				n.recordNotDelivered(revoked, realmName, clientID, outcome, attempt+1)
 			}
 			return
 		}
@@ -217,15 +218,55 @@ func (n *Notifier) post(ctx context.Context, realmName, clientID, endpoint, toke
 		case <-ctx.Done():
 			timer.Stop()
 			n.record(outcome)
+			n.recordNotDelivered(revoked, realmName, clientID, outcome, attempt+1)
 			return
 		case <-n.base.Done():
 			// Shutting down: the attempt in hand was allowed to finish, but
 			// waiting out a backoff would outlast the process.
 			timer.Stop()
 			n.record(outcome)
+			n.recordNotDelivered(revoked, realmName, clientID, outcome, attempt+1)
 			return
 		}
 		timer.Stop()
+	}
+}
+
+// recordNotDelivered puts a delivery that never landed in the audit trail.
+//
+// The console reports the session ended the moment the row is revoked, and
+// this runs afterwards, so its failure is visible nowhere the operator is
+// looking. What is left open is a session at a relying party that the user
+// believes they closed — and "was that session actually ended everywhere" is
+// asked long after a log line has rotated away. Audit events are kept for the
+// retention period, which is the same reason the federation sync records its
+// outcome there rather than only in the log.
+//
+// Only failures are written. A delivery that worked is the ordinary case and
+// recording every one would bury the ones worth reading.
+func (n *Notifier) recordNotDelivered(revoked store.RevokedSession, realmName, clientID, outcome string, attempts int) {
+	if n.store == nil {
+		return
+	}
+	// The delivery's own budget is spent by now, and at shutdown the base
+	// context is going away: this write has to outlive both or the record it
+	// exists to leave would be the thing that goes missing.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(n.base), attemptTimeout)
+	defer cancel()
+	realmID := revoked.RealmID
+	// The actor is this service, not the person whose session ended - they
+	// asked for the logout and it is the delivery that fell short. Naming them
+	// as the actor would also tie the record to a users row, and an event kept
+	// to answer a question years later should not depend on one.
+	if err := n.store.WriteAudit(ctx, store.AuditEvent{
+		RealmID: &realmID, ActorName: "system",
+		EventType: "BACKCHANNEL_LOGOUT", Result: "FAILURE",
+		TargetType: "client", TargetID: clientID,
+		Detail: map[string]any{"session_id": revoked.SessionID.String(),
+			"user_id": revoked.UserID.String(), "outcome": outcome, "attempts": attempts},
+	}); err != nil {
+		n.logger.Error("back-channel logout failure could not be recorded",
+			"realm", realmName, "client", clientID, "error", err)
 	}
 }
 

@@ -51,7 +51,7 @@ func TestPostDeliversFormEncodedLogoutToken(t *testing.T) {
 	defer server.Close()
 
 	notifier := New(context.Background(), nil, nil, slog.New(slog.DiscardHandler), nil)
-	notifier.post(context.Background(), "master", "rp", server.URL, "signed.logout.token")
+	notifier.post(context.Background(), store.RevokedSession{RealmID: uuid.New(), SessionID: uuid.New(), UserID: uuid.New()}, "master", "rp", server.URL, "signed.logout.token")
 
 	select {
 	case got := <-results:
@@ -80,7 +80,7 @@ func TestPostDoesNotFollowRedirects(t *testing.T) {
 	defer redirector.Close()
 
 	notifier := New(context.Background(), nil, nil, slog.New(slog.DiscardHandler), nil)
-	notifier.post(context.Background(), "master", "rp", redirector.URL, "signed.logout.token")
+	notifier.post(context.Background(), store.RevokedSession{RealmID: uuid.New(), SessionID: uuid.New(), UserID: uuid.New()}, "master", "rp", redirector.URL, "signed.logout.token")
 
 	close(reached)
 	var visited []string
@@ -119,7 +119,7 @@ func TestPostRetriesWhenTheRelyingPartyIsMomentarilyDown(t *testing.T) {
 	defer server.Close()
 
 	notifier := New(context.Background(), nil, nil, slog.New(slog.DiscardHandler), nil)
-	notifier.post(context.Background(), "master", "rp", server.URL, "signed.logout.token")
+	notifier.post(context.Background(), store.RevokedSession{RealmID: uuid.New(), SessionID: uuid.New(), UserID: uuid.New()}, "master", "rp", server.URL, "signed.logout.token")
 	if got := attempts.Load(); got != 3 {
 		t.Fatalf("delivery was attempted %d times, want 3", got)
 	}
@@ -136,7 +136,7 @@ func TestPostDoesNotRetryARefusal(t *testing.T) {
 	defer server.Close()
 
 	notifier := New(context.Background(), nil, nil, slog.New(slog.DiscardHandler), nil)
-	notifier.post(context.Background(), "master", "rp", server.URL, "signed.logout.token")
+	notifier.post(context.Background(), store.RevokedSession{RealmID: uuid.New(), SessionID: uuid.New(), UserID: uuid.New()}, "master", "rp", server.URL, "signed.logout.token")
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("a refusal was retried %d times", got)
 	}
@@ -156,7 +156,10 @@ func TestPostStopsRetryingWhenTheContextEnds(t *testing.T) {
 	cancel()
 	// Shutdown must not be held up by a relying party that keeps failing.
 	done := make(chan struct{})
-	go func() { defer close(done); notifier.post(ctx, "master", "rp", server.URL, "signed.logout.token") }()
+	go func() {
+		defer close(done)
+		notifier.post(ctx, store.RevokedSession{RealmID: uuid.New(), SessionID: uuid.New(), UserID: uuid.New()}, "master", "rp", server.URL, "signed.logout.token")
+	}()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -184,7 +187,7 @@ func TestDeliveryInFlightSurvivesShutdown(t *testing.T) {
 
 	ctx, done := notifier.deliveryContext()
 	defer done()
-	notifier.post(ctx, "master", "rp", server.URL, "logout-token")
+	notifier.post(ctx, store.RevokedSession{RealmID: uuid.New(), SessionID: uuid.New(), UserID: uuid.New()}, "master", "rp", server.URL, "logout-token")
 
 	if got := delivered.Load(); got != 1 {
 		t.Errorf("deliveries that reached the relying party = %d, want 1", got)
@@ -209,7 +212,7 @@ func TestShutdownStopsFurtherRetries(t *testing.T) {
 	ctx, done := notifier.deliveryContext()
 	defer done()
 	started := time.Now()
-	notifier.post(ctx, "master", "rp", server.URL, "logout-token")
+	notifier.post(ctx, store.RevokedSession{RealmID: uuid.New(), SessionID: uuid.New(), UserID: uuid.New()}, "master", "rp", server.URL, "logout-token")
 
 	if got := attempts.Load(); got != 1 {
 		t.Errorf("attempts during shutdown = %d, want 1", got)
@@ -249,7 +252,7 @@ func TestAStalledFirstAttemptStillGetsItsRetries(t *testing.T) {
 	notifier.client.Timeout = 0 // the per-attempt context is what has to bound this
 	ctx, cancel := notifier.deliveryContext()
 	defer cancel()
-	notifier.post(ctx, "master", "rp", server.URL, "signed.logout.token")
+	notifier.post(ctx, store.RevokedSession{RealmID: uuid.New(), SessionID: uuid.New(), UserID: uuid.New()}, "master", "rp", server.URL, "signed.logout.token")
 
 	if got := attempts.Load(); got != 2 {
 		t.Fatalf("delivery was attempted %d times, want 2: a stalled attempt must not consume the retries", got)
