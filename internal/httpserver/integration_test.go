@@ -5538,3 +5538,120 @@ func TestIntegrationANameCannotLookLikeSomethingItIsNot(t *testing.T) {
 			"a second account nobody could tell apart", status, http.StatusConflict)
 	}
 }
+
+// A token belongs to the realm that issued it. Nothing checked that at the
+// protocol endpoints: the admin API's boundary is covered route by route, but
+// what a relying party in one tenant can do with another tenant's access token
+// was not, and that is the boundary this product exists to draw.
+//
+// Both answers are taken from the same token, once in each realm, so the check
+// cannot pass by refusing everything: the realm that issued it has to accept
+// it in the same breath that the other one turns it down.
+func TestIntegrationATokenDoesNotWorkInAnotherRealm(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	mine, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := data.CreateRealm(ctx, store.CreateRealmInput{
+		Name: "tenant", DisplayName: "Tenant", IssuerURL: "http://localhost:8080/realms/tenant"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, realmID := range []uuid.UUID{mine.ID, theirs.ID} {
+		if err := data.EnsureActiveSigningKey(ctx, realmID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rp, err := data.CreateClient(ctx, mine.ID, store.CreateClientInput{
+		ClientID: "rp", Name: "RP", Type: "confidential", RedirectURIs: []string{"https://rp.test/cb"},
+		GrantTypes: []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceServers := map[string]store.CreatedClient{}
+	for _, owner := range []struct {
+		realm store.CreateClientInput
+		name  string
+		id    uuid.UUID
+	}{{name: "master", id: mine.ID}, {name: "tenant", id: theirs.ID}} {
+		created, err := data.CreateClient(ctx, owner.id, store.CreateClientInput{
+			ClientID: "rs-" + owner.name, Name: "RS", Type: "confidential",
+			GrantTypes: []string{"client_credentials"}, DefaultScopes: []string{"openid"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resourceServers[owner.name] = created
+	}
+	user, err := data.CreateUser(ctx, mine.ID, store.CreateUserInput{
+		Username: "mine", Password: "mine-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, mine.ID, user.ID, time.Hour, "127.0.0.1", "cross-realm-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, mine, rp.Client, user, session.Session.ID,
+		[]string{"openid"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	userInfoStatus := func(realm string) int {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodGet,
+			server.URL+"/realms/"+realm+"/protocol/openid-connect/userinfo", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+	introspectionSaysActive := func(realm string) bool {
+		t.Helper()
+		rs := resourceServers[realm]
+		response, err := server.Client().PostForm(
+			server.URL+"/realms/"+realm+"/protocol/openid-connect/token/introspect",
+			url.Values{"token": {tokens.AccessToken}, "client_id": {rs.Client.ClientID},
+				"client_secret": {rs.ClientSecret}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded map[string]any
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		_ = response.Body.Close()
+		active, _ := decoded["active"].(bool)
+		return active
+	}
+
+	if status := userInfoStatus("master"); status != http.StatusOK {
+		t.Fatalf("the realm that issued the token answered userinfo with %d, so the refusal below "+
+			"would prove nothing", status)
+	}
+	if !introspectionSaysActive("master") {
+		t.Fatal("the realm that issued the token calls it inactive, so the check below would prove nothing")
+	}
+	if status := userInfoStatus("tenant"); status != http.StatusUnauthorized {
+		t.Errorf("another tenant's userinfo answered %d for this token, want %d",
+			status, http.StatusUnauthorized)
+	}
+	if introspectionSaysActive("tenant") {
+		t.Error("another tenant's introspection calls this token active, which tells a resource server " +
+			"there that it may act on it")
+	}
+}
