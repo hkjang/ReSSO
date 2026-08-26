@@ -6282,3 +6282,51 @@ func TestIntegrationInstancesStartingTogetherAllBootstrap(t *testing.T) {
 		t.Errorf("%d instances reported creating the administrator, want exactly one", created)
 	}
 }
+
+// A name this service has never seen is hashed against a dummy so that the
+// answer takes as long as a wrong password does. Without it the quick answer
+// is the one that means "no such person", and anyone can sort a list of names
+// into the ones that exist.
+//
+// Measured here rather than through the HTTP layer: over a request the
+// difference is invisible, because the request costs about as much as the
+// hashing does. Underneath, removing the dummy takes the unknown name from
+// fifty milliseconds to half of one — a hundredfold, which is why the bar
+// below can be generous and still catch it.
+func TestIntegrationAnUnknownNameCostsAsMuchAsAWrongPassword(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateUser(ctx, bootstrap.RealmID, CreateUserInput{
+		Username: "present", Password: "present-password-1234", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The median of several, so one scheduling hiccup does not decide it.
+	median := func(username, secret string) time.Duration {
+		t.Helper()
+		samples := make([]time.Duration, 0, 7)
+		for i := 0; i < cap(samples); i++ {
+			started := time.Now()
+			if _, err := data.AuthenticatePassword(ctx, realm, username, secret); err != nil {
+				t.Fatal(err)
+			}
+			samples = append(samples, time.Since(started))
+		}
+		slices.Sort(samples)
+		return samples[len(samples)/2]
+	}
+	unknown := median("no-such-person", "whatever-password-1234")
+	wrong := median("present", "wrong-password-1234")
+	if wrong > unknown*10 {
+		t.Errorf("a wrong password took %v and a name that does not exist took %v: the quick answer is "+
+			"the one that says the name is free, which sorts a list of names into the ones that exist",
+			wrong, unknown)
+	}
+}

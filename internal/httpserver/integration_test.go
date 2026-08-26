@@ -5655,3 +5655,102 @@ func TestIntegrationATokenDoesNotWorkInAnotherRealm(t *testing.T) {
 			"there that it may act on it")
 	}
 }
+
+// A refused sign-in must not say which of the reasons it was. An account that
+// does not exist, a wrong password, a disabled account and a locked one all
+// answer the same 401 with the same sentence, and all of them spend the same
+// time getting there - the store hashes against a dummy for a name it has
+// never seen, precisely so that the quick answer is not the one that means
+// "no such person".
+//
+// Only a correct password is told more, which is safe for the reason the store
+// gives where it decides: whoever supplies it already knows more than
+// enumeration would reveal, and being told "your account is locked" rather
+// than "you have forgotten your password" is what they need.
+//
+// The successful case is checked alongside so that this cannot pass by
+// refusing everything. The timing half lives in the store, where it can be
+// seen.
+func TestIntegrationARefusedSignInDoesNotSayWhichReason(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range []struct {
+		name, password string
+		enabled        bool
+	}{
+		{"present", "present-password-1234", true},
+		{"disabled", "disabled-password-1234", false},
+		{"locked", "locked-password-1234", true},
+	} {
+		if _, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+			Username: account.name, Password: account.password, Enabled: account.enabled}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := data.Pool.Exec(ctx,
+		"UPDATE users SET locked_until=now()+interval '1 hour' WHERE realm_id=$1 AND username='locked'",
+		bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	type answer struct {
+		status  int
+		refusal string
+		took    time.Duration
+	}
+	attempt := func(username, secret string) answer {
+		t.Helper()
+		body := fmt.Sprintf(`{"realm":"master","username":%q,"password":%q,"request":""}`, username, secret)
+		started := time.Now()
+		response, err := server.Client().Post(server.URL+"/api/v1/auth/login", "application/json",
+			strings.NewReader(body))
+		took := time.Since(started)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		var decoded struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(raw, &decoded)
+		return answer{response.StatusCode, decoded.Error + "/" + decoded.Message, took}
+	}
+
+	unknown := attempt("no-such-person", "whatever-password-1234")
+	for _, same := range []struct{ what, user, secret string }{
+		{"a wrong password", "present", "wrong-password-1234"},
+		{"a disabled account and a wrong password", "disabled", "wrong-password-1234"},
+		{"a locked account and a wrong password", "locked", "wrong-password-1234"},
+	} {
+		got := attempt(same.user, same.secret)
+		if got.status != unknown.status || got.refusal != unknown.refusal {
+			t.Errorf("%s answered %d %q and an account that does not exist answered %d %q: the difference "+
+				"says which accounts are real", same.what, got.status, got.refusal,
+				unknown.status, unknown.refusal)
+		}
+	}
+
+	// Not "everything is refused": a correct password gets in, and is told what
+	// is wrong when the account cannot be used.
+	if got := attempt("present", "present-password-1234"); got.status != http.StatusOK {
+		t.Fatalf("a correct password answered %d, so the sameness above would mean nothing", got.status)
+	}
+	if got := attempt("locked", "locked-password-1234"); got.status == unknown.status && got.refusal == unknown.refusal {
+		t.Error("a locked account with the right password is told the same thing as a name that does not " +
+			"exist, so nobody can find out why they cannot get in")
+	}
+
+	// Whether they take the same time is checked in the store rather than here.
+	// Measured over HTTP the difference disappears: the request costs about
+	// sixty milliseconds either way in this environment, which is the same
+	// order as the hashing it would have to reveal.
+}
