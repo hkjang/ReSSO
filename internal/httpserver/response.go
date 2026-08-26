@@ -46,6 +46,11 @@ func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 			message = messaged.Message
 		}
 		writeError(w, r, http.StatusConflict, "conflict", message)
+	case store.ValueTooLong(err):
+		// The database refusing a value for its length is the caller's to fix,
+		// so it is not this service apologising for a failure of its own.
+		writeError(w, r, http.StatusBadRequest, "invalid_input",
+			"입력한 값 중 하나가 허용된 길이를 넘습니다. 더 짧게 입력해 주세요.")
 	default:
 		writeError(w, r, http.StatusInternalServerError, "internal_error", "요청을 처리하지 못했습니다.")
 	}

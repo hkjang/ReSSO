@@ -49,6 +49,19 @@ func invalidf(format string, arguments ...any) error {
 	return &MessagedError{Sentinel: ErrInvalidInput, Message: fmt.Sprintf(format, arguments...)}
 }
 
+// ValueTooLong reports whether the database refused a write because a value
+// did not fit the column it was going for.
+//
+// That is the caller's to fix, and it used to be answered with 500: a name
+// pasted a few characters too long told the person that this service had
+// failed, and told every dashboard watching the same thing. The columns are
+// bounded in the schema rather than repeated as numbers here, so this says
+// what happened without claiming to know which field it was.
+func ValueTooLong(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "22001"
+}
+
 // takenValueMessages says what each unique constraint means when a write
 // collides with it. The names are read from the error PostgreSQL returns and
 // come from the migrations, listed here rather than guessed at the call site:

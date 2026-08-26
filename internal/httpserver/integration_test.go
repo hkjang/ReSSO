@@ -5384,3 +5384,73 @@ func documentedFieldsFor(t *testing.T, document []byte, path, method string) map
 	walk(schema, 0)
 	return fields
 }
+
+// A value that does not fit its column is the caller's to fix. It used to be
+// answered with 500 and "요청을 처리하지 못했습니다": a name pasted a few
+// characters too long told the person that this service had failed, told the
+// console to show them nothing they could act on, and told every dashboard
+// watching that the service was erroring.
+//
+// The columns are bounded in the schema, so this is caught where every write
+// already reports its errors rather than by repeating each width in Go, where
+// it would be a second copy of a number that can drift from the one that
+// actually decides.
+func TestIntegrationAValueTooLongIsTheCallersFaultNotAFailure(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+
+	realm := bootstrap.RealmID.String()
+	for _, probe := range []struct{ what, path, body string }{
+		{"a username longer than its column",
+			"/users", fmt.Sprintf(`{"username":%q,"password":"a-long-password-1234","enabled":true}`,
+				strings.Repeat("u", 200))},
+		{"a display name longer than its column",
+			"/users", fmt.Sprintf(`{"username":"dn","password":"a-long-password-1234","display_name":%q,"enabled":true}`,
+				strings.Repeat("d", 400))},
+		{"a Role name longer than its column",
+			"/roles", fmt.Sprintf(`{"name":%q,"description":""}`, strings.Repeat("r", 200))},
+	} {
+		request, err := http.NewRequest(http.MethodPost,
+			fmt.Sprintf("%s/api/admin/v1/realms/%s%s", server.URL, realm, probe.path),
+			strings.NewReader(probe.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		answer, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s answered %d, want %d: the caller sent something this service will not store, "+
+				"and 5xx says the service is the one that went wrong", probe.what,
+				response.StatusCode, http.StatusBadRequest)
+			continue
+		}
+		var refusal struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(answer, &refusal); err != nil {
+			t.Errorf("%s answered undecodable: %s", probe.what, answer)
+			continue
+		}
+		if refusal.Error != "invalid_input" || !strings.Contains(refusal.Message, "길이") {
+			t.Errorf("%s answered %+v, want a refusal that says what to change", probe.what, refusal)
+		}
+	}
+}
