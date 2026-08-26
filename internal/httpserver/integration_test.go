@@ -5172,3 +5172,128 @@ func TestIntegrationARotationThatCouldNotBeUndoneIsRecorded(t *testing.T) {
 		t.Errorf("the event does not say the rotation still stands: %v", detail)
 	}
 }
+
+// Disabling an account is the emergency stop. The row is written first and the
+// sessions are ended after, so when that second half fails the account is off
+// and the sessions are live — and the request used to answer 500 with no audit
+// entry at all, describing something that did happen as something that did not.
+//
+// The retry made it worse. The sweep was keyed on the transition from enabled
+// to disabled, so a second attempt found the account already off, skipped the
+// sweep entirely, and recorded a clean SUCCESS over sessions that were still
+// running. The administrator's own way of checking their work confirmed a stop
+// that had not happened.
+func TestIntegrationDisablingAnAccountThatCouldNotBeSignedOutSaysSo(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "leaver", Password: "leaver-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateSession(ctx, bootstrap.RealmID, target.ID, time.Hour,
+		"127.0.0.1", "leaver-agent", "password"); err != nil {
+		t.Fatal(err)
+	}
+	// Only the revocation is refused, so signing in as the administrator below
+	// still works.
+	if _, err := data.Pool.Exec(ctx, `CREATE FUNCTION refuse_revoke() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.revoked_at IS NOT NULL AND OLD.revoked_at IS NULL THEN
+				RAISE EXCEPTION 'the test refuses this revocation';
+			END IF;
+			RETURN NEW;
+		END; $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `CREATE TRIGGER refuse_session_revoke BEFORE UPDATE ON sso_sessions
+		FOR EACH ROW EXECUTE FUNCTION refuse_revoke()`); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+
+	disable := func() (int, []byte) {
+		t.Helper()
+		body := `{"email":"","display_name":"Leaver","enabled":false}`
+		request, err := http.NewRequest(http.MethodPut,
+			fmt.Sprintf("%s/api/admin/v1/realms/%s/users/%s", server.URL, bootstrap.RealmID, target.ID),
+			strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		answer, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode, answer
+	}
+
+	status, answer := disable()
+	if status != http.StatusOK {
+		t.Fatalf("disabling answered %d %s; the account was disabled, so this is not a failed request",
+			status, answer)
+	}
+	if !strings.Contains(string(answer), "sessions_ended") {
+		t.Errorf("the answer does not mention what did not finish: %s", answer)
+	}
+	var enabled bool
+	if err := data.Pool.QueryRow(ctx, "SELECT enabled FROM users WHERE id=$1", target.ID).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled {
+		t.Fatal("the account was not disabled, so this test is not about what it says it is")
+	}
+	page, err := data.ListAudit(ctx, store.AuditFilter{
+		RealmID: &bootstrap.RealmID, EventType: "USER_UPDATE", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("USER_UPDATE events = %d, want 1: the account was disabled and the trail said nothing",
+			len(page.Items))
+	}
+	if page.Items[0].Result != "PARTIAL" {
+		t.Errorf("result = %q, want PARTIAL", page.Items[0].Result)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(page.Items[0].Detail, &detail); err != nil {
+		t.Fatalf("the event carries no readable detail: %s", page.Items[0].Detail)
+	}
+	if detail["users_signed_out"] != false {
+		t.Errorf("the event does not say the sessions are still live: %v", detail)
+	}
+
+	// And the retry has to actually retry. The account is already disabled by
+	// now, which is exactly the state that used to make the sweep be skipped.
+	if _, err := data.Pool.Exec(ctx, "DROP TRIGGER refuse_session_revoke ON sso_sessions"); err != nil {
+		t.Fatal(err)
+	}
+	if status, answer := disable(); status != http.StatusOK {
+		t.Fatalf("the retry answered %d %s", status, answer)
+	}
+	var live int
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM sso_sessions WHERE user_id=$1 AND revoked_at IS NULL", target.ID).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live != 0 {
+		t.Errorf("%d session(s) of a disabled account are still live after a retry: the second attempt "+
+			"found the account already off and swept nothing", live)
+	}
+}

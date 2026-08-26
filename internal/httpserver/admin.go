@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/hkjang/ReSSO/internal/domain"
 	"github.com/hkjang/ReSSO/internal/store"
 )
 
@@ -326,12 +328,46 @@ func (s *Server) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadGateway, "ldap_update_failed", "LDAP 디렉터리에서 사용자 정보를 변경하지 못했습니다.")
 		return
 	}
-	if err != nil || user.RealmID != realmID {
+	// The account was changed either way; only signing it out everywhere fell
+	// short. Answering with a failure would describe something that did happen
+	// as something that did not, and would leave the trail with no entry for
+	// the change at all.
+	signedOut := !errors.Is(err, store.ErrUsersNotSignedOut)
+	if err != nil && signedOut || user.RealmID != realmID {
 		writeStoreError(w, r, err)
 		return
 	}
-	s.audit(r, &realmID, &principal.UserID, principal.Username, "USER_UPDATE", "SUCCESS", "user", user.ID.String(), userAuditDetail(current, user))
+	detail := userAuditDetail(current, user)
+	if !signedOut {
+		s.logger.Error("a disabled account was not signed out everywhere",
+			"trace_id", traceIDFrom(r.Context()), "user_id", userID, "error", err)
+		detail["users_signed_out"] = false
+		detail["error"] = err.Error()
+	}
+	s.audit(r, &realmID, &principal.UserID, principal.Username, "USER_UPDATE",
+		partialIfNot(signedOut), "user", user.ID.String(), detail)
+	if !signedOut {
+		writeJSON(w, http.StatusOK, withUserWarning(user,
+			"계정은 비활성화했지만 열려 있는 세션을 모두 종료하지 못했습니다. 관리 → 세션에서 확인하세요."))
+		return
+	}
 	writeJSON(w, http.StatusOK, user)
+}
+
+// withUserWarning renders an account with a note about what did not finish,
+// keeping every field the caller already reads.
+func withUserWarning(user domain.User, message string) map[string]any {
+	encoded, err := json.Marshal(user)
+	if err != nil {
+		return map[string]any{"sessions_ended": false, "message": message}
+	}
+	fields := map[string]any{}
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return map[string]any{"sessions_ended": false, "message": message}
+	}
+	fields["sessions_ended"] = false
+	fields["message"] = message
+	return fields
 }
 
 func (s *Server) adminResetPassword(w http.ResponseWriter, r *http.Request) {

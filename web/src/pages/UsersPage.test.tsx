@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { beforeEach, expect, test, vi } from 'vitest'
 import { UsersPage } from './UsersPage'
+import { ToastProvider } from '../components/Toast'
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }))
 
@@ -282,4 +283,34 @@ test('typing puts the term in the URL, so the same hand-over still applies', asy
   await user.click(screen.getByRole('button', { name: 'hand over alice' }))
 
   expect(await screen.findByDisplayValue('alice')).toBeInTheDocument()
+})
+
+// Disabling an account writes the row first and ends its sessions after, so
+// the second half can fall short on its own. Announcing it as done for both
+// tells an administrator the emergency stop landed while the sessions it was
+// meant to end are still running.
+test('disabling an account that could not be signed out says so', async () => {
+  const user = userEvent.setup()
+  mocks.api.mockImplementation((path: string, init?: { method?: string }) => {
+    if (String(path).includes('/role-mappings')) {
+      return Promise.resolve({ available_realm_roles: [], available_client_roles: [], realm_role_ids: [], federation_realm_role_ids: [], client_role_ids: [] })
+    }
+    if (init?.method === 'PUT') {
+      return Promise.resolve({ ...legacyUser, enabled: false, sessions_ended: false,
+        message: '계정은 비활성화했지만 열려 있는 세션을 모두 종료하지 못했습니다.' })
+    }
+    return Promise.resolve({ items: [legacyUser], total: 1 })
+  })
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })}>
+    <ToastProvider>
+      <MemoryRouter initialEntries={['/admin/users']}>
+        <Routes><Route path="/admin/users" element={<UsersPage />} /></Routes>
+      </MemoryRouter>
+    </ToastProvider>
+  </QueryClientProvider>)
+
+  await user.click(await screen.findByText('alice'))
+  await user.click(await screen.findByRole('button', { name: '변경 저장' }))
+
+  expect(await screen.findByText(/세션을 모두 종료하지 못했습니다/)).toBeInTheDocument()
 })

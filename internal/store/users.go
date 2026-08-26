@@ -286,9 +286,24 @@ func (s *Store) UpdateUser(ctx context.Context, userID uuid.UUID, input UpdateUs
 	// session row stayed live, so re-enabling the account later handed the
 	// same session back, and every relying party went on believing the person
 	// was signed in the whole time.
-	if current.Enabled && !input.Enabled {
+	//
+	// Every update that leaves the account disabled sweeps, not only the one
+	// that switched it off. Keyed on the transition, an attempt whose sweep
+	// failed could not be repeated: the account was already disabled by then,
+	// so the retry skipped the sweep entirely and reported a clean success
+	// over sessions that were still live.
+	if !input.Enabled {
 		if err := s.EndSessionsOfDisabledUsers(ctx, []uuid.UUID{userID}); err != nil {
-			return domain.User{}, fmt.Errorf("end sessions of disabled user: %w", err)
+			// The account is disabled either way. Reporting this as a failed
+			// request would describe something that did happen as something
+			// that did not, so the caller is given the account it asked for
+			// alongside the shortfall — the same choice as ErrUsersNotSignedOut
+			// on a provider.
+			updated, lookupErr := s.UserByID(ctx, userID)
+			if lookupErr != nil {
+				return domain.User{}, fmt.Errorf("end sessions of disabled user: %w", err)
+			}
+			return updated, fmt.Errorf("%w: %w", ErrUsersNotSignedOut, err)
 		}
 	}
 	return s.UserByID(ctx, userID)

@@ -139,9 +139,20 @@ export function UsersPage() {
     mutationFn: () => api<User>(`/api/admin/v1/realms/${selection.realmID}/users`, { method: 'POST', ...jsonBody({ ...createForm, manager_id: createForm.manager_id || undefined }) }),
     onSuccess: async () => { setCreateOpen(false); setCreateForm(blankUser); await invalidate() },
   })
+  // Disabling an account writes the row first and ends its sessions after, so
+  // the second half can fall short on its own. The server answers 200 with the
+  // account either way and adds sessions_ended:false when it did — announcing
+  // it as done for both would tell an administrator the emergency stop landed
+  // while the sessions it was meant to end are still running.
   const update = useMutation({
-    mutationFn: () => api<User>(`/api/admin/v1/realms/${selection.realmID}/users/${editForm!.id}`, { method: 'PUT', ...jsonBody({ email: editForm!.email, email_verified: editForm!.email_verified, display_name: editForm!.display_name, enabled: editForm!.enabled, manager_id: editForm!.manager_id || undefined }) }),
-    onSuccess: async (saved) => { setSelected(saved); await invalidate() },
+    mutationFn: () => api<User & { sessions_ended?: boolean; message?: string }>(`/api/admin/v1/realms/${selection.realmID}/users/${editForm!.id}`, { method: 'PUT', ...jsonBody({ email: editForm!.email, email_verified: editForm!.email_verified, display_name: editForm!.display_name, enabled: editForm!.enabled, manager_id: editForm!.manager_id || undefined }) }),
+    onSuccess: async (saved) => {
+      setSelected(saved)
+      if (saved.sessions_ended === false) {
+        notify(saved.message ?? '계정은 비활성화했지만 열려 있는 세션을 모두 종료하지 못했습니다.', 'warning')
+      }
+      await invalidate()
+    },
   })
   // The server answers 204 when the sessions really ended and 200 with
   // other_sessions_ended:false when they did not, because ending them can fail
