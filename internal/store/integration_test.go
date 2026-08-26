@@ -6014,3 +6014,88 @@ func TestIntegrationOnlyTheReviewerOrTheRealmsOwnAdminCanDecide(t *testing.T) {
 		t.Error("an approved request did not grant the Role")
 	}
 }
+
+// Ending someone's sessions everywhere selects refresh tokens by user_id, and
+// the rollback after a failed refresh asks whether a token has a successor by
+// parent_id. Neither column was indexed, so both read the whole table — the one
+// that grows with every token ever issued — and the first of them is the
+// emergency stop: an administrator disabling an account, a password changed
+// because someone believes it is known, a directory sync deactivating a batch.
+//
+// The plan is asked rather than the index list. An index that exists and is
+// never chosen would satisfy a check for its name while the scan it was added
+// to prevent goes on happening.
+func TestIntegrationEndingSessionsDoesNotReadEveryRefreshToken(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, CreateClientInput{
+		ClientID: "sweep-probe", Name: "Sweep Probe", Type: "public",
+		RedirectURIs: []string{"https://probe.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Enough rows, spread widely enough, that reading all of them is the
+	// expensive answer. A handful either way and a sequential scan is simply
+	// the right plan, and this would pass or fail for reasons of its own.
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO users(id,realm_id,username,password_hash)
+        SELECT gen_random_uuid(),$1,'sweep-'||g,'x' FROM generate_series(1,500) g`, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO refresh_tokens(id,token_hash,family_id,realm_id,client_id,user_id,scope,expires_at)
+        SELECT gen_random_uuid(), sha256(g::text::bytea), gen_random_uuid(), $1, $2, u.id, ARRAY['openid'], now()+interval '1 day'
+        FROM generate_series(1,10000) g
+        JOIN LATERAL (SELECT id FROM users WHERE realm_id=$1 AND username='sweep-'||((g % 500)+1)) u ON true`,
+		realm.ID, created.Client.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, "ANALYZE refresh_tokens"); err != nil {
+		t.Fatal(err)
+	}
+	_ = bootstrap
+
+	var sweptUser uuid.UUID
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT id FROM users WHERE realm_id=$1 AND username='sweep-7'", realm.ID).Scan(&sweptUser); err != nil {
+		t.Fatal(err)
+	}
+	for _, probe := range []struct {
+		name, query string
+		argument    any
+	}{
+		{"ending the sessions of a disabled account",
+			`UPDATE refresh_tokens SET revoked_at=now() WHERE user_id=ANY($1::uuid[]) AND revoked_at IS NULL`,
+			[]uuid.UUID{sweptUser}},
+		{"asking whether a token has a successor",
+			`SELECT 1 FROM refresh_tokens c WHERE c.parent_id=$1`, sweptUser},
+	} {
+		rows, err := data.Pool.Query(ctx, "EXPLAIN "+probe.query, probe.argument)
+		if err != nil {
+			t.Fatalf("%s: %v", probe.name, err)
+		}
+		plan := ""
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			plan += line + "\n"
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(plan, "Seq Scan on refresh_tokens") {
+			t.Errorf("%s reads every refresh token in the deployment:\n%s", probe.name, plan)
+		}
+	}
+}
