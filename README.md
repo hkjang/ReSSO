@@ -197,7 +197,7 @@ make test    # go test -race, go vet, 프론트엔드 테스트와 빌드
 
 ```bash
 docker run -d --name resso-test-pg -e POSTGRES_USER=resso -e POSTGRES_PASSWORD=testpw \
-  -e POSTGRES_DB=resso -p 55432:5432 postgres:16-alpine
+  -e POSTGRES_DB=resso -p 55432:5432 postgres:17-alpine
 docker exec resso-test-pg psql -U resso -d resso -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
 RESSO_TEST_POSTGRES_DSN='postgres://resso:testpw@127.0.0.1:55432/resso?sslmode=disable' go test -race ./...
 ```

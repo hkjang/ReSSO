@@ -179,3 +179,46 @@ func TestComposeFilesRunTheReleaseThisTreeDescribes(t *testing.T) {
 		}
 	}
 }
+
+// The database the tests run against is named in three places: the script that
+// starts the local services, the service block of the release workflow, and
+// the manual recipe in the README. Every merge is gated on the script's
+// version, and the last check before an image ships runs the whole backend
+// suite on the release workflow's.
+//
+// They disagreed. The script moved to a newer major and the other two stayed
+// on the one they were written for, so a change that behaves differently
+// between them passed every merge and was first met at the release - and a
+// developer following the README ran their tests against a third position.
+// Which major is correct is a decision; having three of them is not.
+func TestThePostgresVersionIsTheSameEverywhereItIsNamed(t *testing.T) {
+	root := filepath.Join("..", "..")
+	pattern := regexp.MustCompile(`postgres:(\S+?)(?:\s|$|>)`)
+	found := map[string][]string{}
+	for _, name := range []string{
+		"scripts/test-services.sh",
+		filepath.Join(".github", "workflows", "release.yaml"),
+		filepath.Join(".github", "workflows", "ci.yaml"),
+		"README.md",
+	} {
+		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, match := range pattern.FindAllStringSubmatch(string(content), -1) {
+			// postgres://... is a connection string, not an image.
+			if strings.HasPrefix(match[1], "//") {
+				continue
+			}
+			found[match[1]] = append(found[match[1]], name)
+		}
+	}
+	if len(found) == 0 {
+		t.Fatal("no PostgreSQL image is named anywhere, so nothing is being compared")
+	}
+	if len(found) > 1 {
+		t.Errorf("the tests run against %d different PostgreSQL images: %v — every merge is gated "+
+			"on one and the release on another, so a difference between them is first met "+
+			"where there is no time left to meet it", len(found), found)
+	}
+}
