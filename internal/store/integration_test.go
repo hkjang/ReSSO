@@ -4158,6 +4158,62 @@ func TestIntegrationRealmPolicyBoundsAgreeEverywhere(t *testing.T) {
 	if checked < len(settings) {
 		t.Errorf("only %d of %d documented policy rows were found to check", checked, len(settings))
 	}
+
+	// And the console, which is the fourth place these numbers are written and
+	// the only one an administrator meets while choosing a value. Its number
+	// fields carry their own min and max, so a bound raised here and forgotten
+	// there leaves the form refusing a value the service would take, or
+	// offering one it will not - and the refusal arrives after saving, with
+	// nothing to suggest the form's own limits were the stale part.
+	console, err := os.ReadFile(filepath.Join("..", "..", "web", "src", "pages", "RealmsPage.tsx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := map[string]string{
+		"Access Token (초)":  "access_token_ttl_seconds",
+		"Refresh Token (초)": "refresh_token_ttl_seconds",
+		"SSO Session (초)":   "session_ttl_seconds",
+		"유휴 만료 (초)":         "idle_timeout_seconds",
+		"비밀번호 최소 길이":        "password_min_length",
+		"잠금까지 허용할 연속 실패 횟수": "max_login_attempts",
+		"잠금 유지 시간 (초)":      "lockout_seconds",
+	}
+	// The idle timeout is the one field whose lower limit is deliberately not
+	// the validator's: zero turns it off, and the field has to accept that.
+	offAt := map[string]int{"idle_timeout_seconds": 0}
+	// Read one field at a time. Spanning from a label to the next inputProps
+	// would let a field without bounds swallow the next field's, which is how
+	// this check first passed while comparing one fewer setting than it named.
+	labelPattern := regexp.MustCompile(`label="([^"]*)"`)
+	boundsPattern := regexp.MustCompile(`inputProps=\{\{ min: (\d+), max: (\d+) \}\}`)
+	found := map[string]bool{}
+	for _, field := range strings.Split(string(console), "<TextField")[1:] {
+		name := labelPattern.FindStringSubmatch(field)
+		match := boundsPattern.FindStringSubmatch(field)
+		if name == nil || match == nil {
+			continue
+		}
+		label, ok := fields[name[1]]
+		if !ok {
+			continue
+		}
+		found[label] = true
+		low, _ := strconv.Atoi(match[1])
+		high, _ := strconv.Atoi(match[2])
+		wantLow := bounds[label][0]
+		if off, ok := offAt[label]; ok {
+			wantLow = off
+		}
+		if low != wantLow || high != bounds[label][1] {
+			t.Errorf("the console offers %s between %d and %d, the service enforces %d–%d",
+				label, low, high, bounds[label][0], bounds[label][1])
+		}
+	}
+	for _, label := range fields {
+		if !found[label] {
+			t.Errorf("no console field with bounds was found for %s, so it is not being compared", label)
+		}
+	}
 }
 
 // A rate limiter that cannot work must not answer that everything is fine.

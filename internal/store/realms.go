@@ -218,11 +218,12 @@ type UpdateRealmInput struct {
 // constraint violation.
 //
 // It is a package-level table rather than a literal inside the validator
-// because the same numbers are written down in three places — here, the
-// migrations, and the operations guide an administrator reads — and two of
-// them had already drifted: the guide gave the idle timeout a maximum of 24
-// hours where the constraint allows 30 days. A table can be compared against
-// the other two; a literal in a loop cannot.
+// because the same numbers are written down in four places — here, the
+// migrations, the operations guide an administrator reads, and the number
+// fields of the console's Realm screen — and two of them had already drifted:
+// the guide gave the idle timeout a maximum of 24 hours where the constraint
+// allows 30 days. A table can be compared against the other three; a literal
+// in a loop cannot.
 var realmPolicyBounds = []struct {
 	Label     string
 	Low, High int
