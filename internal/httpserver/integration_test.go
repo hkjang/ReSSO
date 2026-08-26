@@ -4811,3 +4811,125 @@ func TestIntegrationEveryMutatingAPIRouteRequiresACSRFToken(t *testing.T) {
 	}
 	t.Logf("%d mutating API routes refuse a request without a CSRF token", probed)
 }
+
+// Every realm-scoped route carries the realm in its path, and each one decides
+// for itself that the caller may act on that realm. One that forgets hands a
+// realm administrator another tenant's directory, which is the whole boundary
+// this product sells.
+//
+// The expectation is taken from behaviour rather than written down: the same
+// session asks for the same routes twice, once naming its own realm and once
+// naming another's. Every route the operator may reach on their own realm must
+// be refused on the other. Written as a fixed list of "must answer 403" it
+// would have proved almost nothing - most of these paths carry a sub-resource
+// id too, and a made-up one answers 404 whichever realm is named, so the
+// refusal would have been the id's doing and not the boundary's.
+func TestIntegrationRealmScopedRoutesRefuseAnotherTenant(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := data.CreateRealm(ctx, store.CreateRealmInput{
+		Name: "tenant", DisplayName: "Tenant", IssuerURL: "http://localhost:8080/realms/tenant"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "realm-operator", Password: "operator-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO user_roles(user_id,role_id)
+        SELECT $1,id FROM roles WHERE realm_id=$2 AND name='realm-admin' ON CONFLICT DO NOTHING`,
+		operator.ID, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	cookies, csrf := signInForBoundaryProbe(t, server, "realm-operator", "operator-password-1234")
+
+	type call struct{ method, route string }
+	routes := make([]call, 0)
+	realmParam := regexp.MustCompile(`\{realmID\}`)
+	otherParams := regexp.MustCompile(`\{[^}]*\}|\*`)
+	if walkErr := chi.Walk(handler.(*chi.Mux), func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		if strings.Contains(route, "{realmID}") && method != http.MethodOptions {
+			routes = append(routes, call{method, route})
+		}
+		return nil
+	}); walkErr != nil {
+		t.Fatal(walkErr)
+	}
+	ask := func(one call, realmID string) int {
+		t.Helper()
+		path := otherParams.ReplaceAllString(realmParam.ReplaceAllString(one.route, realmID),
+			"00000000-0000-0000-0000-000000000001")
+		request, err := http.NewRequest(one.method, server.URL+path, strings.NewReader("{}"))
+		if err != nil {
+			t.Fatalf("%s %s could not be requested: %v", one.method, one.route, err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatalf("%s %s: %v", one.method, one.route, err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+
+	// Own realm first: these are the routes the boundary actually has to hold,
+	// and the mutations they make land on the operator's own tenant.
+	// Not merely "was not refused": a path carrying a made-up sub-resource id
+	// answers 404 whichever realm is named, so counting those as reached would
+	// let the id's doing stand in for the boundary's.
+	reachable := make([]call, 0, len(routes))
+	for _, one := range routes {
+		switch ask(one, bootstrap.RealmID.String()) {
+		case http.StatusForbidden, http.StatusNotFound:
+		default:
+			reachable = append(reachable, one)
+		}
+	}
+	if len(reachable) == 0 {
+		t.Fatal("the operator could reach none of their own realm's routes, so the comparison below " +
+			"would pass without testing anything")
+	}
+	for _, one := range reachable {
+		if status := ask(one, theirs.ID.String()); status != http.StatusForbidden {
+			t.Errorf("%s %s answered %d for another tenant's realm while the operator administers "+
+				"only their own", one.method, one.route, status)
+		}
+	}
+	t.Logf("%d of %d realm-scoped routes act on the operator's own realm and are refused on another's",
+		len(reachable), len(routes))
+}
+
+func signInForBoundaryProbe(t *testing.T, server *httptest.Server, username, password string) ([]*http.Cookie, string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"realm":"master","username":%q,"password":%q,"request":""}`, username, password)
+	response, err := server.Client().Post(server.URL+"/api/v1/auth/login", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("signing in as %s failed: %d %s", username, response.StatusCode, raw)
+	}
+	var decoded struct {
+		CSRF string `json:"csrf_token"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil || decoded.CSRF == "" {
+		t.Fatalf("sign-in returned no CSRF token: %s", raw)
+	}
+	return response.Cookies(), decoded.CSRF
+}
