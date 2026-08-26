@@ -36,9 +36,13 @@ export function UsersPage() {
   // nothing. A term read once is applied to the first hand-over only, leaving
   // the field, the request and the address bar saying three different things.
   const [searchParams, setSearchParams] = useSearchParams()
-  const handedOverTerm = searchParams.get('q') ?? ''
-  const [searchInput, setSearchInput] = useState(handedOverTerm)
-  const [search, setSearch] = useState(handedOverTerm)
+  // The URL holds the term. The box is what is being typed into and follows the
+  // URL only when the URL moved on its own — remembering what was written there
+  // is what separates "the palette handed over a term" from "the debounce just
+  // wrote what I typed", and without that separation the sync clobbers typing.
+  const search = searchParams.get('q') ?? ''
+  const [searchInput, setSearchInput] = useState(search)
+  const [writtenTerm, setWrittenTerm] = useState(search)
   const [page, setPage] = useState(0)
   // The status lives in the URL, like the Realm does and for the same reason:
   // the dashboard links straight to the locked accounts, and a filtered list is
@@ -83,17 +87,28 @@ export function UsersPage() {
     enabled: Boolean(selection.realmID && selected?.id),
   })
   useEffect(() => {
-    const timer = window.setTimeout(() => { setSearch(searchInput.trim()); setPage(0) }, 300)
+    const timer = window.setTimeout(() => {
+      const value = searchInput.trim()
+      setWrittenTerm(value)
+      // Nothing to write when the URL already names this term — otherwise every
+      // mount replaces the entry with an identical one.
+      if (value === search) return
+      setSearchParams((previous) => {
+        const next = new URLSearchParams(previous)
+        if (value) next.set('q', value)
+        else next.delete('q')
+        return next
+      }, { replace: true })
+      setPage(0)
+    }, 300)
     return () => window.clearTimeout(timer)
-  }, [searchInput])
+  }, [search, searchInput, setSearchParams])
   // Adjusted during render rather than in an effect, the same way the realm
   // change below is: the extra render happens before the browser paints, so the
   // list never shows a frame filtered by the previous term.
-  const [appliedTerm, setAppliedTerm] = useState(handedOverTerm)
-  if (appliedTerm !== handedOverTerm) {
-    setAppliedTerm(handedOverTerm)
-    setSearchInput(handedOverTerm)
-    setSearch(handedOverTerm)
+  if (search !== writtenTerm) {
+    setWrittenTerm(search)
+    setSearchInput(search)
     setPage(0)
   }
   // These three derive editor state from data that arrives asynchronously.

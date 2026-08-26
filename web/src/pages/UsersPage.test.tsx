@@ -251,3 +251,35 @@ test('a status the console does not know opens the unfiltered list', async () =>
   expect(asked.every((path) => !path.includes('status='))).toBe(true)
   expect(await screen.findByText('Alice')).toBeInTheDocument()
 })
+
+// The term lives in the URL now, so a filtered list is something to link to —
+// and the case that used to slip through closes with it: typing over the term
+// you arrived with, then being handed that same term again, used to leave what
+// you typed in place because the URL had never moved.
+test('typing puts the term in the URL, so the same hand-over still applies', async () => {
+  const user = userEvent.setup()
+  function HandOver() {
+    const navigate = useNavigate()
+    return <button onClick={() => navigate('/admin/users?q=alice')}>hand over alice</button>
+  }
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+    <MemoryRouter initialEntries={['/admin/users?q=alice']}>
+      <HandOver />
+      <Routes><Route path="/admin/users" element={<UsersPage />} /></Routes>
+    </MemoryRouter>
+  </QueryClientProvider>)
+
+  const field = await screen.findByDisplayValue('alice')
+  await user.clear(field)
+  await user.type(field, 'carol')
+
+  // What was typed reaches the request, which means it reached the URL.
+  await vi.waitFor(() => {
+    expect(mocks.api.mock.calls.map(([path]) => String(path))
+      .some((path) => path.includes('/users?q=carol'))).toBe(true)
+  })
+
+  await user.click(screen.getByRole('button', { name: 'hand over alice' }))
+
+  expect(await screen.findByDisplayValue('alice')).toBeInTheDocument()
+})

@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import SearchRoundedIcon from '@mui/icons-material/SearchRounded'
 import { Alert, Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, InputAdornment, MenuItem, Stack, Switch, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material'
@@ -29,20 +29,39 @@ export function ClientsPage() {
   const [createForm, setCreateForm] = useState(blankClient)
   const [selected, setSelected] = useState<Client | null>(null)
   const [edit, setEdit] = useState<(Client & { redirectText: string; logoutText: string; originsText: string; scopesText: string }) | null>(null)
-  // Handed over by the command palette so the selected client is already
-  // filtered. Read from the router on every change, not once at mount: the
-  // palette opens over this screen too, and landing on the route the browser is
-  // already on remounts nothing, so a term read once applies to the first
-  // hand-over only and every later one leaves the list showing the old filter.
-  const [searchParams] = useSearchParams()
-  const handedOverTerm = searchParams.get('q') ?? ''
-  const [search, setSearch] = useState(handedOverTerm)
+  // The term lives in the URL: the command palette hands one over that way, and
+  // typing one puts it there too, so a filtered list is something to link to.
+  // Read from the router on every change, not once at mount — the palette opens
+  // over this screen too, and landing on the route the browser is already on
+  // remounts nothing, so a term read once applies to the first hand-over only.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const linkedTerm = searchParams.get('q') ?? ''
+  const [search, setSearch] = useState(linkedTerm)
+  // What the debounce last wrote, which is what tells a hand-over apart from
+  // our own write — without it the sync below fires on every keystroke and
+  // fights whoever is typing.
+  const [writtenTerm, setWrittenTerm] = useState(linkedTerm)
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const value = search.trim()
+      setWrittenTerm(value)
+      // Nothing to write when the URL already names this term — otherwise every
+      // mount replaces the entry with an identical one.
+      if (value === linkedTerm) return
+      setSearchParams((previous) => {
+        const next = new URLSearchParams(previous)
+        if (value) next.set('q', value)
+        else next.delete('q')
+        return next
+      }, { replace: true })
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [linkedTerm, search, setSearchParams])
   // Adjusted during render rather than in an effect, so the list never shows a
   // frame still filtered by the previous term.
-  const [appliedTerm, setAppliedTerm] = useState(handedOverTerm)
-  if (appliedTerm !== handedOverTerm) {
-    setAppliedTerm(handedOverTerm)
-    setSearch(handedOverTerm)
+  if (linkedTerm !== writtenTerm) {
+    setWrittenTerm(linkedTerm)
+    setSearch(linkedTerm)
   }
   const [sort, setSort] = useState<SortState<'name' | 'client_id' | 'type'>>({ column: 'name', descending: false })
   const [oneTimeSecret, setOneTimeSecret] = useState('')
