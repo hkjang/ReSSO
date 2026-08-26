@@ -6208,3 +6208,76 @@ func TestIntegrationEachApprovalRefusalSaysWhatItIs(t *testing.T) {
 			"is not this service failing", response.StatusCode, body, http.StatusForbidden)
 	}
 }
+
+// No refusal may describe the database to whoever asked. writeStoreError
+// exists to see to that, and its comment says so, but a handler that answers
+// with err.Error() instead of going through it puts back exactly what it keeps
+// out: creating a personal API key with a name a few characters too long came
+// back as "value too long for type character varying(120) (SQLSTATE 22001)",
+// which names the column, its width and the engine to anybody with an account.
+//
+// Every path that takes a name is asked for one too long, so the check is
+// about the class rather than the one that leaked - and a refusal that says
+// nothing at all would be no better, so each has to come back with a sentence.
+func TestIntegrationNoRefusalDescribesTheDatabase(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+
+	realm := bootstrap.RealmID.String()
+	long := strings.Repeat("n", 300)
+	for _, probe := range []struct{ what, path, body string }{
+		{"a personal API key", "/api/v1/me/api-keys",
+			fmt.Sprintf(`{"name":%q,"scopes":["api:read"],"expires_days":30}`, long)},
+		{"an account", fmt.Sprintf("/api/admin/v1/realms/%s/users", realm),
+			fmt.Sprintf(`{"username":%q,"password":"a-long-password-1234","enabled":true}`, long)},
+		{"a Role", fmt.Sprintf("/api/admin/v1/realms/%s/roles", realm),
+			fmt.Sprintf(`{"name":%q,"description":""}`, long)},
+		{"a Client", fmt.Sprintf("/api/admin/v1/realms/%s/clients", realm),
+			fmt.Sprintf(`{"client_id":%q,"name":"Probe","type":"public","redirect_uris":["https://a.test/cb"],`+
+				`"grant_types":["authorization_code"],"default_scopes":["openid"]}`, long)},
+		{"a directory provider", fmt.Sprintf("/api/admin/v1/realms/%s/user-federations", realm),
+			fmt.Sprintf(`{"name":%q,"vendor":"OTHER","connection_url":"ldap://x","users_dn":"ou=p",`+
+				`"username_ldap_attribute":"uid","rdn_ldap_attribute":"uid","uuid_ldap_attribute":"entryUUID",`+
+				`"user_object_classes":["inetOrgPerson"],"search_scope":"SUBTREE","batch_size":100,`+
+				`"edit_mode":"READ_ONLY","missing_user_action":"KEEP","import_enabled":true,"enabled":true}`, long)},
+	} {
+		request, err := http.NewRequest(http.MethodPost, server.URL+probe.path, strings.NewReader(probe.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		answer, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode == http.StatusCreated {
+			t.Errorf("creating %s with a name of %d characters was accepted", probe.what, len(long))
+			continue
+		}
+		for _, database := range []string{"SQLSTATE", "character varying", "pq:", "ERROR:"} {
+			if strings.Contains(string(answer), database) {
+				t.Errorf("refusing %s described the database to the caller: %s", probe.what, answer)
+			}
+		}
+		var refusal struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(answer, &refusal) != nil || strings.TrimSpace(refusal.Message) == "" {
+			t.Errorf("refusing %s said nothing a person could act on: %s", probe.what, answer)
+		}
+	}
+}

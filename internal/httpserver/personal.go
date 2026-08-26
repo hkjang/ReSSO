@@ -301,7 +301,10 @@ func (s *Server) createMyAPIKey(w http.ResponseWriter, r *http.Request) {
 	expires := time.Now().UTC().Add(time.Duration(input.ExpiresDays) * 24 * time.Hour)
 	created, err := s.store.CreatePersonalAPIKey(r.Context(), principal.UserID, input.Name, input.Scopes, &expires, nil)
 	if err != nil {
-		writeError(w, r, http.StatusBadRequest, "api_key_creation_failed", err.Error())
+		// Through the one mapping, so a name too long for its column is a
+		// refusal in plain words rather than the database describing its own
+		// schema to whoever asked.
+		writeStoreError(w, r, err)
 		return
 	}
 	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "API_KEY_CREATE", "SUCCESS", "api_key", created.Key.ID.String(), map[string]any{"scopes": input.Scopes})

@@ -43,7 +43,7 @@ type CreatedAPIKey struct {
 func (s *Store) CreatePersonalAPIKey(ctx context.Context, userID uuid.UUID, name string, scopes []string, expiresAt *time.Time, rotatedFrom *uuid.UUID) (CreatedAPIKey, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return CreatedAPIKey{}, errors.New("API key name is required")
+		return CreatedAPIKey{}, invalidf("API 키 이름이 필요합니다.")
 	}
 	prefixRandom, err := cryptoutil.RandomToken(16)
 	if err != nil {
