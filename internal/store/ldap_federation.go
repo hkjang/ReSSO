@@ -421,28 +421,32 @@ func normalizeLDAPInput(id, realmID uuid.UUID, input LDAPFederationInput, creden
 		credential = *input.BindCredential
 	}
 	if provider.Name == "" || len([]rune(provider.Name)) > 120 {
-		return domain.LDAPFederation{}, "", errors.New("federation name is required and must be at most 120 characters")
+		return domain.LDAPFederation{}, "", invalidf("federation name is required and must be at most 120 characters")
 	}
 	if provider.Vendor != "OTHER" && provider.Vendor != "AD" {
-		return domain.LDAPFederation{}, "", errors.New("vendor must be OTHER or AD")
+		return domain.LDAPFederation{}, "", invalidf("vendor must be OTHER or AD")
 	}
 	if provider.Priority < 0 || provider.Priority > 1000 || provider.BatchSize < 50 || provider.BatchSize > 5000 {
-		return domain.LDAPFederation{}, "", errors.New("priority or batch size is outside the supported range")
+		return domain.LDAPFederation{}, "", invalidf("priority or batch size is outside the supported range")
 	}
 	if provider.SyncPeriodSeconds != 0 && (provider.SyncPeriodSeconds < 300 || provider.SyncPeriodSeconds > 604800) {
-		return domain.LDAPFederation{}, "", errors.New("sync period must be zero or between 300 and 604800 seconds")
+		return domain.LDAPFederation{}, "", invalidf("sync period must be zero or between 300 and 604800 seconds")
 	}
 	if !provider.ImportEnabled && provider.SyncPeriodSeconds > 0 {
-		return domain.LDAPFederation{}, "", errors.New("automatic synchronization requires user import to be enabled")
+		return domain.LDAPFederation{}, "", invalidf("automatic synchronization requires user import to be enabled")
 	}
 	if provider.MissingUserAction != "KEEP" && provider.MissingUserAction != "DISABLE" {
-		return domain.LDAPFederation{}, "", errors.New("missing user action must be KEEP or DISABLE")
+		return domain.LDAPFederation{}, "", invalidf("missing user action must be KEEP or DISABLE")
 	}
 	if provider.EditMode != "READ_ONLY" && provider.EditMode != "WRITABLE" && provider.EditMode != "UNSYNCED" {
-		return domain.LDAPFederation{}, "", errors.New("edit mode must be READ_ONLY, WRITABLE, or UNSYNCED")
+		return domain.LDAPFederation{}, "", invalidf("edit mode must be READ_ONLY, WRITABLE, or UNSYNCED")
 	}
 	if err := federation.Validate(provider, credential, provider.BindDN != ""); err != nil {
-		return domain.LDAPFederation{}, "", err
+		// These describe the caller's own settings - a malformed DN, an
+		// attribute that is not a valid name - so they are the caller's to
+		// fix. Without a sentinel the HTTP layer has nothing to tell them
+		// apart from a failure of this service.
+		return domain.LDAPFederation{}, "", invalidf("%s", err)
 	}
 	return provider, credential, nil
 }

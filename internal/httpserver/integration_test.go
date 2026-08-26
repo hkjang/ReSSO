@@ -6243,6 +6243,18 @@ func TestIntegrationNoRefusalDescribesTheDatabase(t *testing.T) {
 		{"a Client", fmt.Sprintf("/api/admin/v1/realms/%s/clients", realm),
 			fmt.Sprintf(`{"client_id":%q,"name":"Probe","type":"public","redirect_uris":["https://a.test/cb"],`+
 				`"grant_types":["authorization_code"],"default_scopes":["openid"]}`, long)},
+		// The provider's name is capped in Go, so a long one never reaches the
+		// database and this probe only exercises the validator. users_dn is
+		// not: a DN that is well formed and simply long passes every check
+		// this service makes and is refused by the column, which is where the
+		// column's width and the engine used to come back from.
+		{"a directory provider whose users DN is too long",
+			fmt.Sprintf("/api/admin/v1/realms/%s/user-federations", realm),
+			fmt.Sprintf(`{"name":"probe","vendor":"OTHER","connection_url":"ldap://x","users_dn":%q,`+
+				`"username_ldap_attribute":"uid","rdn_ldap_attribute":"uid","uuid_ldap_attribute":"entryUUID",`+
+				`"user_object_classes":["inetOrgPerson"],"search_scope":"SUBTREE","batch_size":100,`+
+				`"edit_mode":"READ_ONLY","missing_user_action":"KEEP","import_enabled":true,"enabled":true}`,
+				strings.Repeat("ou=x,", 300)+"dc=test")},
 		{"a directory provider", fmt.Sprintf("/api/admin/v1/realms/%s/user-federations", realm),
 			fmt.Sprintf(`{"name":%q,"vendor":"OTHER","connection_url":"ldap://x","users_dn":"ou=p",`+
 				`"username_ldap_attribute":"uid","rdn_ldap_attribute":"uid","uuid_ldap_attribute":"entryUUID",`+
@@ -6828,5 +6840,73 @@ func TestIntegrationAnOutOfRangeSettingSaysWhichOne(t *testing.T) {
 	}
 	if !strings.Contains(body, "access_token_ttl_seconds") {
 		t.Errorf("the refusal does not name the setting the operator has to change: %s", body)
+	}
+}
+
+// Saving an existing provider refuses through its own handler, which carried
+// the same raw store error as creating one did. A probe that only creates
+// would leave that half free to describe the database again.
+func TestIntegrationSavingADirectoryProviderRefusesWithoutTheDatabase(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := "bind-secret-value"
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, store.LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldap://directory.invalid:389",
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid",
+		RDNLDAPAttribute: "uid", UUIDLDAPAttribute: "entryUUID",
+		UserObjectClasses: []string{"inetOrgPerson"}, BatchSize: 500, ImportEnabled: true, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+
+	save := func(usersDN string) (int, string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"name":"corp","vendor":"OTHER","connection_url":"ldap://directory.invalid:389",
+			"bind_dn":"cn=admin,dc=example,dc=test","users_dn":%q,"username_ldap_attribute":"uid",
+			"rdn_ldap_attribute":"uid","uuid_ldap_attribute":"entryUUID","user_object_classes":["inetOrgPerson"],
+			"search_scope":"SUBTREE","batch_size":500,"edit_mode":"READ_ONLY","missing_user_action":"KEEP",
+			"import_enabled":true,"enabled":true}`, usersDN)
+		request, reqErr := http.NewRequest(http.MethodPut,
+			fmt.Sprintf("%s/api/admin/v1/realms/%s/user-federations/%s", server.URL, bootstrap.RealmID, provider.ID),
+			strings.NewReader(body))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		raw, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode, string(raw)
+	}
+
+	// A DN this handler accepts, so what follows is refused for its length and
+	// not for the shape of the request.
+	if status, body := save("ou=people,dc=example,dc=test"); status != http.StatusOK {
+		t.Fatalf("a valid save was refused, so the probe below proves nothing: %d %s", status, body)
+	}
+	status, body := save(strings.Repeat("ou=x,", 300) + "dc=test")
+	if status == http.StatusOK {
+		t.Fatalf("a users DN of %d characters was saved", len(strings.Repeat("ou=x,", 300))+7)
+	}
+	for _, database := range []string{"SQLSTATE", "character varying", "pq:", "ERROR:"} {
+		if strings.Contains(body, database) {
+			t.Errorf("refusing the save described the database to the caller: %s", body)
+		}
 	}
 }

@@ -51,11 +51,7 @@ func (s *Server) adminCreateLDAPFederation(w http.ResponseWriter, r *http.Reques
 	}
 	item, err := s.store.CreateLDAPFederation(r.Context(), realmID, input)
 	if err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			writeStoreError(w, r, err)
-			return
-		}
-		writeError(w, r, http.StatusBadRequest, "ldap_federation_creation_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	principal, _ := principalFrom(r.Context())
@@ -85,11 +81,7 @@ func (s *Server) adminUpdateLDAPFederation(w http.ResponseWriter, r *http.Reques
 	// without the entry saying the provider was switched off.
 	signedOut := !errors.Is(err, store.ErrUsersNotSignedOut)
 	if err != nil && signedOut {
-		if errors.Is(err, store.ErrConflict) {
-			writeStoreError(w, r, err)
-			return
-		}
-		writeError(w, r, http.StatusBadRequest, "ldap_federation_update_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	detail := map[string]any{"enabled": item.Enabled, "edit_mode": item.EditMode}
