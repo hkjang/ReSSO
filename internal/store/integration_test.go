@@ -6621,3 +6621,84 @@ func TestIntegrationADirectoryEntryCannotReachALocalAccount(t *testing.T) {
 		t.Errorf("the provider owns %d accounts, want only the one it could import", owned)
 	}
 }
+
+// Removing a provider and unlinking its people is one-way, and the console
+// and the guide now say so. This is what they are describing.
+//
+// The accounts are left local and disabled, which the delete dialog already
+// stated. What it did not say is the half an operator finds out afterwards:
+// connecting the same directory again adopts none of them. Every entry whose
+// name an unlinked account still holds is refused, run after run, because the
+// comparison that keeps a directory away from a local account cannot tell
+// these apart from any other local account - and it should not, which is why
+// this is written down rather than worked around.
+//
+// Every setting is editable in place, so fixing one never needs this.
+func TestIntegrationUnlinkingAProviderIsOneWay(t *testing.T) {
+	directory := strings.TrimSpace(os.Getenv("RESSO_TEST_LDAP_URL"))
+	if directory == "" {
+		t.Skip("set RESSO_TEST_LDAP_URL to run this")
+	}
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := "adminpassword"
+	create := func(name string) LDAPFederationInput {
+		return LDAPFederationInput{
+			Name: name, Vendor: "OTHER", ConnectionURL: directory,
+			BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+			UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid",
+			RDNLDAPAttribute: "uid", UUIDLDAPAttribute: "entryUUID",
+			UserObjectClasses: []string{"inetOrgPerson"}, BatchSize: 500,
+			ImportEnabled: true, Enabled: true}
+	}
+	first, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, create("corp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := data.SyncLDAPFederation(ctx, first.ID)
+	if err != nil || summary.Added == 0 {
+		t.Fatalf("the first run imported nobody, so nothing below is about unlinking: %+v %v", summary, err)
+	}
+	imported := summary.Added
+
+	// The operator got a setting wrong and removes the provider to redo it.
+	if err := data.DeleteLDAPFederation(ctx, first.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	var localDisabled int
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM users WHERE federation_id IS NULL AND enabled=false AND username<>'admin'").
+		Scan(&localDisabled); err != nil {
+		t.Fatal(err)
+	}
+	if localDisabled != imported {
+		t.Fatalf("%d of %d accounts were left local and disabled, which is not the state the dialog "+
+			"describes", localDisabled, imported)
+	}
+
+	second, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, create("corp-again"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err = data.SyncLDAPFederation(ctx, second.ID)
+	if summary.Read != imported {
+		t.Fatalf("the new provider read %d entries where the first read %d, so the two are not looking "+
+			"at the same directory", summary.Read, imported)
+	}
+	if summary.Added != 0 || summary.Failed != imported || err == nil {
+		t.Errorf("connecting the same directory again adopted %d and refused %d; the console and the "+
+			"guide say none are adopted (err=%v)", summary.Added, summary.Failed, err)
+	}
+	var owned int
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM users WHERE federation_id=$1", second.ID).Scan(&owned); err != nil {
+		t.Fatal(err)
+	}
+	if owned != 0 {
+		t.Errorf("the new provider owns %d accounts; the warning tells the operator it will own none", owned)
+	}
+}

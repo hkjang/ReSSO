@@ -85,5 +85,6 @@ REST API로 실행할 때는 `POST /api/admin/v1/realms/{realmID}/user-federatio
 - `DISABLE`은 LDAP 조회 전체가 성공하고 사용자별 실패가 0건일 때만 적용됩니다.
 - 디렉터리가 사용자를 **하나도** 반환하지 않았는데 ReSSO에는 해당 Provider의 활성 계정이 있으면 비활성화를 실행하지 않고 동기화를 실패로 기록합니다. 결과가 비어 있는 것은 실제로 전원이 디렉터리를 떠난 경우와, `Users DN` 오타·이름이 바뀐 Base·Bind 계정이 해당 하위 트리를 읽을 권한을 잃은 경우가 구분되지 않기 때문입니다. 후자에서 비활성화를 실행하면 다음 예약 동기화 한 번으로 조직 전체가 로그인할 수 없게 됩니다. `last_sync_error`와 `LDAP_FEDERATION_SYNC` 감사 이벤트에서 확인하고 검색 설정을 점검하세요.
 - 공급자 삭제는 연결 사용자가 있으면 기본 거부됩니다. 명시적 연결 해제를 선택하면 사용자를 비활성화하고 세션과 Federation Role을 정리한 뒤 비활성 Local 계정으로 보존합니다.
+- **연결 해제는 되돌릴 수 없습니다.** 남은 계정은 Local이므로, 같은 디렉터리를 새 공급자로 다시 연결해도 이름이 겹치는 계정마다 `username ... already belongs to a local account or another federation`으로 거부됩니다. 새 공급자는 그 사람들을 하나도 가져오지 못하고, 남은 길은 계정마다 비밀번호를 재설정해 Local로 쓰는 것뿐입니다. **Connection URL·Users DN·속성 이름을 포함한 모든 설정은 제자리에서 수정할 수 있으므로, 설정을 고치려고 삭제하지 마세요.**
 
 현재 버전은 direct `memberOf`만 처리합니다. 중첩 Group 탐색, Kerberos/SPNEGO, Changed Users Sync, LDAP 연결 Pool은 후속 확장 범위입니다.
