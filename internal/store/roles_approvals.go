@@ -362,7 +362,7 @@ func (s *Store) CreateRoleApprovalRequest(ctx context.Context, requester domain.
 	}
 	var roleRealm uuid.UUID
 	if err := s.Pool.QueryRow(ctx, "SELECT realm_id FROM roles WHERE id=$1", roleID).Scan(&roleRealm); err != nil || roleRealm != requester.RealmID {
-		return domain.ApprovalRequest{}, errors.New("requested role is not in the user's realm")
+		return domain.ApprovalRequest{}, invalidf("요청한 Role이 이 사용자의 Realm에 없습니다.")
 	}
 	// A second request for a role already waiting on the same reviewer asks
 	// nothing new, and the reviewer sees the same row twice. Clicking again
@@ -481,7 +481,7 @@ func (s *Store) DecideApprovalRequest(ctx context.Context, requestID, reviewerID
 		return domain.ApprovalRequest{}, err
 	}
 	if request.Status != "PENDING" {
-		return domain.ApprovalRequest{}, ErrConflict
+		return domain.ApprovalRequest{}, conflictf("이미 결정된 요청입니다.")
 	}
 	// Nobody signs off on their own request. Administrators are exempt only
 	// because they can assign the role outright, so requiring a second party
@@ -490,11 +490,11 @@ func (s *Store) DecideApprovalRequest(ctx context.Context, requestID, reviewerID
 	// manager_id is written so that a pairing already sitting in an upgraded
 	// database cannot be cashed in.
 	if request.RequesterID == reviewerID && !platformAdmin && !realmAdmin {
-		return domain.ApprovalRequest{}, errors.New("a request cannot be decided by its requester")
+		return domain.ApprovalRequest{}, forbiddenf("요청한 본인은 그 요청을 결정할 수 없습니다.")
 	}
 	adminForRealm := realmAdmin && request.RealmID == adminRealmID
 	if !platformAdmin && !adminForRealm && (request.ReviewerID == nil || *request.ReviewerID != reviewerID) {
-		return domain.ApprovalRequest{}, errors.New("reviewer is not authorized for this request")
+		return domain.ApprovalRequest{}, forbiddenf("이 요청의 검토자로 지정되지 않았습니다.")
 	}
 	// A designated reviewer still has to belong to the realm the request was
 	// raised in; the check above compares identifiers, not standing.
@@ -504,7 +504,7 @@ func (s *Store) DecideApprovalRequest(ctx context.Context, requestID, reviewerID
 			return domain.ApprovalRequest{}, err
 		}
 		if reviewerRealm != request.RealmID {
-			return domain.ApprovalRequest{}, errors.New("reviewer belongs to a different realm")
+			return domain.ApprovalRequest{}, forbiddenf("검토자가 이 요청과 다른 Realm에 속해 있습니다.")
 		}
 	}
 	status := "REJECTED"
@@ -529,7 +529,7 @@ func (s *Store) DecideApprovalRequest(ctx context.Context, requestID, reviewerID
 				return domain.ApprovalRequest{}, err
 			}
 			if !targetExists {
-				return domain.ApprovalRequest{}, errors.New("approval target is no longer valid")
+				return domain.ApprovalRequest{}, invalidf("요청 대상 사용자나 Role이 더 이상 존재하지 않습니다.")
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO user_roles(user_id,role_id)
                 VALUES($1,$2) ON CONFLICT DO NOTHING`, payload.UserID, payload.RoleID); err != nil {

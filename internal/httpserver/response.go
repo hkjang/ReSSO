@@ -38,6 +38,12 @@ func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 			message = messaged.Message
 		}
 		writeError(w, r, http.StatusBadRequest, "invalid_input", message)
+	case errors.Is(err, store.ErrForbidden):
+		message := "이 작업을 수행할 권한이 없습니다."
+		if explained {
+			message = messaged.Message
+		}
+		writeError(w, r, http.StatusForbidden, "insufficient_permission", message)
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, r, http.StatusNotFound, "not_found", "요청한 항목을 찾을 수 없습니다.")
 	case errors.Is(err, store.ErrConflict):

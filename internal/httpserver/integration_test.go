@@ -6042,3 +6042,169 @@ func TestIntegrationAnOrdinaryAccountCannotMintAnAdminKey(t *testing.T) {
 			"every relying party of the Realm over REST and over MCP", status)
 	}
 }
+
+// Deciding an approval can be refused for several different reasons, and each
+// one meant something different to the person refused. Neither handler said
+// which.
+//
+// The personal one answered 403 with whatever the store's error happened to
+// say: "conflict" for a request already decided, "not found" for one that does
+// not exist, and — since nothing filtered it — a database failure in its own
+// words, which is what writeStoreError exists to keep out of a response. The
+// administrator's one went the other way: it used that mapping, which knew
+// nothing about a refusal, so an administrator of another Realm being told no
+// came back as 500 and this service saying it had failed.
+//
+// The approval that succeeds runs in the middle, so none of this can pass by
+// refusing everything.
+func TestIntegrationEachApprovalRefusalSaysWhatItIs(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmID := bootstrap.RealmID
+	if _, err := data.Pool.Exec(ctx, "UPDATE realms SET approval_enabled=true WHERE id=$1", realmID); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "manager", Password: "manager-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "requester", Password: "requester-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		"UPDATE users SET manager_id=$2 WHERE id=$1", requester.ID, manager.ID); err != nil {
+		t.Fatal(err)
+	}
+	wanted, err := data.CreateRole(ctx, realmID, "auditor", "reads the trail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	as := func(who, secret, path, body string) (int, string) {
+		t.Helper()
+		cookies, csrf := signInForBoundaryProbe(t, server, who, secret)
+		request, err := http.NewRequest(http.MethodPost, server.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		answer, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		var refusal struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+			ID      string `json:"id"`
+		}
+		_ = json.Unmarshal(answer, &refusal)
+		if refusal.ID != "" {
+			return response.StatusCode, refusal.ID
+		}
+		return response.StatusCode, refusal.Error + ":" + refusal.Message
+	}
+	ask := fmt.Sprintf(`{"role_id":%q,"reason":"needed for the audit"}`, wanted.ID)
+	const approve = `{"decision":"approve","note":"fine"}`
+
+	status, requestID := as("requester", "requester-password-1234", "/api/v1/me/requests", ask)
+	if status != http.StatusCreated {
+		t.Fatalf("raising a request answered %d %s", status, requestID)
+	}
+	decision := "/api/v1/me/reviews/" + requestID + "/decision"
+
+	check := func(what string, status int, answer string, wantStatus int, wantCode string) {
+		t.Helper()
+		if status != wantStatus || !strings.HasPrefix(answer, wantCode+":") {
+			t.Errorf("%s answered %d %q, want %d and %s with a sentence for the reader",
+				what, status, answer, wantStatus, wantCode)
+		}
+		if parts := strings.SplitN(answer, ":", 2); len(parts) == 2 && strings.TrimSpace(parts[1]) == "" {
+			t.Errorf("%s answered %s with no sentence at all", what, wantCode)
+		}
+	}
+	status, answer := as("requester", "requester-password-1234", "/api/v1/me/requests", ask)
+	check("asking for the same Role twice", status, answer, http.StatusConflict, "conflict")
+	status, answer = as("requester", "requester-password-1234", decision, approve)
+	check("deciding one's own request", status, answer, http.StatusForbidden, "insufficient_permission")
+
+	// The one that works, in the middle: without it every line here would pass
+	// on a service that refuses everything.
+	if status, answer = as("manager", "manager-password-1234", decision, approve); status != http.StatusOK {
+		t.Fatalf("the manager approving answered %d %s", status, answer)
+	}
+
+	status, answer = as("manager", "manager-password-1234", decision, approve)
+	check("deciding it again", status, answer, http.StatusConflict, "conflict")
+	status, answer = as("manager", "manager-password-1234",
+		"/api/v1/me/reviews/00000000-0000-0000-0000-0000000000ff/decision", approve)
+	check("deciding a request that does not exist", status, answer, http.StatusNotFound, "not_found")
+
+	// And the administrator's path, where a refusal used to be reported as
+	// this service failing.
+	theirs, err := data.CreateRealm(ctx, store.CreateRealmInput{
+		Name: "elsewhere", DisplayName: "Elsewhere", IssuerURL: "http://localhost:8080/realms/elsewhere"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := data.CreateUser(ctx, theirs.ID, store.CreateUserInput{
+		Username: "other-admin", Password: "other-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO user_roles(user_id,role_id)
+        SELECT $1,id FROM roles WHERE realm_id=$2 AND name='realm-admin'`, other.ID, theirs.ID); err != nil {
+		t.Fatal(err)
+	}
+	pendingStatus, pendingID := as("requester", "requester-password-1234", "/api/v1/me/requests", ask)
+	if pendingStatus != http.StatusCreated {
+		t.Fatalf("raising a second request answered %d %s", pendingStatus, pendingID)
+	}
+	signIn, err := server.Client().Post(server.URL+"/api/v1/auth/login", "application/json",
+		strings.NewReader(`{"realm":"elsewhere","username":"other-admin","password":"other-password-1234","request":""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(signIn.Body)
+	_ = signIn.Body.Close()
+	var session struct {
+		CSRF string `json:"csrf_token"`
+	}
+	if err := json.Unmarshal(raw, &session); err != nil || signIn.StatusCode != http.StatusOK {
+		t.Fatalf("signing in elsewhere answered %d %s", signIn.StatusCode, raw)
+	}
+	request, err := http.NewRequest(http.MethodPost,
+		server.URL+"/api/admin/v1/approvals/"+pendingID+"/decision", strings.NewReader(approve))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-CSRF-Token", session.CSRF)
+	for _, cookie := range signIn.Cookies() {
+		request.AddCookie(cookie)
+	}
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Errorf("an administrator of another Realm being refused answered %d %.90s, want %d: a refusal "+
+			"is not this service failing", response.StatusCode, body, http.StatusForbidden)
+	}
+}

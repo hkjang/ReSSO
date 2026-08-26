@@ -394,11 +394,14 @@ func (s *Server) createMyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	request, err := s.store.CreateRoleApprovalRequest(r.Context(), user, input.RoleID, input.Reason)
 	if err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, r, http.StatusNotFound, "approval_disabled", "이 Realm에는 검토·승인 절차가 설정되어 있지 않습니다.")
-		} else {
-			writeError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
+			return
 		}
+		// Everything else goes through the one mapping, so a refusal keeps its
+		// own status and no failure of this service reaches the reader in its
+		// own words.
+		writeStoreError(w, r, err)
 		return
 	}
 	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "APPROVAL_REQUEST_CREATE", "SUCCESS", "approval", request.ID.String(), nil)
@@ -435,7 +438,7 @@ func (s *Server) decideMyReview(w http.ResponseWriter, r *http.Request) {
 	request, err := s.store.DecideApprovalRequest(r.Context(), requestID, principal.UserID,
 		principal.PlatformAdmin, false, uuid.Nil, input.Decision == "approve", input.Note)
 	if err != nil {
-		writeError(w, r, http.StatusForbidden, "decision_failed", err.Error())
+		writeStoreError(w, r, err)
 		return
 	}
 	s.audit(r, &request.RealmID, &principal.UserID, principal.Username, "TEAM_LEAD_APPROVAL_DECISION", "SUCCESS",

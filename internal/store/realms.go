@@ -20,6 +20,12 @@ var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
 var ErrInvalidInput = errors.New("invalid input")
 
+// ErrForbidden is a refusal the caller could have avoided by being somebody
+// else: the right shape of request, made by the wrong person. It is separate
+// from ErrInvalidInput because the caller cannot fix it by changing what they
+// sent, and separate from an unexpected failure because nothing went wrong.
+var ErrForbidden = errors.New("forbidden")
+
 // MessagedError carries a sentence written for the person who will read it,
 // alongside the sentinel that decides the status code.
 //
@@ -42,6 +48,11 @@ func (e *MessagedError) Unwrap() error { return e.Sentinel }
 // conflictf reports that a value is already taken, in words.
 func conflictf(format string, arguments ...any) error {
 	return &MessagedError{Sentinel: ErrConflict, Message: fmt.Sprintf(format, arguments...)}
+}
+
+// forbiddenf reports a refusal in words the person refused can read.
+func forbiddenf(format string, arguments ...any) error {
+	return &MessagedError{Sentinel: ErrForbidden, Message: fmt.Sprintf(format, arguments...)}
 }
 
 // invalidf reports a value that cannot be stored, in words.
