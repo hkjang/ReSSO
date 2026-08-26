@@ -6015,17 +6015,19 @@ func TestIntegrationOnlyTheReviewerOrTheRealmsOwnAdminCanDecide(t *testing.T) {
 	}
 }
 
-// Ending someone's sessions everywhere selects refresh tokens by user_id, and
-// the rollback after a failed refresh asks whether a token has a successor by
-// parent_id. Neither column was indexed, so both read the whole table — the one
-// that grows with every token ever issued — and the first of them is the
-// emergency stop: an administrator disabling an account, a password changed
-// because someone believes it is known, a directory sync deactivating a batch.
+// Three queries that have to stay quick as a deployment gets busy, each of
+// which used to read a whole table: ending someone's sessions everywhere
+// (refresh tokens by user_id), the rollback after a failed refresh (by
+// parent_id), and the console's session screen (a Realm's sessions, newest
+// first). The first is the emergency stop — an administrator disabling an
+// account, a password changed because someone believes it is known, a
+// directory sync deactivating a batch — and the last is the screen an
+// administrator opens during an incident.
 //
 // The plan is asked rather than the index list. An index that exists and is
 // never chosen would satisfy a check for its name while the scan it was added
 // to prevent goes on happening.
-func TestIntegrationEndingSessionsDoesNotReadEveryRefreshToken(t *testing.T) {
+func TestIntegrationHotPathsDoNotReadWholeTables(t *testing.T) {
 	data := openIntegrationStore(t, integrationSealer(t))
 	ctx := context.Background()
 	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
@@ -6067,6 +6069,21 @@ func TestIntegrationEndingSessionsDoesNotReadEveryRefreshToken(t *testing.T) {
 		"SELECT id FROM users WHERE realm_id=$1 AND username='sweep-7'", realm.ID).Scan(&sweptUser); err != nil {
 		t.Fatal(err)
 	}
+	// The console's session screen asks for a Realm's sessions, newest use
+	// first, and keeps five hundred. Without an index on that pair it read
+	// every session in the Realm and sorted them to keep five hundred, which
+	// is the screen an administrator opens during an incident.
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO sso_sessions(id,realm_id,user_id,token_hash,csrf_hash,expires_at,last_access)
+        SELECT gen_random_uuid(), $1, u.id, sha256(('s'||g)::bytea), sha256(('c'||g)::bytea),
+               now()+interval '1 day', now()-(g||' seconds')::interval
+        FROM generate_series(1,10000) g
+        JOIN LATERAL (SELECT id FROM users WHERE realm_id=$1 AND username='sweep-'||((g % 500)+1)) u ON true`,
+		realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, "ANALYZE sso_sessions"); err != nil {
+		t.Fatal(err)
+	}
 	for _, probe := range []struct {
 		name, query string
 		argument    any
@@ -6076,6 +6093,9 @@ func TestIntegrationEndingSessionsDoesNotReadEveryRefreshToken(t *testing.T) {
 			[]uuid.UUID{sweptUser}},
 		{"asking whether a token has a successor",
 			`SELECT 1 FROM refresh_tokens c WHERE c.parent_id=$1`, sweptUser},
+		{"listing a Realm's sessions for the console",
+			`SELECT s.id FROM sso_sessions s JOIN users u ON u.id=s.user_id
+             WHERE ($1::uuid IS NULL OR s.realm_id=$1) ORDER BY s.last_access DESC LIMIT 500`, realm.ID},
 	} {
 		rows, err := data.Pool.Query(ctx, "EXPLAIN "+probe.query, probe.argument)
 		if err != nil {
@@ -6094,8 +6114,10 @@ func TestIntegrationEndingSessionsDoesNotReadEveryRefreshToken(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(plan, "Seq Scan on refresh_tokens") {
-			t.Errorf("%s reads every refresh token in the deployment:\n%s", probe.name, plan)
+		for _, table := range []string{"refresh_tokens", "sso_sessions"} {
+			if strings.Contains(plan, "Seq Scan on "+table) {
+				t.Errorf("%s reads every row of %s in the deployment:\n%s", probe.name, table, plan)
+			}
 		}
 	}
 }
