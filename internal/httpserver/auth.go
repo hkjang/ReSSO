@@ -252,7 +252,14 @@ func (s *Server) browserLogout(w http.ResponseWriter, r *http.Request) {
 	s.clearBrowserCookies(w, r)
 	s.audit(r, &session.User.RealmID, &session.User.ID, session.User.Username, "LOGOUT",
 		partialIfNot(ended), "session", session.Session.ID.String(), detail)
-	w.WriteHeader(http.StatusNoContent)
+	// Ending a session from the sessions list says when its refresh tokens
+	// outlived it; logging out ran the same code and answered 204 either way.
+	// That is the reading where it matters most: logging out is the deliberate
+	// "end all of it", and the person is walking away from the screen. The
+	// trail recorded LOGOUT result=PARTIAL, so the service knew and only the
+	// person did not.
+	writeSessionEnded(w, ended,
+		"로그아웃했지만 이 세션의 Refresh Token을 폐기하지 못했습니다. 연동 애플리케이션에서 계속 사용될 수 있습니다.")
 }
 
 // writeLoginError answers an attempt that could not be completed and counts it.

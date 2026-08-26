@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useToast } from '../components/toast-context'
 import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { api } from './api'
 import { AuthContext } from './auth-context'
@@ -35,10 +36,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     forgetIdentity(queryClient)
   }), [queryClient])
 
+  const { notify } = useToast()
   const logout = async () => {
     signingOut.current = true
     try {
-      await api<void>('/api/v1/auth/logout', { method: 'POST' })
+      // Ending a session can leave its refresh tokens live, and the sessions
+      // screens already say so. Logging out is where it matters most - it is
+      // the deliberate "end all of it" - and it is the one place the person is
+      // walking away, so the toast provider sits above this and carries it to
+      // the sign-in screen.
+      const result = await api<{ refresh_tokens_revoked?: boolean; message?: string } | undefined>(
+        '/api/v1/auth/logout', { method: 'POST' })
+      if (result?.refresh_tokens_revoked === false) {
+        notify(result.message ?? '로그아웃했지만 Refresh Token을 폐기하지 못했습니다.', 'warning')
+      }
     } finally {
       setSessionExpired(false)
       forgetIdentity(queryClient)

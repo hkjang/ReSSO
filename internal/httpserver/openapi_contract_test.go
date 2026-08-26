@@ -244,6 +244,7 @@ func TestPartialOutcomesAreDeclaredWhereTheyCanHappen(t *testing.T) {
 	for _, partial := range []struct{ path, method string }{
 		{"/api/v1/me/password", "put"},
 		{"/api/admin/v1/realms/{realmID}/users/{userID}/password", "put"},
+		{"/api/v1/auth/logout", "post"},
 		{"/api/v1/me/sessions/{id}", "delete"},
 		{"/api/admin/v1/realms/{realmID}/sessions/{sessionID}", "delete"},
 		{"/api/admin/v1/realms/{realmID}/user-federations/{federationID}", "put"},

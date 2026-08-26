@@ -7024,3 +7024,80 @@ func TestIntegrationNoRefusalDescribesTheDatabase(t *testing.T) {
 	}
 	_ = leaks
 }
+
+// Ending a session and logging out run the same code and can fall short the
+// same way: the session row is revoked while the refresh tokens issued from it
+// stay live, so the relying parties keep going. Ending a session from either
+// sessions screen says so. Logging out answered 204 whether or not it had
+// worked - and it is the deliberate "end all of it", done by someone who is
+// walking away from the screen. The trail recorded LOGOUT result=PARTIAL, so
+// the service knew; only the person did not.
+func TestIntegrationLoggingOutSaysWhenTheTokensOutliveIt(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	call := func(method, path string, cookies []*http.Cookie, csrf string) (int, string) {
+		t.Helper()
+		request, reqErr := http.NewRequest(method, server.URL+path, nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		raw, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode, string(raw)
+	}
+
+	// Ending a session revokes its refresh tokens in a second statement. Take
+	// that statement away and the session still ends while the tokens live on -
+	// the exact shortfall both endpoints are built to report.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE refresh_tokens RENAME TO refresh_tokens_gone"); err != nil {
+		t.Fatal(err)
+	}
+
+	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+	var sessionID string
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT id::text FROM sso_sessions WHERE revoked_at IS NULL ORDER BY created_at DESC LIMIT 1`).
+		Scan(&sessionID); err != nil {
+		t.Fatal(err)
+	}
+	// What the sessions screen already says, which is the bar for the answer
+	// below rather than a sentence written here.
+	status, listAnswer := call(http.MethodDelete, "/api/v1/me/sessions/"+sessionID, cookies, csrf)
+	if status != http.StatusOK || !strings.Contains(listAnswer, `"refresh_tokens_revoked":false`) {
+		t.Fatalf("ending a session no longer reports the shortfall, so there is nothing to match: %d %s",
+			status, listAnswer)
+	}
+
+	cookies, csrf = signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+	status, logoutAnswer := call(http.MethodPost, "/api/v1/auth/logout", cookies, csrf)
+
+	// The trail knew, which is what makes the silence worth calling a defect
+	// rather than a case nobody could have reported.
+	var partial int
+	if err := data.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE event_type='LOGOUT' AND result='PARTIAL'`).Scan(&partial); err != nil {
+		t.Fatal(err)
+	}
+	if partial == 0 {
+		t.Fatal("logging out did not fall short at all, so this checked nothing")
+	}
+	if status == http.StatusNoContent || !strings.Contains(logoutAnswer, `"refresh_tokens_revoked":false`) {
+		t.Errorf("logging out left the refresh tokens live and answered %d %q, which reads exactly "+
+			"like a logout that finished", status, logoutAnswer)
+	}
+}
