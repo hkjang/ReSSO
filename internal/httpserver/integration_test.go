@@ -7271,3 +7271,108 @@ func TestProbeMCPToolsDoNotReturnSecrets(t *testing.T) {
 		t.Logf("%-24s len=%-6d leaked=%v", call.what, len(body), hits)
 	}
 }
+
+// These headers are the console's defences against being framed, against a
+// response being sniffed into something executable, and against a script the
+// page did not ship. They are set once in the common middleware and reach
+// every response through it - and nothing checked that, so moving where they
+// are set, or a route tree that does not pass through it, would be silent.
+//
+// Presence is not the property worth holding either. A policy that keeps its
+// name while losing frame-ancestors, or gains unsafe-eval, passes any check
+// that only asks whether the header is there. So the walk covers every route
+// the router knows and the directives are named.
+func TestIntegrationEveryAnswerCarriesTheSecurityHeaders(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	router, _ := handler.(*chi.Mux)
+	type probe struct{ method, route string }
+	var probes []probe
+	if err := chi.Walk(router, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		probes = append(probes, probe{method, route})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	required := []string{"X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy",
+		"Content-Security-Policy", "X-Request-ID"}
+	missing := map[string]int{}
+	statuses := map[int]int{}
+	for _, p := range probes {
+		// A path template needs something in place of its parameters; whatever
+		// the answer is, the headers are not conditional on it.
+		path := strings.NewReplacer("{realmID}", "00000000-0000-0000-0000-000000000000",
+			"{userID}", "00000000-0000-0000-0000-000000000000",
+			"{sessionID}", "00000000-0000-0000-0000-000000000000",
+			"{id}", "00000000-0000-0000-0000-000000000000",
+			"{token}", "x", "{realm}", "master", "*", "index.html").Replace(p.route)
+		if strings.Contains(path, "{") {
+			path = strings.NewReplacer("{", "", "}", "").Replace(path)
+		}
+		request, err := http.NewRequest(p.method, server.URL+path, strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		statuses[response.StatusCode]++
+		for _, header := range required {
+			if response.Header.Get(header) == "" {
+				missing[header+" on "+p.method+" "+p.route]++
+			}
+		}
+	}
+	if len(probes) < 20 {
+		t.Fatalf("only %d routes were walked, so this is not covering the service", len(probes))
+	}
+	if statuses[http.StatusOK] == 0 {
+		t.Fatal("no route answered 200, so the headers were only checked on refusals")
+	}
+	for what := range missing {
+		t.Errorf("missing %s", what)
+	}
+
+	// Presence is not the property worth holding. A policy that keeps its name
+	// while losing frame-ancestors, or gains unsafe-eval, passes any check that
+	// only asks whether the header is there.
+	response, err := client.Get(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	policy := response.Header.Get("Content-Security-Policy")
+	for _, directive := range []string{
+		"default-src 'self'", "frame-ancestors 'none'", "form-action 'self'", "base-uri 'self'",
+	} {
+		if !strings.Contains(policy, directive) {
+			t.Errorf("the content security policy no longer carries %q: %s", directive, policy)
+		}
+	}
+	// script-src is left to default-src on purpose, so neither may appear.
+	for _, loosened := range []string{"unsafe-eval", "script-src"} {
+		if strings.Contains(policy, loosened) {
+			t.Errorf("the content security policy now carries %q: %s", loosened, policy)
+		}
+	}
+	if got := response.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q", got)
+	}
+	if got := response.Header.Get("Referrer-Policy"); got != "no-referrer" {
+		t.Errorf("Referrer-Policy = %q", got)
+	}
+}
