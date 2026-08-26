@@ -5977,3 +5977,68 @@ func TestIntegrationACodeIsRefusedAfterWhatItStandsForIsTakenAway(t *testing.T) 
 		}
 	}
 }
+
+// A personal API key carries scopes, and admin:read is the one that reads the
+// whole directory — every account and every relying party of a Realm, over
+// REST and over MCP. Whether the person asking is entitled to it is decided by
+// one flag at the moment the key is made, and nothing checked it: inverted or
+// dropped, anybody could mint themselves a key that reads everything, and the
+// suite would go on passing.
+//
+// The administrator asking for the same scope has to succeed, or the refusal
+// above would only mean that nobody can make keys at all. And an ordinary
+// account has to keep getting the scopes it is entitled to, or it would only
+// mean that the endpoint is broken.
+func TestIntegrationAnOrdinaryAccountCannotMintAnAdminKey(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "ordinary", Password: "ordinary-password-1234", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	ask := func(who, secret, body string) int {
+		t.Helper()
+		cookies, csrf := signInForBoundaryProbe(t, server, who, secret)
+		request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/me/api-keys",
+			strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+	const (
+		adminScope    = `{"name":"probe","scopes":["admin:read"],"expires_days":30}`
+		ordinaryScope = `{"name":"probe","scopes":["api:read","mcp:read"],"expires_days":30}`
+	)
+	if status := ask("admin", "bootstrap-password-123", adminScope); status != http.StatusCreated {
+		t.Fatalf("an administrator asking for admin:read answered %d, so the refusal below would only "+
+			"mean that nobody can make keys", status)
+	}
+	if status := ask("ordinary", "ordinary-password-1234", ordinaryScope); status != http.StatusCreated {
+		t.Fatalf("an ordinary account asking for the scopes it is entitled to answered %d, so the "+
+			"refusal below would only mean the endpoint is broken", status)
+	}
+	if status := ask("ordinary", "ordinary-password-1234", adminScope); status != http.StatusBadRequest {
+		t.Errorf("an ordinary account minted a key with admin:read (%d), which reads every account and "+
+			"every relying party of the Realm over REST and over MCP", status)
+	}
+}
