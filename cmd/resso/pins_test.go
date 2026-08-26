@@ -133,3 +133,49 @@ func TestToolchainPinsAgreeAcrossTheBuild(t *testing.T) {
 		}
 	}
 }
+
+// The compose files name the image an operator runs, and the release script
+// saves the archive as resso:<the version it built>. When the two disagree,
+// the documented offline install does the one thing an offline install cannot
+// do: docker finds no such tag locally and goes to the network for it. The
+// maintenance file is worse - it is what someone locked out of the console is
+// told to run, so it fails at the moment there is no other way in.
+//
+// Naming the newest release is what keeps a freshly loaded archive runnable by
+// the recipe in the README. Pinning it by hand is how it drifted: both files
+// sat on the version they were written for while nine releases went by.
+func TestComposeFilesRunTheReleaseThisTreeDescribes(t *testing.T) {
+	root := filepath.Join("..", "..")
+	changelog, err := os.ReadFile(filepath.Join(root, "CHANGELOG.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newest := regexp.MustCompile(`(?m)^## (v[\d.]+)\s*$`).FindStringSubmatch(string(changelog))
+	if newest == nil {
+		t.Fatal("no released version was found in the changelog, so nothing is being compared")
+	}
+	for _, name := range []string{"compose.offline.yaml", "compose.maintenance.yaml"} {
+		content, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		images := regexp.MustCompile(`(?m)^\s+image:\s*(\S+)`).FindAllStringSubmatch(string(content), -1)
+		if len(images) == 0 {
+			t.Errorf("%s names no image", name)
+			continue
+		}
+		for _, image := range images {
+			// Either the tag itself or the default of the variable standing in
+			// for it: resso:${RESSO_VERSION:-vX.Y.Z}.
+			tag := image[1]
+			if fallback := regexp.MustCompile(`\$\{[A-Z_]+:-([^}]+)\}`).FindStringSubmatch(tag); fallback != nil {
+				tag = strings.Replace(tag, fallback[0], fallback[1], 1)
+			}
+			if want := "resso:" + newest[1]; tag != want {
+				t.Errorf("%s runs %s, but this tree describes %s: an archive loaded from the "+
+					"release is tagged %s, so the documented recipe finds no such image and "+
+					"reaches for the network", name, image[1], newest[1], want)
+			}
+		}
+	}
+}
