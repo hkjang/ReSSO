@@ -5777,6 +5777,12 @@ func TestIntegrationEveryListingAnswersWithAListEvenWhenEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The personal listing of requestable Roles answers 404 where approvals are
+	// off, and a route that is skipped proves nothing. The signed-in account
+	// lives in the bootstrap Realm, so that is the one to turn them on for.
+	if _, err := data.Pool.Exec(ctx, "UPDATE realms SET approval_enabled=true WHERE name='master'"); err != nil {
+		t.Fatal(err)
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	handler := New(data, logger, nil, nil).Handler()
 	server := httptest.NewServer(handler)
@@ -5789,7 +5795,11 @@ func TestIntegrationEveryListingAnswersWithAListEvenWhenEmpty(t *testing.T) {
 	// here rather than inside a callback whose return value steers the walk.
 	listings := make([]string, 0)
 	walkErr := chi.Walk(handler.(*chi.Mux), func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
-		if method != http.MethodGet || !strings.HasPrefix(route, "/api/admin/") {
+		// The console's own screens read these the same way, and the personal
+		// ones were outside this walk: a listing under /api/v1/me answering
+		// items:null would have gone unnoticed here.
+		if method != http.MethodGet ||
+			!(strings.HasPrefix(route, "/api/admin/") || strings.HasPrefix(route, "/api/v1/me/")) {
 			return nil
 		}
 		// The collection reads only. A route naming a sub-resource needs a real
@@ -5802,7 +5812,7 @@ func TestIntegrationEveryListingAnswersWithAListEvenWhenEmpty(t *testing.T) {
 	if walkErr != nil {
 		t.Fatal(walkErr)
 	}
-	checked := 0
+	checked := map[string]int{}
 	for _, route := range listings {
 		request, err := http.NewRequest(http.MethodGet,
 			server.URL+realmParam.ReplaceAllString(route, empty.ID.String()), nil)
@@ -5830,16 +5840,26 @@ func TestIntegrationEveryListingAnswersWithAListEvenWhenEmpty(t *testing.T) {
 		if !carries {
 			continue
 		}
-		checked++
+		family := "administration"
+		if strings.HasPrefix(route, "/api/v1/me/") {
+			family = "personal"
+		}
+		checked[family]++
 		if string(items) == "null" {
 			t.Errorf("%s answered items:null on a Realm with nothing in it, which the console reads "+
 				"into .length and does not survive", route)
 		}
 	}
-	if checked == 0 {
-		t.Fatal("no listing was reached, so nothing is being checked")
+	// Counted per family rather than in total: the administration listings
+	// alone would carry a total past zero while every personal one was skipped
+	// for a 404, which is the state this walk was in before.
+	for _, family := range []string{"administration", "personal"} {
+		if checked[family] == 0 {
+			t.Fatalf("no %s listing was reached, so that half is not being checked", family)
+		}
 	}
-	t.Logf("%d listings answer with a list when empty", checked)
+	t.Logf("listings answering with a list: %d administration, %d personal",
+		checked["administration"], checked["personal"])
 }
 
 // realm_access.roles is a list every relying party reads, and one that asks
