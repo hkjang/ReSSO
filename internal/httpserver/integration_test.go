@@ -5454,3 +5454,87 @@ func TestIntegrationAValueTooLongIsTheCallersFaultNotAFailure(t *testing.T) {
 		}
 	}
 }
+
+// This service records who did what by name, and the console asks an
+// administrator to pick people, Roles and Clients by name. A name that does
+// not look like what it is takes both of those apart.
+//
+// Unicode gives more than one way to write the same letter, so an account
+// whose e-acute is a letter plus a combining mark used to be a different row
+// from one where it is a single rune — two accounts identical everywhere a
+// person reads them. And a name could carry characters that are not rendered
+// at all: a zero-width joiner inside "admin" shows as "admin", a right-to-left
+// override turns the rest of a name backwards, and a newline forges a line in
+// any log that writes one per line.
+func TestIntegrationANameCannotLookLikeSomethingItIsNot(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+
+	post := func(path, body string) int {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodPost,
+			fmt.Sprintf("%s/api/admin/v1/realms/%s%s", server.URL, bootstrap.RealmID, path),
+			strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+	user := func(username string) string {
+		return fmt.Sprintf(`{"username":%q,"password":"a-long-password-1234","enabled":true}`, username)
+	}
+
+	// Written as escapes: the point of these characters is that they are not
+	// visible, which would make the source of this test unreadable.
+	const (
+		joiner   = "\u200d" // zero-width joiner, rendered as nothing at all
+		override = "\u202e" // right-to-left override, renders the rest backwards
+	)
+	for _, refused := range []struct{ what, path, body string }{
+		{"a username with a newline", "/users", user("new\nline")},
+		{"a username with a zero-width joiner", "/users", user("ad" + joiner + "min")},
+		{"a username with a right-to-left override", "/users", user("ali" + override + "ce")},
+		{"a display name with a zero-width joiner", "/users",
+			fmt.Sprintf(`{"username":"plain","password":"a-long-password-1234","display_name":%q,"enabled":true}`,
+				"ad"+joiner+"min")},
+		{"a Role name with a zero-width joiner", "/roles",
+			fmt.Sprintf(`{"name":%q,"description":""}`, "ad"+joiner+"min")},
+		{"a client_id with a right-to-left override", "/clients",
+			fmt.Sprintf(`{"client_id":%q,"name":"Probe","type":"public","redirect_uris":["https://a.test/cb"],`+
+				`"grant_types":["authorization_code"],"default_scopes":["openid"]}`, "rp"+override+"one")},
+	} {
+		if status := post(refused.path, refused.body); status != http.StatusBadRequest {
+			t.Errorf("%s answered %d, want %d: it would be stored and shown as something else",
+				refused.what, status, http.StatusBadRequest)
+		}
+	}
+
+	// The two spellings of the same letter are the same name, so the second is
+	// a name already taken rather than a new account that looks identical.
+	if status := post("/users", user("caf\u00e9")); status != http.StatusCreated {
+		t.Fatalf("the composed spelling was refused: %d", status)
+	}
+	if status := post("/users", user("cafe\u0301")); status != http.StatusConflict {
+		t.Errorf("the decomposed spelling answered %d, want %d: it is the same name and used to become "+
+			"a second account nobody could tell apart", status, http.StatusConflict)
+	}
+}

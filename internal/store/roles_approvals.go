@@ -51,13 +51,16 @@ func (s *Store) ListRoles(ctx context.Context, realmID uuid.UUID) ([]Role, error
 }
 
 func (s *Store) CreateRole(ctx context.Context, realmID uuid.UUID, name, description string) (Role, error) {
-	name = strings.TrimSpace(name)
+	name, err := displayableName("Role 이름", name)
+	if err != nil {
+		return Role{}, err
+	}
 	if name == "" {
 		return Role{}, invalidf("Role 이름이 필요합니다.")
 	}
 	now := time.Now().UTC()
 	role := Role{ID: uuid.New(), RealmID: realmID, Name: name, Description: strings.TrimSpace(description), CreatedAt: now, UpdatedAt: now}
-	_, err := s.Pool.Exec(ctx, `INSERT INTO roles(id,realm_id,name,description,created_at,updated_at)
+	_, err = s.Pool.Exec(ctx, `INSERT INTO roles(id,realm_id,name,description,created_at,updated_at)
         VALUES($1,$2,$3,$4,$5,$5)`, role.ID, role.RealmID, role.Name, role.Description, now)
 	if conflict, taken := conflictFromUnique(err); taken {
 		return Role{}, conflict
@@ -168,13 +171,16 @@ func nullableUUID(id uuid.UUID) *uuid.UUID {
 }
 
 func (s *Store) CreateClientRole(ctx context.Context, realmID, clientID uuid.UUID, name, description string) (ClientRole, error) {
-	name = strings.TrimSpace(name)
+	name, err := displayableName("Client Role 이름", name)
+	if err != nil {
+		return ClientRole{}, err
+	}
 	if name == "" {
 		return ClientRole{}, invalidf("Client Role 이름이 필요합니다.")
 	}
 	role := ClientRole{ID: uuid.New(), ClientID: clientID, Name: name,
 		Description: strings.TrimSpace(description), CreatedAt: time.Now().UTC()}
-	err := s.Pool.QueryRow(ctx, "SELECT client_id FROM clients WHERE id=$1 AND realm_id=$2", clientID, realmID).Scan(&role.ClientKey)
+	err = s.Pool.QueryRow(ctx, "SELECT client_id FROM clients WHERE id=$1 AND realm_id=$2", clientID, realmID).Scan(&role.ClientKey)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ClientRole{}, ErrNotFound
 	}

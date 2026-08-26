@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/hkjang/ReSSO/internal/domain"
 	"github.com/hkjang/ReSSO/internal/password"
@@ -170,13 +172,17 @@ func (s *Store) validateManagerID(ctx context.Context, userID, realmID uuid.UUID
 }
 
 func (s *Store) CreateUser(ctx context.Context, realmID uuid.UUID, input CreateUserInput) (domain.User, error) {
-	input.Username = strings.TrimSpace(input.Username)
 	var err error
+	if input.Username, err = displayableName("사용자 이름", input.Username); err != nil {
+		return domain.User{}, err
+	}
 	input.Email, err = normalizeOptionalEmail(input.Email)
 	if err != nil {
 		return domain.User{}, err
 	}
-	input.DisplayName = strings.TrimSpace(input.DisplayName)
+	if input.DisplayName, err = displayableName("표시 이름", input.DisplayName); err != nil {
+		return domain.User{}, err
+	}
 	if input.Username == "" || input.Password == "" {
 		return domain.User{}, invalidf("사용자 이름과 비밀번호가 필요합니다.")
 	}
@@ -627,4 +633,35 @@ func (s *Store) UserHasRealmRole(ctx context.Context, userID uuid.UUID, name str
 	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_roles ur
 		JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1 AND r.name=$2)`, userID, name).Scan(&assigned)
 	return assigned, err
+}
+
+// displayableName is the form of a name that can be stored, or the reason it
+// cannot be.
+//
+// Two things are settled here, and both are about a name being the same thing
+// to a person as it is to this service.
+//
+// Composed to one spelling, because Unicode has more than one way to write the
+// same letter: an e-acute can be a single rune or an e followed by a combining
+// mark, and those are different rows behind an index that is supposed to make
+// a name unique. Two accounts could exist that are identical everywhere anyone
+// reads them — the console, the audit trail, and every relying party that
+// shows a username.
+//
+// Control and format characters are refused outright. A right-to-left override
+// renders the rest of a name backwards, a zero-width joiner is not rendered at
+// all, and a newline in a name forges a line in any log that writes one per
+// line. This service records who did what by name, so a name that does not
+// look like what it is takes that record apart.
+func displayableName(what, raw string) (string, error) {
+	name := norm.NFC.String(strings.TrimSpace(raw))
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return "", invalidf("%s에 줄바꿈이나 제어 문자를 쓸 수 없습니다.", what)
+		}
+		if unicode.Is(unicode.Cf, r) {
+			return "", invalidf("%s에 보이지 않는 서식 문자를 쓸 수 없습니다. 화면에 보이는 것과 저장되는 것이 달라집니다.", what)
+		}
+	}
+	return name, nil
 }

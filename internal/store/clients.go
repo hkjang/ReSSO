@@ -163,7 +163,14 @@ func (s *Store) UpdateClient(ctx context.Context, id uuid.UUID, input UpdateClie
 }
 
 func (s *Store) CreateClient(ctx context.Context, realmID uuid.UUID, input CreateClientInput) (CreatedClient, error) {
-	input.ClientID, input.Name, input.Type = strings.TrimSpace(input.ClientID), strings.TrimSpace(input.Name), strings.TrimSpace(input.Type)
+	var nameErr error
+	if input.ClientID, nameErr = displayableName("client_id", input.ClientID); nameErr != nil {
+		return CreatedClient{}, nameErr
+	}
+	if input.Name, nameErr = displayableName("Client 이름", input.Name); nameErr != nil {
+		return CreatedClient{}, nameErr
+	}
+	input.Type = strings.TrimSpace(input.Type)
 	if input.ClientID == "" || input.Name == "" || !slices.Contains([]string{"public", "confidential"}, input.Type) {
 		return CreatedClient{}, invalidf("client_id와 이름, 그리고 public 또는 confidential 유형이 필요합니다.")
 	}
