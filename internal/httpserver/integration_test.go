@@ -7376,3 +7376,122 @@ func TestIntegrationEveryAnswerCarriesTheSecurityHeaders(t *testing.T) {
 		t.Errorf("Referrer-Policy = %q", got)
 	}
 }
+
+// Introspection is deliberately open to every confidential Client of a Realm,
+// so they can all reach the token endpoint authenticated as themselves. What
+// keeps one from renewing another's refresh token is a single comparison in
+// the refresh grant, and nothing checked it: the ownership test next to this
+// one covers revocation and RP logout, not this exchange.
+//
+// The second half matters as much. The comparison happens before the rotation,
+// so a refused attempt does not spend the token. Checking ownership after
+// rotating would leave any Client of the Realm able to burn another's refresh
+// tokens on demand - refused every time, and the owner locked out all the
+// same. The grant already reasons this way about a disabled account, in the
+// same function.
+func TestIntegrationARefreshTokenIsOnlyItsOwnClientsToRenew(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "mine", Name: "Mine", Type: "confidential", RedirectURIs: []string{"https://mine.test/cb"},
+		GrantTypes: []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "theirs", Name: "Theirs", Type: "confidential", RedirectURIs: []string{"https://theirs.test/cb"},
+		GrantTypes: []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "cross-client-probe", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	browser := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	verifier := strings.Repeat("cross-client-verify", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	target := server.URL + "/realms/master/protocol/openid-connect/auth?response_type=code&client_id=mine" +
+		"&redirect_uri=" + url.QueryEscape("https://mine.test/cb") + "&scope=openid&state=s" +
+		"&code_challenge=" + challenge + "&code_challenge_method=S256"
+	request, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+	authResponse, err := browser.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = authResponse.Body.Close()
+	location, err := url.Parse(authResponse.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := location.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code was issued: %s", location)
+	}
+
+	tokenURL := server.URL + "/realms/master/protocol/openid-connect/token"
+	exchange := func(form url.Values, clientID, secret string) (int, string) {
+		t.Helper()
+		request, reqErr := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.SetBasicAuth(clientID, secret)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		raw, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode, string(raw)
+	}
+
+	status, body := exchange(url.Values{"grant_type": {"authorization_code"}, "code": {code},
+		"redirect_uri": {"https://mine.test/cb"}, "code_verifier": {verifier}}, "mine", mine.ClientSecret)
+	if status != http.StatusOK {
+		t.Fatalf("the owning client could not redeem its own code: %d %s", status, body)
+	}
+	var issued struct {
+		Refresh string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal([]byte(body), &issued); err != nil || issued.Refresh == "" {
+		t.Fatalf("no refresh token was issued: %s", body)
+	}
+
+	// Another Client of the same Realm, authenticating correctly as itself.
+	status, body = exchange(url.Values{"grant_type": {"refresh_token"},
+		"refresh_token": {issued.Refresh}}, "theirs", theirs.ClientSecret)
+	if status == http.StatusOK {
+		t.Errorf("another Client of the Realm renewed a refresh token it was never issued: %.120s", body)
+	}
+
+	// And the owner's token afterwards: a refused attempt must not spend it.
+	status, body = exchange(url.Values{"grant_type": {"refresh_token"},
+		"refresh_token": {issued.Refresh}}, "mine", mine.ClientSecret)
+	if status != http.StatusOK {
+		t.Errorf("the refused attempt spent the owner's refresh token, so any Client of the Realm "+
+			"can lock another out of renewing: %d %.120s", status, body)
+	}
+}
