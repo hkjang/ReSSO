@@ -364,8 +364,18 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 			// audit screen to look for it — where the actor column was blank
 			// and a search by account could never return it. The account is
 			// already loaded a few lines above.
+			detail := map[string]any(nil)
+			if errors.Is(err, store.ErrFamilyNotRevoked) {
+				// The detection is the entry an operator is sent to look for,
+				// and that the family survived it is the part they have to act
+				// on: the token whoever took it is holding still works.
+				detail = map[string]any{"family_revoked": false}
+				s.logger.Error("refresh token reuse detected but its family was not revoked",
+					"trace_id", traceIDFrom(r.Context()), "realm", realm.Name,
+					"client", client.ClientID, "error", err)
+			}
 			s.audit(r, &realm.ID, inspected.UserID, user.Username,
-				"REFRESH_TOKEN_REUSE", "FAILURE", "client", client.ClientID, nil)
+				"REFRESH_TOKEN_REUSE", "FAILURE", "client", client.ClientID, detail)
 		}
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token is invalid or was already used")
 		return

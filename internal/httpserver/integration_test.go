@@ -6413,3 +6413,151 @@ func TestIntegrationAClientActsOnlyOnWhatIsItsOwn(t *testing.T) {
 		}
 	}
 }
+
+// A refresh token presented after it was rotated is the strongest sign this
+// service has that one was taken, and revoking the family is the whole of the
+// response: it takes the working token away from whoever is holding it. The
+// outcome of that revocation was dropped, so it could fail to happen and
+// nobody would be told.
+//
+// Measured with the revocation refused: the caller got the same invalid_grant
+// an expired token gets, the trail got no REFRESH_TOKEN_REUSE entry at all —
+// the entry the operations guide sends an operator to look for — and the
+// family was still live. The detection is worth reporting even more when the
+// response did not land, because the token is still working.
+//
+// The ordinary case runs first, so this cannot pass on a service that has
+// stopped detecting reuse altogether.
+func TestIntegrationReuseIsRecordedEvenWhenTheFamilySurvivesIt(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmID := bootstrap.RealmID
+	if err := data.EnsureActiveSigningKey(ctx, realmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "reuse-rp", Name: "Reuse RP", Type: "public", RedirectURIs: []string{"https://r.test/cb"},
+		GrantTypes: []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "victim", Password: "victim-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realmID, user.ID, time.Hour, "127.0.0.1", "reuse-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, rp.Client, user, session.Session.ID,
+		[]string{"openid"}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	refresh := func(token string) int {
+		t.Helper()
+		response, err := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token",
+			url.Values{"grant_type": {"refresh_token"}, "refresh_token": {token}, "client_id": {"reuse-rp"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+	age := func() {
+		t.Helper()
+		if _, err := data.Pool.Exec(ctx,
+			"UPDATE refresh_tokens SET rotated_at=now()-interval '1 hour' WHERE rotated_at IS NOT NULL"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reuseEntries := func() []store.AuditRow {
+		t.Helper()
+		page, err := data.ListAudit(ctx, store.AuditFilter{
+			RealmID: &realmID, EventType: "REFRESH_TOKEN_REUSE", Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return page.Items
+	}
+
+	// The ordinary case: spend it, age the rotation past the grace, replay.
+	if status := refresh(tokens.RefreshToken); status != http.StatusOK {
+		t.Fatalf("the first refresh answered %d", status)
+	}
+	age()
+	if status := refresh(tokens.RefreshToken); status != http.StatusBadRequest {
+		t.Fatalf("replaying a rotated token answered %d, so nothing below is about reuse", status)
+	}
+	if entries := reuseEntries(); len(entries) != 1 {
+		t.Fatalf("an ordinary reuse left %d entries, want 1", len(entries))
+	}
+	var live int
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM refresh_tokens WHERE revoked_at IS NULL").Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live != 0 {
+		t.Fatalf("%d tokens of the family survived an ordinary reuse, so this test is not about what it "+
+			"says it is", live)
+	}
+
+	// And with the revocation refused, which is the case that used to vanish.
+	second, err := service.IssueUserTokens(ctx, realm, rp.Client, user, session.Session.ID,
+		[]string{"openid"}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := refresh(second.RefreshToken); status != http.StatusOK {
+		t.Fatalf("refreshing the second token answered %d", status)
+	}
+	age()
+	if _, err := data.Pool.Exec(ctx, `CREATE FUNCTION refuse_family_revoke() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.revoked_at IS NOT NULL AND OLD.revoked_at IS NULL THEN
+				RAISE EXCEPTION 'the test refuses this revocation';
+			END IF;
+			RETURN NEW;
+		END; $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `CREATE TRIGGER refuse_family BEFORE UPDATE ON refresh_tokens
+		FOR EACH ROW EXECUTE FUNCTION refuse_family_revoke()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = data.Pool.Exec(cleanupCtx, "DROP TRIGGER IF EXISTS refuse_family ON refresh_tokens")
+	})
+	refresh(second.RefreshToken)
+
+	entries := reuseEntries()
+	if len(entries) != 2 {
+		t.Fatalf("a reuse whose family could not be revoked left %d entries in total, want 2: the "+
+			"strongest signal this service has went unrecorded", len(entries))
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(entries[0].Detail, &detail); err != nil {
+		t.Fatalf("the newest entry carries no readable detail: %s", entries[0].Detail)
+	}
+	if revoked, said := detail["family_revoked"].(bool); !said || revoked {
+		t.Errorf("the entry does not say the family survived (%v), so whoever reads it believes the "+
+			"token was taken away when it still works", detail)
+	}
+}

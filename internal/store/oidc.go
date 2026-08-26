@@ -221,6 +221,12 @@ func (s *Store) CreateRefreshToken(ctx context.Context, token RefreshToken) (str
 
 var ErrTokenReuse = errors.New("refresh token reuse detected")
 
+// ErrFamilyNotRevoked accompanies ErrTokenReuse when the reuse was detected
+// and the response to it did not land. The detection is still worth reporting —
+// more so, because the family it should have taken away is still usable by
+// whoever has it.
+var ErrFamilyNotRevoked = errors.New("the reused token's family was not revoked")
+
 // refreshRotationGrace lets a token that was already rotated be presented
 // again for a short window. Browsers and mobile clients routinely fire two
 // refreshes at once (parallel tabs, a retried request whose response was lost
@@ -269,9 +275,22 @@ func (s *Store) RotateRefreshToken(ctx context.Context, raw string, reducedScope
 		return RefreshToken{}, "", err
 	}
 	if used && !withinGrace {
-		_, _ = tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE family_id=$1`, old.FamilyID)
+		// A token presented after it was rotated is the strongest sign this
+		// service has that one was taken, and revoking the family is the whole
+		// of the response: it is what takes the working token away from
+		// whoever has it. Dropping the outcome meant the response could not
+		// happen and nobody would be told — the caller got the same
+		// invalid_grant an expired token gets, the trail got nothing, and the
+		// family the operations guide sends an operator to look for was still
+		// live.
+		if _, revokeErr := tx.Exec(ctx,
+			`UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE family_id=$1`,
+			old.FamilyID); revokeErr != nil {
+			return RefreshToken{}, "", fmt.Errorf("%w: %w: %v", ErrTokenReuse, ErrFamilyNotRevoked, revokeErr)
+		}
 		if err := tx.Commit(ctx); err != nil {
-			return RefreshToken{}, "", err
+			// Nothing was written either, so this is the same shortfall.
+			return RefreshToken{}, "", fmt.Errorf("%w: %w: %v", ErrTokenReuse, ErrFamilyNotRevoked, err)
 		}
 		return RefreshToken{}, "", ErrTokenReuse
 	}
