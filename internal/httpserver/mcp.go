@@ -210,6 +210,39 @@ func mcpReadsDirectory(principal domain.Principal) bool {
 	return (principal.PlatformAdmin || principal.RealmAdmin) && slices.Contains(principal.Scopes, "admin:read")
 }
 
+// mcpReadsAllRealms is the platform-wide read: every Realm, and the directory
+// connections that cross them. Kept beside the tool list rather than repeated
+// inside each case, because the same rule decides whether a tool is offered
+// and whether the call is allowed, and the two must not drift.
+func mcpReadsAllRealms(principal domain.Principal) bool {
+	return principal.PlatformAdmin && slices.Contains(principal.Scopes, "admin:read")
+}
+
+// mcpAdminRefusal names the half that is actually missing.
+//
+// Two conditions were checked and only one named: an administrator of a single
+// Realm, holding a key that carries admin:read, was told "admin:read 권한이
+// 필요합니다". The scope was already there, so the only thing that reading
+// suggests is minting the same key again - and it changes nothing, because
+// what is missing is not on the key at all. Neither half is a secret from the
+// person holding the key: both are their own.
+func mcpAdminRefusal(principal domain.Principal, platformOnly bool) error {
+	hasScope := slices.Contains(principal.Scopes, "admin:read")
+	admin := principal.PlatformAdmin || (!platformOnly && principal.RealmAdmin)
+	switch {
+	case !admin && !hasScope && platformOnly:
+		return errors.New("서비스 관리자 권한과 admin:read 범위가 모두 필요합니다")
+	case !admin && !hasScope:
+		return errors.New("관리자 권한과 admin:read 범위가 모두 필요합니다")
+	case !admin && platformOnly:
+		return errors.New("이 조회는 서비스 관리자만 할 수 있습니다. 키의 범위 문제가 아닙니다")
+	case !admin:
+		return errors.New("이 조회에는 관리자 권한이 필요합니다. 키의 범위 문제가 아닙니다")
+	default:
+		return errors.New("이 키에 admin:read 범위가 없습니다")
+	}
+}
+
 func (s *Server) mcpTools(principal domain.Principal) []any {
 	tools := []any{
 		map[string]any{"name": "resso_service_status", "description": "ReSSO 버전과 데이터베이스 상태를 조회합니다.",
@@ -224,7 +257,7 @@ func (s *Server) mcpTools(principal domain.Principal) []any {
 					"realm_id": map[string]any{"type": "string", "format": "uuid"}, "query": map[string]any{"type": "string", "minLength": 2}},
 					"required": []string{"query"}, "additionalProperties": false}})
 	}
-	if principal.PlatformAdmin && slices.Contains(principal.Scopes, "admin:read") {
+	if mcpReadsAllRealms(principal) {
 		tools = append(tools, map[string]any{"name": "resso_list_realms", "description": "모든 Realm의 공개 운영 설정을 조회합니다.",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}})
 		tools = append(tools, map[string]any{"name": "resso_list_user_federations", "description": "Realm의 LDAP User Federation 연결 및 동기화 상태를 조회합니다. 자격증명은 반환하지 않습니다.",
@@ -251,8 +284,8 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 			output = map[string]any{"status": "ready", "version": version.Current()}
 		}
 	case "resso_list_realms":
-		if !principal.PlatformAdmin || !slices.Contains(principal.Scopes, "admin:read") {
-			return nil, errors.New("admin:read 권한이 필요합니다")
+		if !mcpReadsAllRealms(principal) {
+			return nil, mcpAdminRefusal(principal, true)
 		}
 		output, err = s.store.ListRealms(r.Context())
 	case "resso_list_clients":
@@ -262,8 +295,8 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 		}
 		output, err = s.store.ListClients(r.Context(), realmID)
 	case "resso_list_user_federations":
-		if !principal.PlatformAdmin || !slices.Contains(principal.Scopes, "admin:read") {
-			return nil, errors.New("admin:read 권한이 필요합니다")
+		if !mcpReadsAllRealms(principal) {
+			return nil, mcpAdminRefusal(principal, true)
 		}
 		realmID, parseErr := mcpRealmID(call.Arguments, principal)
 		if parseErr != nil {
@@ -325,7 +358,7 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 // Reaching outside one's own realm stays reserved for platform administrators.
 func mcpDirectoryRealm(raw json.RawMessage, principal domain.Principal) (uuid.UUID, error) {
 	if !mcpReadsDirectory(principal) {
-		return uuid.Nil, errors.New("관리자 권한과 admin:read 범위가 필요합니다")
+		return uuid.Nil, mcpAdminRefusal(principal, false)
 	}
 	realmID, err := mcpRealmID(raw, principal)
 	if err != nil {

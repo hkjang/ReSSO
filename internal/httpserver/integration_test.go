@@ -7101,3 +7101,100 @@ func TestIntegrationLoggingOutSaysWhenTheTokensOutliveIt(t *testing.T) {
 			"like a logout that finished", status, logoutAnswer)
 	}
 }
+
+// MCP is a second front door to the same directory, reached with a personal
+// API key rather than a browser session, and an agent is what walks through
+// it. So the Realm boundary has to hold here too, and a refusal has to say
+// which thing is missing - an agent relays that sentence to the person, who
+// acts on it.
+//
+// Two tools checked platform administrator AND the admin:read scope and named
+// only the scope. An administrator of one Realm, holding a key that already
+// carried admin:read, was told the scope was missing: the only thing that
+// reading suggests is minting the same key again, which changes nothing.
+func TestIntegrationMCPKeepsEachTenantToItsOwnAndSaysWhatIsMissing(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second tenant with something worth not leaking.
+	theirs, err := data.CreateRealm(ctx, store.CreateRealmInput{
+		Name: "theirs", DisplayName: "Theirs", IssuerURL: "http://localhost:8080/realms/theirs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, theirs.ID, store.CreateClientInput{
+		ClientID: "their-secret-client", Name: "Theirs", Type: "public",
+		RedirectURIs: []string{"https://theirs.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateUser(ctx, theirs.ID, store.CreateUserInput{
+		Username: "their-person", Password: "their-password-1234", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+		ClientID: "our-own-client", Name: "Ours", Type: "public",
+		RedirectURIs: []string{"https://ours.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// An administrator of the first tenant only: realm-admin, not platform.
+	tenantAdmin, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "tenant-admin", Password: "tenant-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO user_roles(user_id,role_id)
+        SELECT $1,id FROM roles WHERE realm_id=$2 AND name='realm-admin'`,
+		tenantAdmin.ID, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	key, err := data.CreatePersonalAPIKey(ctx, tenantAdmin.ID, "agent",
+		[]string{"mcp:read", "admin:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+
+	// Its own Realm first, and it has to come back with the thing that is
+	// there: an empty answer would pass whether the key worked or not.
+	own := callIntegrationMCP(t, client, server.URL, key.Secret,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resso_list_clients","arguments":{}}}`)
+	if !strings.Contains(own, "our-own-client") {
+		t.Fatalf("the key cannot read its own Realm, so every refusal below proves nothing: %s", own)
+	}
+
+	for _, call := range []string{
+		fmt.Sprintf(`{"name":"resso_list_clients","arguments":{"realm_id":%q}}`, theirs.ID),
+		fmt.Sprintf(`{"name":"resso_search_users","arguments":{"realm_id":%q,"query":"their"}}`, theirs.ID),
+		`{"name":"resso_list_realms","arguments":{}}`,
+		`{"name":"resso_list_user_federations","arguments":{}}`,
+	} {
+		body := callIntegrationMCP(t, client, server.URL, key.Secret,
+			fmt.Sprintf(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":%s}`, call))
+		if !strings.Contains(body, `"isError":true`) {
+			t.Errorf("%s was answered rather than refused: %s", call, body)
+			continue
+		}
+		for _, theirs := range []string{"their-secret-client", "their-person", "theirs"} {
+			if strings.Contains(body, theirs) {
+				t.Errorf("%s carried the other tenant's %q: %s", call, theirs, body)
+			}
+		}
+		// The key carries admin:read, so naming that scope describes something
+		// the holder already has and sends them to re-mint it.
+		if strings.Contains(body, "admin:read") {
+			t.Errorf("%s told a key that carries admin:read that admin:read is what is missing: %s",
+				call, body)
+		}
+	}
+}
