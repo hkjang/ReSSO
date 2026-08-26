@@ -6561,3 +6561,214 @@ func TestIntegrationReuseIsRecordedEvenWhenTheFamilySurvivesIt(t *testing.T) {
 			"token was taken away when it still works", detail)
 	}
 }
+
+// integrationJWTClaims reads a token's payload without verifying it. The
+// signature is checked elsewhere; what is wanted here is which claims are
+// present.
+func integrationJWTClaims(t *testing.T, token string) map[string]any {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		t.Fatalf("not a JWT: %q", token)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := map[string]any{}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		t.Fatal(err)
+	}
+	return claims
+}
+
+// The discovery document states what this server supports, and relying parties
+// configure themselves from it without asking again. That makes it the same
+// fact written in two places: once as an advertisement and once as the code
+// that has to honour it. Nothing tied the two together, so a claim could be
+// listed for a feature that was never finished, or stop being emitted while the
+// advertisement went on promising it - and either way the relying party finds
+// out at runtime, on a token it cannot use, with the server insisting it is
+// supported.
+//
+// So this asks the server what it offers and then takes it up on all of it: it
+// requests every advertised scope, and requires every advertised claim to
+// actually arrive. The account is set up to be able to produce all of them - it
+// has an email address and both a Realm and a Client Role - because a claim
+// that is absent for want of data proves nothing about whether it can be
+// emitted at all.
+func TestIntegrationEveryAdvertisedCapabilityIsHonoured(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE users SET email='admin@probe.test', email_verified=true WHERE id=$1`,
+		bootstrap.AdminUserID); err != nil {
+		t.Fatal(err)
+	}
+	role, err := data.CreateRole(ctx, realm.ID, "reader", "Reads")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, "INSERT INTO user_roles(user_id,role_id) VALUES($1,$2)",
+		bootstrap.AdminUserID, role.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "probe", Name: "Probe", Type: "public",
+		RedirectURIs:  []string{"https://probe.example.test/cb"},
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		DefaultScopes: []string{"openid", "profile", "email", "roles"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		`INSERT INTO client_roles(id,client_id,name)
+         SELECT gen_random_uuid(), id, 'probe-role' FROM clients WHERE client_id='probe'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		`INSERT INTO user_client_roles(user_id,client_role_id)
+         SELECT $1, cr.id FROM client_roles cr JOIN clients c ON c.id=cr.client_id
+         WHERE c.client_id='probe' AND cr.name='probe-role'`, bootstrap.AdminUserID); err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "disco-probe", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	// Read what the server advertises.
+	discoResp, err := server.Client().Get(server.URL + "/realms/master/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	discoRaw, _ := io.ReadAll(discoResp.Body)
+	_ = discoResp.Body.Close()
+	var disco struct {
+		Scopes  []string `json:"scopes_supported"`
+		Claims  []string `json:"claims_supported"`
+		Token   string   `json:"token_endpoint"`
+		Revoke  string   `json:"revocation_endpoint"`
+		RevAuth []string `json:"revocation_endpoint_auth_methods_supported"`
+	}
+	if err := json.Unmarshal(discoRaw, &disco); err != nil {
+		t.Fatal(err)
+	}
+	// Discovery advertises the configured issuer's host, not this test server's.
+	local := func(endpoint string) string {
+		parsed, parseErr := url.Parse(endpoint)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		return server.URL + parsed.Path
+	}
+	disco.Token, disco.Revoke = local(disco.Token), local(disco.Revoke)
+
+	// Ask for every advertised scope.
+	verifier := strings.Repeat("disco-probe-verify", 4)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	target := server.URL + "/realms/master/protocol/openid-connect/auth?response_type=code&client_id=probe" +
+		"&redirect_uri=" + url.QueryEscape("https://probe.example.test/cb") +
+		"&scope=" + url.QueryEscape(strings.Join(disco.Scopes, " ")) + "&state=s&nonce=n123" +
+		"&code_challenge=" + challenge + "&code_challenge_method=S256"
+	request, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+	authResp, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = authResp.Body.Close()
+	location, err := url.Parse(authResp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := location.Query().Get("code")
+	if code == "" {
+		t.Fatalf("asking for every advertised scope was refused: %s", location)
+	}
+
+	tokenResp, err := server.Client().PostForm(disco.Token, url.Values{
+		"grant_type": {"authorization_code"}, "code": {code}, "client_id": {"probe"},
+		"redirect_uri": {"https://probe.example.test/cb"}, "code_verifier": {verifier}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenRaw, _ := io.ReadAll(tokenResp.Body)
+	_ = tokenResp.Body.Close()
+	if tokenResp.StatusCode != http.StatusOK {
+		t.Fatalf("token exchange answered %d %s", tokenResp.StatusCode, tokenRaw)
+	}
+	var tokens struct {
+		Access  string `json:"access_token"`
+		ID      string `json:"id_token"`
+		Refresh string `json:"refresh_token"`
+		Scope   string `json:"scope"`
+	}
+	if err := json.Unmarshal(tokenRaw, &tokens); err != nil {
+		t.Fatal(err)
+	}
+
+	// A grant that quietly narrows what was asked for is the same drift seen
+	// from the other side: the advertisement held, the request was accepted,
+	// and the relying party still does not get what it configured for.
+	for _, scope := range disco.Scopes {
+		if !strings.Contains(" "+tokens.Scope+" ", " "+scope+" ") {
+			t.Errorf("scope %q is advertised and was requested, but was not granted: %q", scope, tokens.Scope)
+		}
+	}
+
+	idClaims := integrationJWTClaims(t, tokens.ID)
+	accessClaims := integrationJWTClaims(t, tokens.Access)
+	for _, name := range disco.Claims {
+		_, inID := idClaims[name]
+		_, inAccess := accessClaims[name]
+		if !inID && !inAccess {
+			t.Errorf("claims_supported advertises %q but neither token carries it", name)
+		}
+	}
+
+	// Revocation advertises "none": a public client with no secret must be able to revoke.
+	revokeResp, err := server.Client().PostForm(disco.Revoke, url.Values{
+		"token": {tokens.Refresh}, "client_id": {"probe"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokeRaw, _ := io.ReadAll(revokeResp.Body)
+	_ = revokeResp.Body.Close()
+	if revokeResp.StatusCode != http.StatusOK {
+		t.Fatalf("revocation advertises %v, yet a public client with no secret was answered %d %s",
+			disco.RevAuth, revokeResp.StatusCode, revokeRaw)
+	}
+
+	refreshResp, err := server.Client().PostForm(disco.Token, url.Values{
+		"grant_type": {"refresh_token"}, "refresh_token": {tokens.Refresh}, "client_id": {"probe"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshRaw, _ := io.ReadAll(refreshResp.Body)
+	_ = refreshResp.Body.Close()
+	// Answering 200 to a revocation it did not perform is the failure this
+	// endpoint is most able to hide, so the token is spent afterwards.
+	if refreshResp.StatusCode == http.StatusOK {
+		t.Errorf("revocation answered 200 but the refresh token still works: %s", refreshRaw)
+	}
+}
