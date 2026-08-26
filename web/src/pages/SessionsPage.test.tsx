@@ -104,3 +104,21 @@ test('a listing that is complete says nothing about a cap', async () => {
   expect(await screen.findByText(session.username)).toBeInTheDocument()
   expect(screen.queryByText(/500건만 표시합니다/)).not.toBeInTheDocument()
 })
+
+// The search moved to the server, and with it the rows that come back became
+// the whole answer rather than a page to narrow. The screen kept a second empty
+// state for "nothing matched" that nothing could reach any more, so a term that
+// missed was reported as a Realm with no sessions at all — and an operator who
+// believes that goes looking somewhere else entirely.
+test('a search that matches nothing says so rather than that there are none', async () => {
+  const user = userEvent.setup()
+  mocks.api.mockImplementation((path: string) =>
+    Promise.resolve({ items: String(path).includes('q=nobody') ? [] : [session], truncated: false }))
+  renderSessions()
+  expect(await screen.findByText(session.username)).toBeInTheDocument()
+
+  await user.type(screen.getByLabelText('세션 검색'), 'nobody')
+
+  expect(await screen.findByText('검색 조건에 맞는 세션이 없습니다')).toBeInTheDocument()
+  expect(screen.queryByText('세션이 없습니다')).not.toBeInTheDocument()
+})
