@@ -6281,3 +6281,135 @@ func TestIntegrationNoRefusalDescribesTheDatabase(t *testing.T) {
 		}
 	}
 }
+
+// A Client can only act on what is its own. Two places decide that, and both
+// answer the same way whether it is or not, so a mistake in either is quiet:
+// revocation answers 200 for a token it did not revoke because RFC 7009 says
+// not to tell a caller whether a token existed, and RP-initiated logout falls
+// back to this service's own page rather than saying no.
+//
+// The subtle half of the second is a post-logout address that is registered —
+// just not by the Client asking. Existing coverage has the switched-off Client
+// with an id_token_hint; an address belonging to somebody else, and one
+// belonging to nobody, were not covered, and neither was a Client revoking
+// another's token.
+//
+// Each pair runs its own case first, so neither can pass on a service that
+// refuses everything.
+func TestIntegrationAClientActsOnlyOnWhatIsItsOwn(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmID := bootstrap.RealmID
+	if err := data.EnsureActiveSigningKey(ctx, realmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "mine", Name: "Mine", Type: "confidential", RedirectURIs: []string{"https://mine.test/cb"},
+		PostLogoutRedirectURIs: []string{"https://mine.test/bye"},
+		GrantTypes:             []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "theirs", Name: "Theirs", Type: "confidential", RedirectURIs: []string{"https://theirs.test/cb"},
+		GrantTypes: []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "owner", Password: "owner-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realmID, user.ID, time.Hour, "127.0.0.1", "ownership-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	mint := func() string {
+		t.Helper()
+		tokens, err := service.IssueUserTokens(ctx, realm, mine.Client, user, session.Session.ID,
+			[]string{"openid"}, "", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tokens.RefreshToken
+	}
+	stillLive := func(raw string) bool {
+		t.Helper()
+		var revoked *time.Time
+		if err := data.Pool.QueryRow(ctx,
+			`SELECT revoked_at FROM refresh_tokens WHERE token_hash=ANY($1::bytea[])`,
+			data.Sealer.Digests(raw)).Scan(&revoked); err != nil {
+			t.Fatal(err)
+		}
+		return revoked == nil
+	}
+	revoke := func(token, clientID, secret string) {
+		t.Helper()
+		response, err := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/revoke",
+			url.Values{"token": {token}, "client_id": {clientID}, "client_secret": {secret}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+	}
+	own := mint()
+	revoke(own, "mine", mine.ClientSecret)
+	if stillLive(own) {
+		t.Fatal("the Client that was issued the token did not revoke it, so the check below would prove nothing")
+	}
+	other := mint()
+	revoke(other, "theirs", theirs.ClientSecret)
+	if !stillLive(other) {
+		t.Error("another Client revoked a token it was never issued, and RFC 7009's silence means " +
+			"nobody would be told it had happened")
+	}
+
+	noRedirect := server.Client()
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	logoutTo := func(query url.Values) string {
+		t.Helper()
+		response, err := noRedirect.Get(
+			server.URL + "/realms/master/protocol/openid-connect/logout?" + query.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.Header.Get("Location")
+	}
+	ownAddress := url.Values{"post_logout_redirect_uri": {"https://mine.test/bye"},
+		"client_id": {"mine"}, "state": {"s"}}
+	if where := logoutTo(ownAddress); !strings.HasPrefix(where, "https://mine.test/bye") {
+		t.Fatalf("a Client's own registered address was not honoured (%q), so the refusals below would "+
+			"prove nothing", where)
+	}
+	for _, refused := range []struct {
+		what  string
+		query url.Values
+	}{
+		{"an address nobody registered", url.Values{"post_logout_redirect_uri": {"https://evil.test/bye"},
+			"client_id": {"mine"}, "state": {"s"}}},
+		{"an address registered by another Client", url.Values{"post_logout_redirect_uri": {"https://mine.test/bye"},
+			"client_id": {"theirs"}, "state": {"s"}}},
+	} {
+		if where := logoutTo(refused.query); strings.HasPrefix(where, "https://") {
+			t.Errorf("logout sent the person to %s for %s", where, refused.what)
+		}
+	}
+}
