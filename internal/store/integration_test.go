@@ -6225,3 +6225,60 @@ func TestIntegrationSigningInBringsAnOldPasswordHashUpToTheCurrentCost(t *testin
 		t.Errorf("the rehashed password no longer signs in: %+v %v", again, err)
 	}
 }
+
+// Replicas coming up together against a fresh database all read no realm, all
+// write one, and Serializable refuses every one but the winner — which the
+// startup path turns into os.Exit(1). Four at once left three dead. They come
+// back, find the realm and succeed, so it heals itself, but the first rollout
+// of a deployment shows containers crashing and a log line saying the service
+// could not bootstrap, which is not what a first install should look like.
+//
+// Eight rather than four, because each round only has to eliminate one
+// contender for the retry budget to be enough at four and not at eight.
+func TestIntegrationInstancesStartingTogetherAllBootstrap(t *testing.T) {
+	data := openIntegrationStore(t, integrationSealer(t))
+	ctx := context.Background()
+	const instances = 8
+	failures := make([]error, instances)
+	results := make([]BootstrapResult, instances)
+	var start, done sync.WaitGroup
+	start.Add(1)
+	for i := 0; i < instances; i++ {
+		done.Add(1)
+		go func(index int) {
+			defer done.Done()
+			start.Wait()
+			results[index], failures[index] = data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+		}(i)
+	}
+	start.Done()
+	done.Wait()
+
+	for index, err := range failures {
+		if err != nil {
+			t.Errorf("instance %d could not start: %v", index, err)
+		}
+	}
+	// And it is still the same install: one realm, one administrator, and only
+	// one of them reporting that it did the creating.
+	var realms, admins, created int
+	if err := data.Pool.QueryRow(ctx, "SELECT count(*) FROM realms WHERE name='master'").Scan(&realms); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.Pool.QueryRow(ctx,
+		"SELECT count(*) FROM users WHERE username='admin'").Scan(&admins); err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range results {
+		if result.Created {
+			created++
+		}
+	}
+	if realms != 1 || admins != 1 {
+		t.Errorf("after %d concurrent startups there are %d master realms and %d admins, want one of each",
+			instances, realms, admins)
+	}
+	if created != 1 {
+		t.Errorf("%d instances reported creating the administrator, want exactly one", created)
+	}
+}

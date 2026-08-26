@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/hkjang/ReSSO/internal/config"
 	"github.com/hkjang/ReSSO/internal/password"
@@ -22,7 +23,35 @@ type BootstrapResult struct {
 // Bootstrap is idempotent. It never resets an existing administrator's
 // password, which prevents a container restart from becoming a password
 // reset mechanism.
+//
+// Instances starting together are retried rather than refused. The work below
+// runs Serializable, so replicas coming up against a fresh database all read
+// no realm, all write one, and every one but the winner is refused with a
+// serialization failure — which the caller turns into a failed startup. Four
+// starting at once left three dead: they come back, find the realm, and
+// succeed, so it heals itself, but the first rollout of a deployment shows
+// three containers crashing and a log line saying the service could not
+// bootstrap. A serialization failure is the one error that means "try again".
 func (s *Store) Bootstrap(ctx context.Context, adminUsername, adminPassword string) (BootstrapResult, error) {
+	const attempts = 5
+	for attempt := 0; ; attempt++ {
+		result, err := s.bootstrapOnce(ctx, adminUsername, adminPassword)
+		if err == nil || attempt >= attempts-1 || !isSerializationFailure(err) {
+			return result, err
+		}
+	}
+}
+
+// isSerializationFailure reports whether the database refused a transaction
+// because another one got there first: 40001 for a serialization failure and
+// 40P01 for a deadlock, both of which mean the same thing to a caller that can
+// simply run it again.
+func isSerializationFailure(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
+}
+
+func (s *Store) bootstrapOnce(ctx context.Context, adminUsername, adminPassword string) (BootstrapResult, error) {
 	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return BootstrapResult{}, fmt.Errorf("begin bootstrap: %w", err)
