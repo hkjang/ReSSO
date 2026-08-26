@@ -282,3 +282,57 @@ func TestPartialOutcomesAreDeclaredWhereTheyCanHappen(t *testing.T) {
 		}
 	}
 }
+
+// The other direction. TestOpenAPICoversEveryRegisteredRoute walks the router
+// and requires the document to describe what it finds, which cannot notice a
+// path the document describes and nothing serves - deleting a route makes that
+// test pass, because there is one less route to look up. What is left is a
+// document that sends whoever follows it to a 404 while insisting the endpoint
+// is there, and a generated client with a method that cannot work. Both
+// directions are needed for the document to mean anything.
+func TestOpenAPIDescribesNothingThatIsNotThere(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/openapi.json", nil)
+	response := httptest.NewRecorder()
+	(&Server{}).openAPISpec(response, request)
+	var spec map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &spec); err != nil {
+		t.Fatal(err)
+	}
+	paths, ok := spec["paths"].(map[string]any)
+	if !ok {
+		t.Fatal("spec has no paths object")
+	}
+
+	router, ok := New(nil, nil, nil, nil).Handler().(*chi.Mux)
+	if !ok {
+		t.Fatal("handler is not a chi router")
+	}
+	type key struct{ method, route string }
+	served := map[key]bool{}
+	if err := chi.Walk(router, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		served[key{strings.ToLower(method), strings.TrimSuffix(route, "/")}] = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var phantom []string
+	for path, raw := range paths {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		for method := range item {
+			switch method {
+			case "get", "put", "post", "delete", "patch", "head", "options":
+			default:
+				continue
+			}
+			if !served[key{method, path}] {
+				phantom = append(phantom, strings.ToUpper(method)+" "+path)
+			}
+		}
+	}
+	if len(phantom) > 0 {
+		t.Errorf("documented but no route serves them (%d):\n  %s", len(phantom), strings.Join(phantom, "\n  "))
+	}
+}
