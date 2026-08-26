@@ -149,3 +149,41 @@ func openBackchannelIntegrationStore(t *testing.T) (*store.Store, uuid.UUID) {
 	})
 	return data, bootstrap.RealmID
 }
+
+// A notification the queue had no room for is the version of this worth
+// hearing about most: nothing was attempted at all, and the only trace was a
+// log line. It is recorded on its own goroutine so that SessionRevoked still
+// returns without waiting - a logout response is on the other end of it - and
+// Wait covers that goroutine so shutdown does not drop the record of the drop.
+func TestIntegrationDroppedLogoutNotificationReachesTheAuditTrail(t *testing.T) {
+	data, realmID := openBackchannelIntegrationStore(t)
+	ctx := context.Background()
+
+	notifier := New(context.Background(), data, nil, slog.New(slog.DiscardHandler), nil)
+	// Fill every slot so the next one has nowhere to go.
+	for i := 0; i < maximumQueueDepth; i++ {
+		notifier.slots <- struct{}{}
+	}
+	dropped := store.RevokedSession{RealmID: realmID, SessionID: uuid.New(), UserID: uuid.New()}
+	notifier.SessionRevoked(dropped)
+	notifier.Wait(10 * time.Second)
+
+	page, err := data.ListAudit(ctx, store.AuditFilter{RealmID: &realmID, EventType: "BACKCHANNEL_LOGOUT", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("BACKCHANNEL_LOGOUT events = %d, want 1: a notification that was never attempted "+
+			"left no record outside a log that rotates", len(page.Items))
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(page.Items[0].Detail, &detail); err != nil {
+		t.Fatalf("the event carries no readable detail: %s", page.Items[0].Detail)
+	}
+	if detail["outcome"] != "dropped" {
+		t.Errorf("the event does not say the notification was never attempted: %v", detail)
+	}
+	if detail["session_id"] != dropped.SessionID.String() {
+		t.Errorf("the event does not say which session it was: %v", detail)
+	}
+}

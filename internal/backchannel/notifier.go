@@ -84,6 +84,16 @@ func (n *Notifier) SessionRevoked(revoked store.RevokedSession) {
 		n.logger.Warn("back-channel logout notification dropped: queue is full",
 			"realm_id", revoked.RealmID, "session_id", revoked.SessionID)
 		n.record("dropped")
+		// Nothing was even attempted here, which is the version of this worth
+		// hearing about most. Recorded on its own goroutine because this
+		// function must return without waiting on anything — a logout response
+		// is on the other end of it — and tracked so shutdown does not drop
+		// the record of the drop.
+		n.pending.Add(1)
+		go func() {
+			defer n.pending.Done()
+			n.recordNotDelivered(revoked, "", "session", revoked.SessionID.String(), "dropped", 0)
+		}()
 		return
 	}
 	n.pending.Add(1)
@@ -157,12 +167,14 @@ func (n *Notifier) deliver(revoked store.RevokedSession) {
 	if err != nil {
 		n.logger.Warn("back-channel logout skipped: Realm is unavailable",
 			"realm_id", revoked.RealmID, "error", err)
+		n.recordNotDelivered(revoked, "", "session", revoked.SessionID.String(), "realm_unavailable", 0)
 		return
 	}
 	targets, err := n.store.BackchannelLogoutTargets(lookupCtx, revoked.RealmID, revoked.SessionID)
 	if err != nil {
 		n.logger.Warn("back-channel logout target lookup failed",
 			"realm_id", revoked.RealmID, "session_id", revoked.SessionID, "error", err)
+		n.recordNotDelivered(revoked, realm.Name, "session", revoked.SessionID.String(), "targets_unknown", 0)
 		return
 	}
 	if len(targets) == 0 {
@@ -176,6 +188,7 @@ func (n *Notifier) deliver(revoked store.RevokedSession) {
 		if tokenErr != nil {
 			n.logger.Error("back-channel logout token could not be signed",
 				"realm", realm.Name, "client", client.ClientID, "error", tokenErr)
+			n.recordNotDelivered(revoked, realm.Name, "client", client.ClientID, "token_unsigned", 0)
 			continue
 		}
 		group.Add(1)
@@ -208,7 +221,7 @@ func (n *Notifier) post(ctx context.Context, revoked store.RevokedSession, realm
 			if outcome != "delivered" {
 				n.logger.Warn("back-channel logout was not delivered",
 					"realm", realmName, "client", clientID, "outcome", outcome, "attempts", attempt+1)
-				n.recordNotDelivered(revoked, realmName, clientID, outcome, attempt+1)
+				n.recordNotDelivered(revoked, realmName, "client", clientID, outcome, attempt+1)
 			}
 			return
 		}
@@ -218,14 +231,14 @@ func (n *Notifier) post(ctx context.Context, revoked store.RevokedSession, realm
 		case <-ctx.Done():
 			timer.Stop()
 			n.record(outcome)
-			n.recordNotDelivered(revoked, realmName, clientID, outcome, attempt+1)
+			n.recordNotDelivered(revoked, realmName, "client", clientID, outcome, attempt+1)
 			return
 		case <-n.base.Done():
 			// Shutting down: the attempt in hand was allowed to finish, but
 			// waiting out a backoff would outlast the process.
 			timer.Stop()
 			n.record(outcome)
-			n.recordNotDelivered(revoked, realmName, clientID, outcome, attempt+1)
+			n.recordNotDelivered(revoked, realmName, "client", clientID, outcome, attempt+1)
 			return
 		}
 		timer.Stop()
@@ -244,7 +257,7 @@ func (n *Notifier) post(ctx context.Context, revoked store.RevokedSession, realm
 //
 // Only failures are written. A delivery that worked is the ordinary case and
 // recording every one would bury the ones worth reading.
-func (n *Notifier) recordNotDelivered(revoked store.RevokedSession, realmName, clientID, outcome string, attempts int) {
+func (n *Notifier) recordNotDelivered(revoked store.RevokedSession, realmName, targetType, targetID, outcome string, attempts int) {
 	if n.store == nil {
 		return
 	}
@@ -261,12 +274,12 @@ func (n *Notifier) recordNotDelivered(revoked store.RevokedSession, realmName, c
 	if err := n.store.WriteAudit(ctx, store.AuditEvent{
 		RealmID: &realmID, ActorName: "system",
 		EventType: "BACKCHANNEL_LOGOUT", Result: "FAILURE",
-		TargetType: "client", TargetID: clientID,
+		TargetType: targetType, TargetID: targetID,
 		Detail: map[string]any{"session_id": revoked.SessionID.String(),
 			"user_id": revoked.UserID.String(), "outcome": outcome, "attempts": attempts},
 	}); err != nil {
 		n.logger.Error("back-channel logout failure could not be recorded",
-			"realm", realmName, "client", clientID, "error", err)
+			"realm", realmName, "target", targetID, "error", err)
 	}
 }
 
