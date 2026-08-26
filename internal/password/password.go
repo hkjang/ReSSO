@@ -166,11 +166,19 @@ func HashContext(ctx context.Context, value string) (string, error) {
 }
 
 // VerifyContext compares a password against an encoded hash, waiting for a
-// free Argon2 slot. Malformed hashes are rejected before the slot is taken.
+// free Argon2 slot. Malformed hashes are rejected before the slot is taken:
+// reading the format costs nothing, and a hash that cannot be read is never
+// going to reach the comparison, so holding a slot for it takes one away from
+// a sign-in that would have used it.
 func VerifyContext(ctx context.Context, value, encoded string) (bool, error) {
+	p, salt, expected, err := decode(encoded)
+	if err != nil {
+		return false, err
+	}
 	if err := acquire(ctx); err != nil {
 		return false, err
 	}
 	defer release()
-	return Verify(value, encoded)
+	actual := argon2.IDKey([]byte(value), salt, p.Iterations, p.Memory, p.Parallelism, uint32(len(expected)))
+	return subtle.ConstantTimeCompare(actual, expected) == 1, nil
 }
