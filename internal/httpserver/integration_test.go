@@ -7198,3 +7198,76 @@ func TestIntegrationMCPKeepsEachTenantToItsOwnAndSaysWhatIsMissing(t *testing.T)
 		}
 	}
 }
+
+func TestProbeMCPToolsDoNotReturnSecrets(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A confidential client actually has a secret to leak; a public one has none,
+	// so probing with one proves nothing.
+	confidential, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+		ClientID: "confidential-probe", Name: "Confidential", Type: "confidential",
+		RedirectURIs: []string{"https://c.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := "bind-secret-do-not-return"
+	if _, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, store.LDAPFederationInput{
+		Name: "corp", Vendor: "OTHER", ConnectionURL: "ldap://directory.invalid:389",
+		BindDN: "cn=admin,dc=example,dc=test", BindCredential: &credential,
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid",
+		RDNLDAPAttribute: "uid", UUIDLDAPAttribute: "entryUUID",
+		UserObjectClasses: []string{"inetOrgPerson"}, BatchSize: 500,
+		ImportEnabled: true, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	person, err := data.CreateUser(ctx, bootstrap.RealmID, store.CreateUserInput{
+		Username: "probe-person", Password: "person-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hash string
+	if err := data.Pool.QueryRow(ctx, "SELECT password_hash FROM users WHERE id=$1", person.ID).Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	key, err := data.CreatePersonalAPIKey(ctx, bootstrap.AdminUserID, "agent",
+		[]string{"mcp:read", "admin:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+
+	t.Logf("client secret present: %v (len %d)", confidential.ClientSecret != "", len(confidential.ClientSecret))
+	for _, call := range []struct{ what, params string }{
+		{"list_clients", `{"name":"resso_list_clients","arguments":{}}`},
+		{"list_user_federations", `{"name":"resso_list_user_federations","arguments":{}}`},
+		{"search_users", `{"name":"resso_search_users","arguments":{"query":"probe"}}`},
+		{"list_realms", `{"name":"resso_list_realms","arguments":{}}`},
+	} {
+		body := callIntegrationMCP(t, client, server.URL, key.Secret,
+			`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":`+call.params+`}`)
+		hits := []string{}
+		for name, secret := range map[string]string{
+			"client secret": confidential.ClientSecret, "bind credential": credential,
+			"password hash": hash, "api key secret": key.Secret,
+		} {
+			if secret != "" && strings.Contains(body, secret) {
+				hits = append(hits, name)
+			}
+		}
+		for _, field := range []string{`"secret"`, `"password_hash"`, `"bind_credential"`, `"secret_hash"`} {
+			if strings.Contains(body, field) {
+				hits = append(hits, "field "+field)
+			}
+		}
+		t.Logf("%-24s len=%-6d leaked=%v", call.what, len(body), hits)
+	}
+}
