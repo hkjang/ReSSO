@@ -269,20 +269,14 @@ func (s *Server) callMCPTool(r *http.Request, principal domain.Principal, raw js
 		if parseErr != nil {
 			return nil, parseErr
 		}
-		providers, listErr := s.store.ListLDAPFederations(r.Context(), realmID)
-		if listErr != nil {
-			err = listErr
-			break
-		}
-		items := make([]map[string]any, 0, len(providers))
-		for _, provider := range providers {
-			items = append(items, map[string]any{"id": provider.ID, "realm_id": provider.RealmID, "name": provider.Name,
-				"vendor": provider.Vendor, "enabled": provider.Enabled, "connection_url": provider.ConnectionURL,
-				"priority": provider.Priority, "edit_mode": provider.EditMode, "last_sync_at": provider.LastSyncAt,
-				"last_sync_status": provider.LastSyncStatus, "last_sync_added": provider.LastSyncAdded,
-				"last_sync_updated": provider.LastSyncUpdated, "last_sync_failed": provider.LastSyncFailed})
-		}
-		output = items
+		// The whole record, the same one the REST listing hands the console
+		// behind the same admin:read. Copying a chosen few fields here withheld
+		// nothing — the record carries no credential to withhold, the bind
+		// password being a boolean — so the list was duplication that could
+		// only fall behind, and did: an agent checking on a sync was told its
+		// status but not why it failed, and never heard about the accounts the
+		// run deactivated.
+		output, err = s.store.ListLDAPFederations(r.Context(), realmID)
 	case "resso_search_users":
 		var args struct {
 			RealmID string `json:"realm_id"`

@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -4642,5 +4643,88 @@ func TestIntegrationAdminWriteFailuresExplainOrStayQuiet(t *testing.T) {
 	}
 	if status == http.StatusBadRequest {
 		t.Errorf("a write that failed on our side was reported as a bad request: %d %q", status, message)
+	}
+}
+
+// The MCP federation tool copied the fields it returns one by one, and the
+// copy fell behind the record: an agent asked to check on a sync was told its
+// status but not why it failed, and never heard about the accounts the run
+// deactivated — under the DISABLE policy the outcome that ends those people's
+// sessions, and the one an administrator is sent to these fields to find.
+//
+// Nothing was being withheld by the copy. The record carries no credential to
+// withhold: the bind password is represented by a boolean, and the REST
+// listing behind the same admin:read hands the whole record to the console.
+// So the list was duplication that could only drift, and did.
+func TestIntegrationMCPFederationReportsWhatTheSyncDid(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := data.CreateLDAPFederation(ctx, bootstrap.RealmID, store.LDAPFederationInput{
+		Name: "directory", Vendor: "OTHER", ConnectionURL: "ldap://127.0.0.1:1",
+		UsersDN: "ou=people,dc=example,dc=test", UsernameLDAPAttribute: "uid", RDNLDAPAttribute: "uid",
+		UUIDLDAPAttribute: "entryUUID", UserObjectClasses: []string{"inetOrgPerson"},
+		SearchScope: "SUBTREE", BatchSize: 100, EditMode: "READ_ONLY", MissingUserAction: "DISABLE",
+		ImportEnabled: true, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE user_federations SET last_sync_status='FAILURE', last_sync_error='bind failed',
+		 last_sync_disabled=3, last_sync_group_memberships=7, last_sync_unknown_roles=ARRAY['auditor']
+		 WHERE id=$1`, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	key, err := data.CreatePersonalAPIKey(ctx, bootstrap.AdminUserID, "agent",
+		[]string{"mcp:read", "admin:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	body := callIntegrationMCP(t, server.Client(), server.URL, key.Secret,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resso_list_user_federations","arguments":{}}}`)
+	var envelope struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil || len(envelope.Result.Content) == 0 {
+		t.Fatalf("federation listing did not answer with content: %s", body)
+	}
+	reported := envelope.Result.Content[0].Text
+	var listed []struct {
+		LastSyncError            string   `json:"last_sync_error"`
+		LastSyncDisabled         int      `json:"last_sync_disabled"`
+		LastSyncGroupMemberships int      `json:"last_sync_group_memberships"`
+		LastSyncUnknownRoles     []string `json:"last_sync_unknown_roles"`
+	}
+	if err := json.Unmarshal([]byte(reported), &listed); err != nil || len(listed) != 1 {
+		t.Fatalf("federation listing did not decode to one provider: %s", reported)
+	}
+	if listed[0].LastSyncError != "bind failed" {
+		t.Errorf("last_sync_error = %q, want the reason the run failed", listed[0].LastSyncError)
+	}
+	if listed[0].LastSyncDisabled != 3 {
+		t.Errorf("last_sync_disabled = %d, want 3", listed[0].LastSyncDisabled)
+	}
+	if listed[0].LastSyncGroupMemberships != 7 {
+		t.Errorf("last_sync_group_memberships = %d, want 7", listed[0].LastSyncGroupMemberships)
+	}
+	if !slices.Contains(listed[0].LastSyncUnknownRoles, "auditor") {
+		t.Errorf("last_sync_unknown_roles = %v, want the Role the mapping names", listed[0].LastSyncUnknownRoles)
+	}
+	// And it still withholds nothing it never held: the credential is a
+	// boolean either way, so this is the whole record and not a wider one.
+	if strings.Contains(reported, "bind_password") || strings.Contains(reported, "bind_credential_cipher") {
+		t.Errorf("federation listing carried a credential: %s", reported)
 	}
 }
