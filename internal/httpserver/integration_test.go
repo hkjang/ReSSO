@@ -5069,3 +5069,106 @@ func TestIntegrationDeletingARoleSaysWhichOneAndWhoHeldIt(t *testing.T) {
 		t.Errorf("the event does not say how many people lost the Client Role: %v", clientDetail)
 	}
 }
+
+// A refresh rotates the caller's token before the new pair is signed. When the
+// signing fails the rotation is undone, and when undoing it also fails the
+// caller is left holding a token the service already considers spent. Its next
+// attempt is then read as a replay: the family is revoked and the trail records
+// REFRESH_TOKEN_REUSE against the client — the strongest signal this service
+// has that a token was taken, and the one the operations guide sends a reader
+// to look for.
+//
+// So the trail names a theft for something the service did to itself. Left
+// only in a log, the line that says what actually happened is gone by the time
+// anyone reads that entry and takes it at its word.
+func TestIntegrationARotationThatCouldNotBeUndoneIsRecorded(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "rollback-probe", Name: "Rollback Probe", Type: "public",
+		RedirectURIs: []string{"https://probe.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "rollback-integration-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := bootstrap.AdminUserID
+	sessionID := session.Session.ID
+	raw, err := data.CreateRefreshToken(ctx, store.RefreshToken{RealmID: realm.ID, ClientID: created.Client.ID,
+		UserID: &userID, SessionID: &sessionID, Scope: []string{"openid"},
+		ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Signing fails: the realm has no active key, which is the outage this
+	// path exists for rather than a bad grant.
+	if _, err := data.Pool.Exec(ctx,
+		`UPDATE signing_keys SET status='RETIRED' WHERE realm_id=$1`, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	// And undoing the rotation fails: the rollback deletes the successor it
+	// just created, so refusing that delete is the smallest way to stand in
+	// for a database that will not take it.
+	if _, err := data.Pool.Exec(ctx, `CREATE FUNCTION refuse_delete() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'the test refuses this delete'; END; $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `CREATE TRIGGER refuse_refresh_delete BEFORE DELETE ON refresh_tokens
+		FOR EACH ROW EXECUTE FUNCTION refuse_delete()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = data.Pool.Exec(cleanupCtx, "DROP TRIGGER IF EXISTS refuse_refresh_delete ON refresh_tokens")
+	})
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {raw}, "client_id": {"rollback-probe"}}
+	response, err := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("a refresh with no signing key answered %d, want %d",
+			response.StatusCode, http.StatusInternalServerError)
+	}
+
+	page, err := data.ListAudit(ctx, store.AuditFilter{
+		RealmID: &realm.ID, EventType: "TOKEN_REFRESH", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("TOKEN_REFRESH events = %d, want 1: the caller was left holding a token the service "+
+			"considers spent, and the trail says nothing until it reads the next attempt as a theft",
+			len(page.Items))
+	}
+	event := page.Items[0]
+	if event.Result != "PARTIAL" {
+		t.Errorf("result = %q, want PARTIAL: the refresh was refused and something it left behind was not undone",
+			event.Result)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(event.Detail, &detail); err != nil {
+		t.Fatalf("the event carries no readable detail: %s", event.Detail)
+	}
+	if detail["rotation_rolled_back"] != false {
+		t.Errorf("the event does not say the rotation still stands: %v", detail)
+	}
+}

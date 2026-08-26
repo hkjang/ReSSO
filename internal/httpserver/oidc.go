@@ -378,6 +378,18 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 		if rollbackErr := s.store.RollbackRefreshRotation(r.Context(), inspected.ID, rotated.ID); rollbackErr != nil {
 			s.logger.Error("refresh rotation could not be undone", "trace_id", traceIDFrom(r.Context()),
 				"client", client.ClientID, "error", rollbackErr)
+			// The caller never received the successor and the token it still
+			// holds stays marked rotated, so its next attempt is read as a
+			// replay: the family is revoked and the trail records
+			// REFRESH_TOKEN_REUSE against this client. That entry names a
+			// stolen token, which is the strongest signal this service has and
+			// the one the operations guide sends a reader to look for. Left
+			// only in a log, this line — the actual cause, minutes earlier —
+			// is gone by the time anyone reads that entry and takes it at its
+			// word.
+			s.audit(r, &realm.ID, &user.ID, user.Username, "TOKEN_REFRESH", "PARTIAL",
+				"client", client.ClientID, map[string]any{"rotation_rolled_back": false,
+					"error": rollbackErr.Error()})
 		}
 		// A Realm with no key to sign with is not a bad grant. Answering
 		// invalid_grant tells the relying party its code or refresh token is
