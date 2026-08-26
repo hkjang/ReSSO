@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -187,5 +189,44 @@ func TestMissingAssetIsRefusedRatherThanAnsweredWithTheDocument(t *testing.T) {
 	_ = shell.Body.Close()
 	if shell.StatusCode != http.StatusOK || !strings.Contains(string(shellBody), "<html") {
 		t.Errorf("a console route answered %d with %.60s, want the document", shell.StatusCode, shellBody)
+	}
+}
+
+// The integrations page tells an integrator which protocol revisions this
+// service speaks. Both numbers are the service's own — the MCP revision is a
+// constant here, the OpenAPI one is in the document this handler serves — and
+// the page carries its own copy of each. A copy that falls behind sends
+// somebody to build against a revision the service stopped speaking, and the
+// page is where they would go to check.
+func TestTheIntegrationsPageNamesTheRevisionsThisServiceSpeaks(t *testing.T) {
+	page, err := os.ReadFile(filepath.Join("..", "..", "web", "src", "pages", "IntegrationsPage.tsx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(page), mcpProtocolVersion) {
+		t.Errorf("the page does not name the MCP revision this service speaks (%s)", mcpProtocolVersion)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(nil, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	response, err := server.Client().Get(server.URL + "/api/openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	var document struct {
+		OpenAPI string `json:"openapi"`
+	}
+	if err := json.Unmarshal(body, &document); err != nil || document.OpenAPI == "" {
+		t.Fatalf("the OpenAPI document names no version: %.120s", body)
+	}
+	// The page says the series rather than the patch, which is what an
+	// integrator cares about and what the chip has room for.
+	series := document.OpenAPI[:strings.LastIndex(document.OpenAPI, ".")]
+	if !strings.Contains(string(page), "OpenAPI "+series) {
+		t.Errorf("the page does not name the OpenAPI series this service serves (%s from %s)",
+			series, document.OpenAPI)
 	}
 }
