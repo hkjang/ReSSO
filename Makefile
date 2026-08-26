@@ -10,7 +10,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-VERSION ?= v0.9.40-dev
+VERSION ?= v0.9.41-dev
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
