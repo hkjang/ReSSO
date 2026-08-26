@@ -6084,6 +6084,28 @@ func TestIntegrationHotPathsDoNotReadWholeTables(t *testing.T) {
 	if _, err := data.Pool.Exec(ctx, "ANALYZE sso_sessions"); err != nil {
 		t.Fatal(err)
 	}
+	// Which of a person's Roles the directory grants is asked by user and role,
+	// and the only index on that table leads with the provider.
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO user_federations(id,realm_id,name,vendor,connection_url,
+        users_dn,username_ldap_attribute,rdn_ldap_attribute,uuid_ldap_attribute,user_object_classes)
+        VALUES($1,$2,'sweep-probe','OTHER','ldap://x','ou=p','uid','uid','entryUUID',ARRAY['inetOrgPerson'])`,
+		uuid.New(), realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO roles(id,realm_id,name)
+        SELECT gen_random_uuid(),$1,'sweep-role-'||g FROM generate_series(1,20) g`, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `INSERT INTO federation_role_assignments(federation_id,user_id,role_id)
+        SELECT f.id, u.id, r.id FROM user_federations f
+        JOIN users u ON u.realm_id=$1 AND u.username LIKE 'sweep-%'
+        JOIN roles r ON r.realm_id=$1 AND r.name LIKE 'sweep-role-%'
+        WHERE f.realm_id=$1`, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, "ANALYZE federation_role_assignments"); err != nil {
+		t.Fatal(err)
+	}
 	for _, probe := range []struct {
 		name, query string
 		argument    any
@@ -6096,6 +6118,12 @@ func TestIntegrationHotPathsDoNotReadWholeTables(t *testing.T) {
 		{"listing a Realm's sessions for the console",
 			`SELECT s.id FROM sso_sessions s JOIN users u ON u.id=s.user_id
              WHERE ($1::uuid IS NULL OR s.realm_id=$1) ORDER BY s.last_access DESC LIMIT 500`, realm.ID},
+		// Asked by user and role, without the provider the primary key leads
+		// with. The absence case is the honest one: it has to read everything
+		// to say no.
+		{"asking whether a Role came from the directory",
+			`SELECT EXISTS(SELECT 1 FROM federation_role_assignments fra
+             WHERE fra.user_id=$1 AND fra.role_id='00000000-0000-0000-0000-0000000000ee'::uuid)`, sweptUser},
 	} {
 		rows, err := data.Pool.Query(ctx, "EXPLAIN "+probe.query, probe.argument)
 		if err != nil {
@@ -6114,7 +6142,7 @@ func TestIntegrationHotPathsDoNotReadWholeTables(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
-		for _, table := range []string{"refresh_tokens", "sso_sessions"} {
+		for _, table := range []string{"refresh_tokens", "sso_sessions", "federation_role_assignments"} {
 			if strings.Contains(plan, "Seq Scan on "+table) {
 				t.Errorf("%s reads every row of %s in the deployment:\n%s", probe.name, table, plan)
 			}
