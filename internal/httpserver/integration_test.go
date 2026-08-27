@@ -8162,3 +8162,135 @@ func TestIntegrationEveryStateChangeNeedsItsCSRFToken(t *testing.T) {
 			"other reason and being refused without one proves little", reached, len(writes))
 	}
 }
+
+// The CSRF token is only worth something if the cookie carrying the session
+// and the cookie carrying the token behave differently, and each of the
+// differences is one attribute that a later change could quietly drop.
+//
+// The session cookie is HttpOnly, so script cannot read it, and SameSite=Lax
+// rather than Strict because the authorization flow comes back through a
+// cross-site top-level redirect that Strict would eat. The token cookie is the
+// mirror image: script has to read it to put it in a header, so it is not
+// HttpOnly - and it is SameSite=Strict, so it never rides along on a
+// cross-site request at all. Lax on that one would hand the token to the
+// attack it exists to stop. Secure is conditional on the request being over
+// TLS, so it is checked from a server that is.
+//
+// And signing in must not settle for a session the caller already had: a
+// planted cookie that survives the sign-in is somebody else's session to use.
+func TestIntegrationTheSessionCookiesAreWhatTheyHaveToBe(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+
+	// A session the caller already holds, to plant in the sign-in request.
+	planted, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "cookie-probe", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/auth/login",
+		strings.NewReader(`{"realm":"master","username":"admin","password":"bootstrap-password-123","request":""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: planted.Token})
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("signing in answered %d", response.StatusCode)
+	}
+	issued := map[string]*http.Cookie{}
+	for _, cookie := range response.Cookies() {
+		issued[cookie.Name] = cookie
+	}
+	for _, want := range []struct {
+		name     string
+		httpOnly bool
+		sameSite http.SameSite
+	}{
+		{sessionCookieName, true, http.SameSiteLaxMode},
+		{csrfCookieName, false, http.SameSiteStrictMode},
+	} {
+		cookie := issued[want.name]
+		if cookie == nil {
+			t.Fatalf("signing in issued no %s cookie", want.name)
+		}
+		if cookie.HttpOnly != want.httpOnly {
+			t.Errorf("%s HttpOnly=%v, want %v", want.name, cookie.HttpOnly, want.httpOnly)
+		}
+		if cookie.SameSite != want.sameSite {
+			t.Errorf("%s SameSite=%v, want %v", want.name, cookie.SameSite, want.sameSite)
+		}
+		if cookie.Path != "/" {
+			t.Errorf("%s Path=%q, want the whole site", want.name, cookie.Path)
+		}
+	}
+	if issued[sessionCookieName].Value == planted.Token {
+		t.Error("signing in kept the session the caller arrived with, so one planted beforehand " +
+			"becomes a signed-in session somebody else knows")
+	}
+
+	// And what logout leaves behind.
+	cookies, csrf := signInForBoundaryProbe(t, server, "admin", "bootstrap-password-123")
+	out, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/auth/logout", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Header.Set("X-CSRF-Token", csrf)
+	for _, cookie := range cookies {
+		out.AddCookie(cookie)
+	}
+	logout, err := client.Do(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, logout.Body)
+	_ = logout.Body.Close()
+	cleared := map[string]bool{}
+	for _, cookie := range logout.Cookies() {
+		if cookie.Value == "" && cookie.MaxAge < 0 {
+			cleared[cookie.Name] = true
+		}
+	}
+	for _, name := range []string{sessionCookieName, csrfCookieName} {
+		if !cleared[name] {
+			t.Errorf("logging out left %s in the browser", name)
+		}
+	}
+
+	// Secure is conditional on the request really being over TLS, so it can
+	// only be seen from a server that is.
+	secureServer := httptest.NewTLSServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(secureServer.Close)
+	overTLS, err := secureServer.Client().Post(secureServer.URL+"/api/v1/auth/login", "application/json",
+		strings.NewReader(`{"realm":"master","username":"admin","password":"bootstrap-password-123","request":""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, overTLS.Body)
+	_ = overTLS.Body.Close()
+	secured := 0
+	for _, cookie := range overTLS.Cookies() {
+		if cookie.Secure {
+			secured++
+		} else {
+			t.Errorf("%s came back without Secure over a TLS request", cookie.Name)
+		}
+	}
+	if secured != 2 {
+		t.Errorf("%d cookies were marked Secure over TLS, want both", secured)
+	}
+}
