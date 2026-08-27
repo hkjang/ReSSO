@@ -7775,3 +7775,163 @@ func TestIntegrationADisabledAccountIsRefusedEveryWayItCouldAct(t *testing.T) {
 		}
 	}
 }
+
+// Switching a Client off is how an integration is decommissioned or cut loose
+// after a leak, and it has to reach everything the Client can still do, not
+// only the next sign-in. Six ways, decided in different places: asking for an
+// authorization code, exchanging one, the client credentials grant, renewing a
+// refresh token, introspecting a token - which the Realm deliberately opens to
+// every confidential Client, so a switched-off one would go on reading other
+// Clients' tokens - and having its post-logout redirect honoured.
+//
+// Each has to work while the Client is on, or its refusal afterwards would
+// only mean it never worked.
+func TestIntegrationADisabledClientIsRefusedEveryWayItCouldAct(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "rp", Name: "RP", Type: "confidential", RedirectURIs: []string{"https://rp.test/cb"},
+		PostLogoutRedirectURIs: []string{"https://rp.test/bye"},
+		GrantTypes:             []string{"authorization_code", "refresh_token", "client_credentials"},
+		DefaultScopes:          []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "subject", Password: "subject-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "client-probe", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, rp.Client, user, session.Session.ID,
+		[]string{"openid"}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	base := server.URL + "/realms/master/protocol/openid-connect"
+
+	verifier := strings.Repeat("client-probe-verify", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	// A code is spent by exchanging it, so each attempt mints its own.
+	mint := func() string {
+		request, _ := http.NewRequest(http.MethodGet, base+"/auth?response_type=code&client_id=rp"+
+			"&redirect_uri="+url.QueryEscape("https://rp.test/cb")+"&scope=openid&state=s"+
+			"&code_challenge="+challenge+"&code_challenge_method=S256", nil)
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		location, _ := url.Parse(response.Header.Get("Location"))
+		return location.Query().Get("code")
+	}
+
+	post := func(path string, form url.Values) (int, string) {
+		response, doErr := client.PostForm(base+path, form)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode, string(body)
+	}
+	auth := url.Values{"client_id": {"rp"}, "client_secret": {rp.ClientSecret}}
+	with := func(extra url.Values) url.Values {
+		form := url.Values{}
+		for k, v := range auth {
+			form[k] = v
+		}
+		for k, v := range extra {
+			form[k] = v
+		}
+		return form
+	}
+
+	ways := []struct {
+		what string
+		try  func() bool
+	}{
+		{"asking for an authorization code", func() bool { return mint() != "" }},
+		{"exchanging a fresh code", func() bool {
+			code := mint()
+			if code == "" {
+				return false
+			}
+			status, _ := post("/token", with(url.Values{"grant_type": {"authorization_code"},
+				"code": {code}, "redirect_uri": {"https://rp.test/cb"}, "code_verifier": {verifier}}))
+			return status == http.StatusOK
+		}},
+		{"the client credentials grant", func() bool {
+			status, _ := post("/token", with(url.Values{"grant_type": {"client_credentials"}}))
+			return status == http.StatusOK
+		}},
+		{"a refresh token", func() bool {
+			// Rotation spends it, so each attempt gets its own; the same token
+			// twice would be refused for reuse, not for the Client.
+			fresh, issueErr := service.IssueUserTokens(ctx, realm, rp.Client, user, session.Session.ID,
+				[]string{"openid"}, "", true)
+			if issueErr != nil {
+				t.Fatal(issueErr)
+			}
+			status, _ := post("/token", with(url.Values{"grant_type": {"refresh_token"},
+				"refresh_token": {fresh.RefreshToken}}))
+			return status == http.StatusOK
+		}},
+		{"introspecting a token", func() bool {
+			_, body := post("/token/introspect", with(url.Values{"token": {tokens.AccessToken}}))
+			var answer struct {
+				Active bool `json:"active"`
+			}
+			_ = json.Unmarshal([]byte(body), &answer)
+			return answer.Active
+		}},
+		{"its post-logout redirect", func() bool {
+			request, _ := http.NewRequest(http.MethodGet, base+"/logout?post_logout_redirect_uri="+
+				url.QueryEscape("https://rp.test/bye")+"&id_token_hint="+tokens.IDToken, nil)
+			response, doErr := client.Do(request)
+			if doErr != nil {
+				t.Fatal(doErr)
+			}
+			_ = response.Body.Close()
+			return strings.HasPrefix(response.Header.Get("Location"), "https://rp.test/bye")
+		}},
+	}
+
+	for _, way := range ways {
+		if !way.try() {
+			t.Fatalf("%s does not work while the Client is on, so refusing it afterwards would prove "+
+				"nothing", way.what)
+		}
+	}
+	if _, err := data.Pool.Exec(ctx, "UPDATE clients SET enabled=false WHERE id=$1", rp.Client.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, way := range ways {
+		if way.try() {
+			t.Errorf("%s still works for a Client that was switched off", way.what)
+		}
+	}
+}
