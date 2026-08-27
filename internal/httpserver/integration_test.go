@@ -7495,3 +7495,156 @@ func TestIntegrationARefreshTokenIsOnlyItsOwnClientsToRenew(t *testing.T) {
 			"can lock another out of renewing: %d %.120s", status, body)
 	}
 }
+
+// Suspending a Realm is what an operator reaches for to stop a tenant, and
+// the flag was once tested by four of the eight endpoints that resolve one:
+// the tenant could issue nothing while still vouching for the tokens already
+// out there and handing back their subjects' claims. That is fixed, and the
+// check lives in one helper - but the test for it named endpoints by hand, so
+// a new route that resolves a Realm its own way would not be noticed.
+//
+// The property that does not need a list: a suspended Realm answers exactly
+// as one that was never there. It holds for the awkward cases too - revocation
+// and introspection answer 200 either way, as their RFCs require - and it is
+// what the helper does, refusing with the not-found error.
+func TestIntegrationASuspendedRealmAnswersLikeNoRealmAtAll(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	router, _ := handler.(*chi.Mux)
+	type route struct{ method, template string }
+	var routes []route
+	if err := chi.Walk(router, func(method, template string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		if strings.HasPrefix(template, "/realms/{realm}/") {
+			routes = append(routes, route{method, template})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// userinfo answers 401 to an unauthenticated caller whether or not the
+	// Realm is live, so without a token it cannot show whether the flag was
+	// tested at all - the blind spot the historical defect lived in. Every
+	// probe carries one; the routes that ignore it are unaffected.
+	bearer := mintIntegrationAccessToken(t, data, server, bootstrap.RealmID, bootstrap.AdminUserID)
+
+	ask := func(r route, realmName string) int {
+		path := strings.ReplaceAll(r.template, "{realm}", realmName)
+		request, reqErr := http.NewRequest(r.method, server.URL+path, strings.NewReader(""))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.Header.Set("Authorization", "Bearer "+bearer)
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+
+	// While it is live, so a difference below is the suspension and not the route.
+	live := map[route]int{}
+	for _, r := range routes {
+		live[r] = ask(r, "master")
+	}
+	if _, err := data.Pool.Exec(ctx, "UPDATE realms SET enabled=false WHERE id=$1", bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) < 8 {
+		t.Fatalf("only %d routes resolve a Realm from the path, so this is not covering the protocol",
+			len(routes))
+	}
+	changed := 0
+	for _, r := range routes {
+		suspended := ask(r, "master")
+		unknown := ask(r, "no-such-realm")
+		if suspended != unknown {
+			t.Errorf("%s %s answers %d for a suspended Realm and %d for one that never existed, so "+
+				"the suspension is visible from outside and this route decides it separately",
+				r.method, r.template, suspended, unknown)
+		}
+		if live[r] != suspended {
+			changed++
+		}
+	}
+	// Otherwise a service that refused everything would pass: the answers have
+	// to have been different while the Realm was live.
+	if changed < len(routes)/2 {
+		t.Errorf("only %d of %d routes answered differently once the Realm was suspended, so most of "+
+			"them were refusing for some other reason and prove nothing", changed, len(routes))
+	}
+}
+
+// mintIntegrationAccessToken runs a full authorization code exchange and
+// returns the access token it produced.
+func mintIntegrationAccessToken(t *testing.T, data *store.Store, server *httptest.Server,
+	realmID, userID uuid.UUID) string {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "suspend-probe", Name: "Probe", Type: "public",
+		RedirectURIs: []string{"https://probe.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realmID, userID, time.Hour, "127.0.0.1", "suspend-probe", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := strings.Repeat("suspend-probe-verify", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	browser := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	request, err := http.NewRequest(http.MethodGet, server.URL+
+		"/realms/master/protocol/openid-connect/auth?response_type=code&client_id=suspend-probe"+
+		"&redirect_uri="+url.QueryEscape("https://probe.test/cb")+"&scope=openid&state=s"+
+		"&code_challenge="+challenge+"&code_challenge_method=S256", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+	response, err := browser.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	location, err := url.Parse(response.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := location.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code was issued for the probe: %s", location)
+	}
+	tokenResponse, err := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/token",
+		url.Values{"grant_type": {"authorization_code"}, "code": {code}, "client_id": {"suspend-probe"},
+			"redirect_uri": {"https://probe.test/cb"}, "code_verifier": {verifier}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(tokenResponse.Body)
+	_ = tokenResponse.Body.Close()
+	var issued struct {
+		Access string `json:"access_token"`
+	}
+	if json.Unmarshal(raw, &issued) != nil || issued.Access == "" {
+		t.Fatalf("the probe could not obtain an access token: %s", raw)
+	}
+	return issued.Access
+}
