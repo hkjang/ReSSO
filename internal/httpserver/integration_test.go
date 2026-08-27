@@ -7648,3 +7648,130 @@ func mintIntegrationAccessToken(t *testing.T, data *store.Store, server *httptes
 	}
 	return issued.Access
 }
+
+// Switching an account off is the emergency stop, and it has to reach every
+// credential the account is already holding - not just the next sign-in.
+// There are five, each decided by its own code in its own place: the browser
+// session, a personal API key, an access token at userinfo, the same token at
+// introspection (which is precisely what a resource server asks so it does not
+// have to wait out the expiry), and the refresh token.
+//
+// Each has to answer while the account is on, or its refusal afterwards would
+// only mean the credential never worked.
+func TestIntegrationADisabledAccountIsRefusedEveryWayItCouldAct(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "rp", Name: "RP", Type: "confidential", RedirectURIs: []string{"https://rp.test/cb"},
+		PostLogoutRedirectURIs: []string{"https://rp.test/bye"},
+		GrantTypes:             []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "subject", Password: "subject-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "disabled-probe", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := data.CreatePersonalAPIKey(ctx, user.ID, "agent", []string{"api:read", "mcp:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, rp.Client, user, session.Session.ID,
+		[]string{"openid"}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	send := func(request *http.Request) int {
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		// Introspection answers 200 either way; what it says is the answer.
+		if strings.Contains(request.URL.Path, "introspect") && strings.Contains(string(body), `"active":true`) {
+			return 200
+		}
+		if strings.Contains(request.URL.Path, "introspect") {
+			return 401
+		}
+		return response.StatusCode
+	}
+
+	ways := []struct {
+		what  string
+		build func() *http.Request
+	}{
+		{"the browser session", func() *http.Request {
+			r, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/me", nil)
+			r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+			return r
+		}},
+		{"a personal API key", func() *http.Request {
+			r, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/me", nil)
+			r.Header.Set("Authorization", "Bearer "+key.Secret)
+			return r
+		}},
+		{"the access token at userinfo", func() *http.Request {
+			r, _ := http.NewRequest(http.MethodGet,
+				server.URL+"/realms/master/protocol/openid-connect/userinfo", nil)
+			r.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+			return r
+		}},
+		{"the access token at introspection", func() *http.Request {
+			form := url.Values{"token": {tokens.AccessToken}, "client_id": {"rp"},
+				"client_secret": {rp.ClientSecret}}
+			r, _ := http.NewRequest(http.MethodPost,
+				server.URL+"/realms/master/protocol/openid-connect/token/introspect",
+				strings.NewReader(form.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			return r
+		}},
+		{"the refresh token", func() *http.Request {
+			form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {tokens.RefreshToken},
+				"client_id": {"rp"}, "client_secret": {rp.ClientSecret}}
+			r, _ := http.NewRequest(http.MethodPost,
+				server.URL+"/realms/master/protocol/openid-connect/token", strings.NewReader(form.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			return r
+		}},
+	}
+
+	for _, way := range ways {
+		if status := send(way.build()); status != http.StatusOK {
+			t.Fatalf("%s does not work while the account is on (%d), so refusing it afterwards would "+
+				"prove nothing", way.what, status)
+		}
+	}
+	if _, err := data.Pool.Exec(ctx, "UPDATE users SET enabled=false WHERE id=$1", user.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, way := range ways {
+		if status := send(way.build()); status == http.StatusOK {
+			t.Errorf("%s still works for an account that was switched off", way.what)
+		}
+	}
+}
