@@ -7935,3 +7935,101 @@ func TestIntegrationADisabledClientIsRefusedEveryWayItCouldAct(t *testing.T) {
 		}
 	}
 }
+
+// A personal API key is read-only authorization: changing state always needs a
+// browser session, so that CSRF protection applies. That one rule is what
+// bounds a leaked key - it can read what its scopes allow and nothing else. It
+// cannot mint another key, rotate one, change a password, end a session, or
+// touch a Realm.
+//
+// The rule is enforced in one place, by method, and that is exactly why it
+// wants a check that does not name routes: a route tree added outside that
+// middleware would inherit nothing and nobody would notice. So every route the
+// router knows is walked and sorted by whether it changes state.
+//
+// The reads carry the check that keeps this honest. A key that authenticated
+// nowhere would be "refused on every write" too.
+func TestIntegrationAnAPIKeyCannotChangeAnything(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := data.CreatePersonalAPIKey(ctx, bootstrap.AdminUserID, "agent",
+		[]string{"api:read", "mcp:read", "admin:read"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	router, _ := handler.(*chi.Mux)
+	type route struct{ method, template string }
+	var writes, reads []route
+	if err := chi.Walk(router, func(method, template string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		if !strings.HasPrefix(template, "/api/") || strings.Contains(template, "openapi") {
+			return nil
+		}
+		switch method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			reads = append(reads, route{method, template})
+		default:
+			writes = append(writes, route{method, template})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ask := func(r route) int {
+		path := strings.NewReplacer(
+			"{realmID}", bootstrap.RealmID.String(),
+			"{userID}", "00000000-0000-0000-0000-000000000000",
+			"{sessionID}", "00000000-0000-0000-0000-000000000000",
+			"{federationID}", "00000000-0000-0000-0000-000000000000",
+			"{roleID}", "00000000-0000-0000-0000-000000000000",
+			"{clientID}", "00000000-0000-0000-0000-000000000000",
+			"{requestID}", "00000000-0000-0000-0000-000000000000",
+			"{keyID}", "00000000-0000-0000-0000-000000000000",
+			"{id}", "00000000-0000-0000-0000-000000000000",
+		).Replace(r.template)
+		request, reqErr := http.NewRequest(r.method, server.URL+path, strings.NewReader("{}"))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("Authorization", "Bearer "+key.Secret)
+		request.Header.Set("Content-Type", "application/json")
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+
+	if len(writes) < 20 || len(reads) < 10 {
+		t.Fatalf("the walk found %d writes and %d reads, so it is not covering the API",
+			len(writes), len(reads))
+	}
+	for _, r := range writes {
+		if status := ask(r); status != http.StatusUnauthorized {
+			t.Errorf("%s %s answered %d to an API key, so a leaked key can change state there",
+				r.method, r.template, status)
+		}
+	}
+	accepted := 0
+	for _, r := range reads {
+		if ask(r) == http.StatusOK {
+			accepted++
+		}
+	}
+	if accepted < len(reads)/2 {
+		t.Errorf("the key was accepted on only %d of %d reads, so it authenticated almost nowhere and "+
+			"being refused on every write means nothing", accepted, len(reads))
+	}
+}
