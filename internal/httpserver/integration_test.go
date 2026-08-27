@@ -8033,3 +8033,132 @@ func TestIntegrationAnAPIKeyCannotChangeAnything(t *testing.T) {
 			"being refused on every write means nothing", accepted, len(reads))
 	}
 }
+
+// A browser session is a cookie, so it rides along with a request another site
+// made. What separates the two is the CSRF token, which a cross-site caller
+// cannot read - and the whole reason an API key is refused on these routes is
+// that it would carry no session and so no token either.
+//
+// The check is one line in the middleware that resolves a session, decided by
+// method, so what wants testing is not a list of routes but that every route
+// which changes state actually passes through it. A tree mounted elsewhere
+// would take a session cookie and never ask for the token.
+//
+// The second half is what keeps this from being free: with a token in hand,
+// every one of those routes has to get past the check. Otherwise "refused
+// without a token" would also hold for routes nothing can reach.
+func TestIntegrationEveryStateChangeNeedsItsCSRFToken(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	router, _ := handler.(*chi.Mux)
+	type route struct{ method, template string }
+	var writes []route
+	if err := chi.Walk(router, func(method, template string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		if strings.HasPrefix(template, "/api/") && !isSafeMethod(method) {
+			writes = append(writes, route{method, template})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The walk includes signing out and ending a session, so one reused across
+	// requests dies partway and everything after it reads 401. Each gets its
+	// own - made here rather than through the sign-in endpoint, which refuses
+	// the hundredth attempt from one address, as it should.
+	ask := func(r route, sendToken, withSession bool) int {
+		var cookies []*http.Cookie
+		token := ""
+		if withSession || sendToken {
+			fresh, sessionErr := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+				time.Hour, "127.0.0.1", "csrf-probe", "password")
+			if sessionErr != nil {
+				t.Fatal(sessionErr)
+			}
+			cookies = []*http.Cookie{{Name: sessionCookieName, Value: fresh.Token}}
+			token = fresh.CSRFToken
+		}
+		if !sendToken {
+			token = ""
+		}
+		// Every identifier is one nothing answers to. The check under test runs
+		// before the handler looks at them, so a 404 is no obstacle - and the
+		// walk includes deletions and an account update, which with real
+		// identifiers would take apart the very Realm and account it signs in
+		// with. It did exactly that before this line.
+		path := strings.NewReplacer(
+			"{realmID}", bootstrap.RealmID.String(),
+			"{userID}", "00000000-0000-0000-0000-0000000000ff",
+			"{sessionID}", "00000000-0000-0000-0000-000000000000",
+			"{federationID}", "00000000-0000-0000-0000-000000000000",
+			"{roleID}", "00000000-0000-0000-0000-000000000000",
+			"{clientID}", "00000000-0000-0000-0000-000000000000",
+			"{requestID}", "00000000-0000-0000-0000-000000000000",
+			"{keyID}", "00000000-0000-0000-0000-000000000000",
+			"{id}", "00000000-0000-0000-0000-000000000000",
+		).Replace(r.template)
+		request, reqErr := http.NewRequest(r.method, server.URL+path, strings.NewReader("{}"))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			request.Header.Set("X-CSRF-Token", token)
+		}
+		if withSession {
+			for _, cookie := range cookies {
+				request.AddCookie(cookie)
+			}
+		}
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+
+	if len(writes) < 20 {
+		t.Fatalf("the walk found %d state-changing routes, so it is not covering the API", len(writes))
+	}
+	for _, r := range writes {
+		// The check is middleware, so it answers before the path parameters or
+		// the body are looked at: without a token the answer is 403 whatever
+		// else is wrong with the request. Accepting any refusal instead would
+		// let a route lose the check and pass here on a 404 for its made-up id.
+		// A route that answers the same with no cookies at all does not run on a
+		// session, so there is nothing for a token to be bound to - signing in
+		// is how a session is obtained in the first place.
+		if ask(r, false, false) == ask(r, true, true) {
+			continue
+		}
+		if status := ask(r, false, true); status != http.StatusForbidden {
+			t.Errorf("%s %s answered %d to a session request carrying no CSRF token, want 403: another "+
+				"site can drive it with the cookie the browser sends anyway", r.method, r.template, status)
+		}
+	}
+	// A route that answers 403 with a valid token was refused for something
+	// other than the token - permission, most likely - and cannot show whether
+	// the check is there at all.
+	reached := 0
+	for _, r := range writes {
+		if ask(r, true, true) != http.StatusForbidden {
+			reached++
+		}
+	}
+	if reached*4 < len(writes)*3 {
+		t.Errorf("only %d of %d routes got past the check with a token, so most were refused for some "+
+			"other reason and being refused without one proves little", reached, len(writes))
+	}
+}
