@@ -2,7 +2,7 @@ name: resso
 
 services:
   resso:
-    image: resso:${RESSO_VERSION:-v0.9.62}
+    image: resso:${RESSO_VERSION:-v0.9.63}
     container_name: resso
     restart: unless-stopped
     ports:
