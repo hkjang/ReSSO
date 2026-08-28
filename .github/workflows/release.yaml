@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # A release that was published by hand still needs its offline image. Without
+  # this the only way to attach one is to delete and re-push the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build the offline image for"
+        required: true
 
 permissions:
   contents: write
@@ -29,10 +36,17 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
       - name: Validate tag
         shell: bash
         run: |
-          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tag="${{ inputs.tag || github.ref_name }}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          # Everything below names the release through this one variable, so a
+          # dispatched run builds the tag it was given and not whatever branch
+          # the workflow file was read from.
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "RELEASE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
@@ -54,12 +68,12 @@ jobs:
         shell: bash
         run: |
           docker build --platform linux/amd64 \
-            --build-arg "VERSION=${GITHUB_REF_NAME}" \
-            --build-arg "COMMIT=${GITHUB_SHA}" \
+            --build-arg "VERSION=${RELEASE_TAG}" \
+            --build-arg "COMMIT=${RELEASE_COMMIT}" \
             --build-arg "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --tag "resso:${GITHUB_REF_NAME}" .
-          docker image inspect "resso:${GITHUB_REF_NAME}" >/dev/null
-          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "resso:${GITHUB_REF_NAME}")" = "linux/amd64"
+            --tag "resso:${RELEASE_TAG}" .
+          docker image inspect "resso:${RELEASE_TAG}" >/dev/null
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "resso:${RELEASE_TAG}")" = "linux/amd64"
       - name: Test built offline image
         shell: bash
         env:
@@ -82,21 +96,21 @@ jobs:
             --read-only --tmpfs /tmp:size=16m,mode=1777 \
             --cap-drop ALL --security-opt no-new-privileges:true \
             -e POSTGRES_DSN -e BOOTSTRAP_ADMIN -e BOOTSTRAP_ADMIN_PASSWORD -e ENCRYPTION_KEY \
-            "resso:${GITHUB_REF_NAME}"
+            "resso:${RELEASE_TAG}"
           for attempt in $(seq 1 30); do
             curl -fsS http://127.0.0.1:8080/health/ready >/dev/null && break
             sleep 1
           done
           curl -fsS http://127.0.0.1:8080/health/ready >/dev/null
           curl -fsS http://127.0.0.1:8080/api/v1/meta | \
-            jq -e --arg expected "$GITHUB_REF_NAME" '.product == "ReSSO" and .version == $expected' >/dev/null
+            jq -e --arg expected "$RELEASE_TAG" '.product == "ReSSO" and .version == $expected' >/dev/null
           bash ./scripts/smoke-test.sh http://127.0.0.1:8080 admin integration-password-123
       - name: Package offline image
         shell: bash
         run: |
-          docker save "resso:${GITHUB_REF_NAME}" | gzip -9 -n > "resso-${GITHUB_REF_NAME}.tar.gz"
-          gzip -t "resso-${GITHUB_REF_NAME}.tar.gz"
-          sha256sum "resso-${GITHUB_REF_NAME}.tar.gz" > release-sha256.txt
+          docker save "resso:${RELEASE_TAG}" | gzip -9 -n > "resso-${RELEASE_TAG}.tar.gz"
+          gzip -t "resso-${RELEASE_TAG}.tar.gz"
+          sha256sum "resso-${RELEASE_TAG}.tar.gz" > release-sha256.txt
       # What is published has to be loadable by the command the README gives,
       # from the two files as published and nothing else. Packaging was
       # verified up to this point and the reverse trip never was, so a change
@@ -106,33 +120,53 @@ jobs:
       - name: Load the published archive back, as an operator would
         shell: bash
         run: |
-          docker image rm "resso:${GITHUB_REF_NAME}"
-          if docker image inspect "resso:${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+          docker image rm "resso:${RELEASE_TAG}"
+          if docker image inspect "resso:${RELEASE_TAG}" >/dev/null 2>&1; then
             echo "the image was still present, so the load below would prove nothing" >&2
             exit 1
           fi
-          ./scripts/offline-load.sh "resso-${GITHUB_REF_NAME}.tar.gz"
-          docker image inspect "resso:${GITHUB_REF_NAME}" >/dev/null
+          ./scripts/offline-load.sh "resso-${RELEASE_TAG}.tar.gz"
+          docker image inspect "resso:${RELEASE_TAG}" >/dev/null
           # And a damaged archive has to be refused rather than half-loaded.
-          cp "resso-${GITHUB_REF_NAME}.tar.gz" damaged.tar.gz
+          cp "resso-${RELEASE_TAG}.tar.gz" damaged.tar.gz
           printf '\x00' | dd of=damaged.tar.gz bs=1 seek=64 conv=notrunc status=none
-          sed "s/resso-${GITHUB_REF_NAME}.tar.gz/damaged.tar.gz/" release-sha256.txt > damaged-sha256.txt
+          sed "s/resso-${RELEASE_TAG}.tar.gz/damaged.tar.gz/" release-sha256.txt > damaged-sha256.txt
           if ./scripts/offline-load.sh damaged.tar.gz damaged-sha256.txt; then
             echo "a damaged archive was accepted" >&2
             exit 1
           fi
           rm -f damaged.tar.gz damaged-sha256.txt
-      - name: Create GitHub release with the image archive
+      # A release published by hand before the tag was pushed used to make this
+      # step fail, and the run failed with it: the archive was built, smoke
+      # tested and loaded back, then thrown away. Attach to whatever release
+      # the tag already has, and keep the notes that were written by hand.
+      - name: Publish the release with the image archive
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          archive="resso-${GITHUB_REF_NAME}.tar.gz"
+          archive="resso-${RELEASE_TAG}.tar.gz"
           digest="$(cut -d' ' -f1 release-sha256.txt)"
-          notes="$(printf 'Docker image: `%s`\n\nArchive: `%s`\n\nSHA-256: `%s`' "resso:${GITHUB_REF_NAME}" "$archive" "$digest")"
-          gh release create "${GITHUB_REF_NAME}" \
-            "$archive#ReSSO offline Docker image" \
-            "release-sha256.txt#SHA-256 checksum" \
-            --title "ReSSO ${GITHUB_REF_NAME}" \
-            --generate-notes \
-            --notes "$notes"
+          notes="$(printf 'Docker image: `%s`\n\nArchive: `%s`\n\nSHA-256: `%s`' "resso:${RELEASE_TAG}" "$archive" "$digest")"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" \
+              "$archive#ReSSO offline Docker image" \
+              "release-sha256.txt#SHA-256 checksum" \
+              --clobber
+            existing="$(gh release view "${RELEASE_TAG}" --json body --jq .body)"
+            case "$existing" in
+              *"$digest"*) ;;
+              *) gh release edit "${RELEASE_TAG}" \
+                   --notes "$(printf '%s\n\n---\n\n%s' "$existing" "$notes")" ;;
+            esac
+          else
+            gh release create "${RELEASE_TAG}" \
+              "$archive#ReSSO offline Docker image" \
+              "release-sha256.txt#SHA-256 checksum" \
+              --title "ReSSO ${RELEASE_TAG}" \
+              --generate-notes \
+              --notes "$notes"
+          fi
+          # Whatever route was taken, the release has to carry both files.
+          attached="$(gh release view "${RELEASE_TAG}" --json assets --jq '[.assets[].name] | sort | join(",")')"
+          test "$attached" = "release-sha256.txt,${archive}"
