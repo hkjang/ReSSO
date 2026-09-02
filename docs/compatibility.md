@@ -18,7 +18,7 @@
 | Client Credentials | Confidential Client 구현 |
 | UserInfo / JWKS | 구현 |
 | Introspection / Revocation | 구현. Access Token은 같은 Realm의 모든 Confidential Client가 조회 가능 |
-| RP-Initiated Logout | 구현. `id_token_hint` 또는 `client_id` |
+| RP-Initiated Logout | 구현. `id_token_hint` 또는 `client_id`. `id_token_hint`는 만료된 ID Token도 받습니다(RP가 로그아웃 시점에 들고 있는 것이 보통 만료된 토큰입니다). Access Token은 hint가 아닙니다 |
 | Back-Channel Logout | 구현. Session 참여 Client에 서명된 `logout_token` 전송 |
 | ID Token `at_hash` | 구현 |
 | Keycloak `realm_access` / `resource_access` Claim | 구현 |

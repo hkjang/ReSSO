@@ -217,25 +217,43 @@ func (s *Service) IssueLogoutToken(ctx context.Context, realm domain.Realm, clie
 	return jwt.Signed(signer).Claims(standard).Claims(extra).Serialize()
 }
 
-// SubjectFromIDTokenHint reads the subject an id_token_hint asserts.
+// IDTokenHint reads the claims of an id_token_hint, for the two endpoints that
+// take one: authorization and RP-initiated logout.
 //
 // Expiry is deliberately not checked. A hint is normally presented precisely
-// because the token expired — that is what a relying party is trying to renew
-// — so rejecting expired ones would refuse the case the parameter exists for.
-// The signature and issuer still have to be ours, which is what makes the
-// subject trustworthy enough to compare against the session.
+// because the token expired — that is what a relying party is trying to renew,
+// and the state its stored token is in by the time somebody clicks log out — so
+// rejecting expired ones would refuse the case the parameter exists for.
+// RP-Initiated Logout 1.0 section 4 asks for exactly that. The signature and
+// issuer still have to be ours, which is what makes the claims trustworthy
+// enough to act on.
+//
+// The typ claim is checked because only an ID token is a hint. An access token
+// carries the same issuer, azp and subject, so without this it passed for one.
+func (s *Service) IDTokenHint(ctx context.Context, realm domain.Realm, raw string) (VerifiedToken, error) {
+	standard, extra, err := s.parseSigned(ctx, realm, raw)
+	if err != nil {
+		return VerifiedToken{}, err
+	}
+	if standard.Issuer != realm.IssuerURL {
+		return VerifiedToken{}, errors.New("id_token_hint was issued by another issuer")
+	}
+	if extra.Type != "ID" {
+		return VerifiedToken{}, errors.New("id_token_hint is not an ID token")
+	}
+	return VerifiedToken{Claims: standard, Extra: extra, Raw: raw}, nil
+}
+
+// SubjectFromIDTokenHint reads the subject an id_token_hint asserts.
 func (s *Service) SubjectFromIDTokenHint(ctx context.Context, realm domain.Realm, raw string) (string, error) {
-	standard, _, err := s.parseSigned(ctx, realm, raw)
+	hint, err := s.IDTokenHint(ctx, realm, raw)
 	if err != nil {
 		return "", err
 	}
-	if standard.Issuer != realm.IssuerURL {
-		return "", errors.New("id_token_hint was issued by another issuer")
-	}
-	if standard.Subject == "" {
+	if hint.Claims.Subject == "" {
 		return "", errors.New("id_token_hint has no subject")
 	}
-	return standard.Subject, nil
+	return hint.Claims.Subject, nil
 }
 
 // parseSigned resolves the Realm signing key named by the token and returns
