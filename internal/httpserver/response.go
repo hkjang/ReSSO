@@ -16,7 +16,17 @@ type apiError struct {
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
+	// no-store is the right default here — almost everything this service
+	// answers with is a token, a credential or somebody's account — but it is a
+	// default rather than a rule, and Set made it a rule. The JWKS handler is
+	// the one exception, publishing a key set that every resource server
+	// refetches to verify every token; it chose its own Cache-Control and this
+	// line silently replaced it. The code said the set was cacheable, the
+	// response said it was not, and neither carried anything to say which was
+	// meant.
+	if w.Header().Get("Cache-Control") == "" {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }

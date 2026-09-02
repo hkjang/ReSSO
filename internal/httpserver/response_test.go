@@ -32,6 +32,27 @@ func TestWriteStoreErrorMapsInvalidInputToBadRequest(t *testing.T) {
 	}
 }
 
+// no-store is the default every JSON answer gets, and it has to stay the
+// default: these are tokens, credentials and people's accounts. It was written
+// with Set, which made it a rule instead — a handler that had chosen its own
+// Cache-Control was overwritten on the way out, silently, so the JWKS shipped
+// for two versions saying it could not be stored while the line asking for it
+// to be cached sat right above the call.
+func TestWriteJSONDefaultsToNoStoreWithoutOverridingAHandler(t *testing.T) {
+	plain := httptest.NewRecorder()
+	writeJSON(plain, http.StatusOK, map[string]any{"ok": true})
+	if stored := plain.Header().Get("Cache-Control"); stored != "no-store" {
+		t.Errorf("Cache-Control = %q; want no-store by default", stored)
+	}
+
+	chosen := httptest.NewRecorder()
+	chosen.Header().Set("Cache-Control", "public, max-age=30")
+	writeJSON(chosen, http.StatusOK, map[string]any{"keys": []any{}})
+	if stored := chosen.Header().Get("Cache-Control"); stored != "public, max-age=30" {
+		t.Errorf("Cache-Control = %q; the handler's own choice was overwritten", stored)
+	}
+}
+
 // Every refusal this service makes is a JSON object with error, message and
 // trace_id, and the OpenAPI document promises that shape for 4XX on every
 // operation. Two paths did not keep it, both of them chi's defaults: an
