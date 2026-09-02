@@ -93,7 +93,17 @@ func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
 	for _, key := range keys {
 		result = append(result, key.PublicJWK)
 	}
-	w.Header().Set("Cache-Control", "public, max-age=300, stale-while-revalidate=300")
+	// How long a relying party may hold this set is bounded by how long the set
+	// itself may be out of date, and that is store.SigningKeyTTL: a rotation on
+	// one instance leaves every other instance serving a set without the new key
+	// until its own cache expires. Anything longer than that hands a relying
+	// party a stale set and tells it to keep it past the window that produced
+	// it, so tokens signed with the new key fail to verify for the difference —
+	// which the earlier five minutes here would have made ten times the window.
+	//
+	// stale-while-revalidate is deliberately absent for the same reason: it
+	// extends exactly that.
+	w.Header().Set("Cache-Control", "public, max-age="+strconv.Itoa(int(store.SigningKeyTTL.Seconds())))
 	writeJSON(w, http.StatusOK, map[string]any{"keys": result})
 }
 

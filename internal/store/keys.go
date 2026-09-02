@@ -18,11 +18,15 @@ import (
 	"github.com/hkjang/ReSSO/internal/domain"
 )
 
-// signingKeyTTL bounds how long an instance keeps serving a cached key set
+// SigningKeyTTL bounds how long an instance keeps serving a cached key set
 // after another instance rotates. A rotated key stays PASSIVE — and therefore
 // published and accepted — for two hours, so signing with it for a few more
 // seconds cannot produce a token that fails verification.
-const signingKeyTTL = 30 * time.Second
+//
+// Exported because it is also the longest a key set this instance publishes can
+// be out of date, which is what the JWKS endpoint may let a relying party hold
+// it for. See the freshness note there.
+const SigningKeyTTL = 30 * time.Second
 
 // minimumKeyReload floors how often an unrecognised key identifier may force a
 // read. The reload below turns a cache miss into a database query, and the
@@ -44,7 +48,7 @@ type signingKeyEntry struct {
 // The zero value is usable, so a Store built literally in tests still works.
 func (s *Store) cachedSigningKeys(ctx context.Context, realmID uuid.UUID) (signingKeyEntry, error) {
 	if cached, found := s.signingKeys.Load(realmID); found {
-		if entry, ok := cached.(signingKeyEntry); ok && time.Since(entry.loadedAt) < signingKeyTTL {
+		if entry, ok := cached.(signingKeyEntry); ok && time.Since(entry.loadedAt) < SigningKeyTTL {
 			return entry, nil
 		}
 	}
@@ -292,7 +296,7 @@ func (s *Store) loadActivePrivateKey(ctx context.Context, realmID uuid.UUID) (*r
 // status so the row records what happened; it no longer decides it.
 //
 // The per-Realm cache can still serve a key for its own lifetime past that
-// moment, which is bounded by signingKeyTTL rather than by an hour.
+// moment, which is bounded by SigningKeyTTL rather than by an hour.
 func (s *Store) ListSigningKeys(ctx context.Context, realmID uuid.UUID) ([]domain.SigningKey, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT id,realm_id,kid,algorithm,status,public_jwk,created_at,retire_at,
         GREATEST(0, EXTRACT(day FROM now()-created_at))::int

@@ -8294,3 +8294,120 @@ func TestIntegrationTheSessionCookiesAreWhatTheyHaveToBe(t *testing.T) {
 		t.Errorf("%d cookies were marked Secure over TLS, want both", secured)
 	}
 }
+
+// The JWKS is what every resource server fetches to verify every token it is
+// given, and the handler asks for it to be cached. It was not: writeJSON set
+// Cache-Control after the handler had already set it, so every answer went out
+// no-store while the line above said otherwise — the code and the wire
+// disagreeing, with nothing in either to show which was meant. What that cost
+// is a key set refetched per verification rather than per half minute.
+//
+// Restoring it makes the freshness bound the thing to hold onto. A relying
+// party must not keep a key set for longer than one can be out of date, and
+// that is store.SigningKeyTTL: a rotation on one instance leaves every other
+// instance serving a set without the new key until its own cache expires. A
+// longer max-age hands a relying party exactly such a set and tells it to keep
+// it past the window that produced it, so tokens signed with the new key fail
+// to verify for the difference.
+//
+// And a cacheable answer whose CORS header depends on the Origin has to say so.
+// Vary was added only on the branch where the origin turned out to be allowed,
+// which is the branch where a cache least needs telling: the copy naming one
+// registered origin could be served to every other caller.
+func TestIntegrationJWKSIsCacheableNoLongerThanAKeySetCanBeStale(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+		ClientID: "spa", Name: "Browser SPA", Type: "public",
+		RedirectURIs: []string{"https://spa.example.com/callback"},
+		WebOrigins:   []string{"https://spa.example.com"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	fetch := func(path, origin string) http.Header {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if origin != "" {
+			request.Header.Set("Origin", origin)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s answered %d", path, response.StatusCode)
+		}
+		return response.Header
+	}
+
+	const certs = "/realms/master/protocol/openid-connect/certs"
+	keySetHeader := fetch(certs, "")
+	directives := keySetHeader.Get("Cache-Control")
+	maxAge := -1
+	for _, directive := range strings.Split(directives, ",") {
+		if value, found := strings.CutPrefix(strings.TrimSpace(directive), "max-age="); found {
+			maxAge, _ = strconv.Atoi(value)
+		}
+	}
+	if strings.Contains(directives, "no-store") || maxAge <= 0 {
+		t.Errorf("the key set is served %q, so a resource server refetches it to verify every token", directives)
+	}
+	if limit := int(store.SigningKeyTTL.Seconds()); maxAge > limit {
+		t.Errorf("the key set may be held for %ds while one may be out of date for %ds; a rotation is unverifiable for the difference",
+			maxAge, limit)
+	}
+	// stale-while-revalidate extends the held copy past max-age, which is the
+	// one thing the bound above exists to prevent.
+	if strings.Contains(directives, "stale-while-revalidate") {
+		t.Errorf("the key set may be served stale past its max-age: %q", directives)
+	}
+
+	// Whether the origin is registered or not, the answer depends on it.
+	for _, origin := range []string{"", "https://spa.example.com", "https://attacker.example.com"} {
+		header := fetch(certs, origin)
+		if !slices.ContainsFunc(header.Values("Vary"), func(value string) bool {
+			return strings.Contains(strings.ToLower(value), "origin")
+		}) {
+			t.Errorf("a cacheable key set fetched with Origin %q does not vary by it: %v", origin, header.Values("Vary"))
+		}
+		allowed := header.Get("Access-Control-Allow-Origin")
+		if origin == "https://spa.example.com" && allowed != origin {
+			t.Errorf("a registered origin was answered Access-Control-Allow-Origin %q", allowed)
+		}
+		if origin == "https://attacker.example.com" && allowed != "" {
+			t.Errorf("an unregistered origin was answered Access-Control-Allow-Origin %q", allowed)
+		}
+	}
+
+	// The key set is the exception, not the new rule. Everything else this
+	// service answers with still refuses to be stored.
+	if stored := fetch("/realms/master/.well-known/openid-configuration", "").Get("Cache-Control"); stored != "no-store" {
+		t.Errorf("the discovery document is served %q, want no-store", stored)
+	}
+	refused, err := server.Client().Post(server.URL+"/realms/master/protocol/openid-connect/token",
+		"application/x-www-form-urlencoded", strings.NewReader("grant_type=client_credentials"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, refused.Body)
+	_ = refused.Body.Close()
+	if stored := refused.Header.Get("Cache-Control"); stored != "no-store" {
+		t.Errorf("the token endpoint is served %q, want no-store", stored)
+	}
+}

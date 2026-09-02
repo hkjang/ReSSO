@@ -83,12 +83,18 @@ func (s *Server) commonMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) oidcCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Announced whether or not the origin turns out to be allowed, because
+		// what varies is the answer, not the allowed case of it. Adding it only
+		// on the allowed path let a shared cache treat a response whose
+		// Access-Control-Allow-Origin names one registered origin as the answer
+		// for every origin — and the JWKS is served public and cacheable, so it
+		// is the one response here a cache actually keeps.
+		w.Header().Add("Vary", "Origin")
 		origin := strings.TrimRight(strings.TrimSpace(r.Header.Get("Origin")), "/")
 		if origin != "" {
 			if realm, err := s.realmFromPath(r); err == nil {
 				if allowed, allowErr := s.store.WebOriginAllowed(r.Context(), realm.ID, origin); allowErr == nil && allowed {
 					w.Header().Set("Access-Control-Allow-Origin", origin)
-					w.Header().Add("Vary", "Origin")
 					w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 					w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 					w.Header().Set("Access-Control-Max-Age", "600")
