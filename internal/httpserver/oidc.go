@@ -833,7 +833,13 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 		// below, so naming a switched-off Client by client_id was refused
 		// while presenting its ID token was not — and what this Client
 		// decides is whether a post-logout redirect target is allowed.
-		if verified, verifyErr := s.oidc.Verify(r.Context(), realm, hint, ""); verifyErr == nil {
+		//
+		// Read as a hint rather than verified as a live token: this used to go
+		// through Verify, which enforces expiry, and an expired ID token is the
+		// ordinary thing a relying party has to hand at logout. Refusing it left
+		// client nil, which dropped post_logout_redirect_uri without a word and
+		// stranded the browser on this service's login page.
+		if verified, verifyErr := s.oidc.IDTokenHint(r.Context(), realm, hint); verifyErr == nil {
 			if found, findErr := s.store.ClientByIdentifier(r.Context(), realm.ID, verified.Extra.AuthorizedParty); findErr == nil && found.Enabled {
 				client = &found
 			}

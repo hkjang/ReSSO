@@ -6362,6 +6362,108 @@ func TestIntegrationAClientActsOnlyOnWhatIsItsOwn(t *testing.T) {
 	}
 }
 
+// An id_token_hint at the logout endpoint is how a relying party says which of
+// its addresses to come back to, and by the time somebody clicks log out the
+// token it stored is normally past its expiry — five minutes, by default. That
+// hint went through the same verification as a token being presented for
+// access, so an expired one was refused, and refusing it did not say no: it
+// left the Client unresolved, dropped post_logout_redirect_uri, and left the
+// browser on this service's login page. The relying party sees the person
+// simply not come back.
+//
+// The other half is the reverse: an access token carries the same issuer, azp
+// and subject as the ID token beside it, so it passed for a hint. Only an ID
+// token is one.
+func TestIntegrationLogoutTakesTheHintARelyingPartyActuallyHolds(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmID := bootstrap.RealmID
+	if err := data.EnsureActiveSigningKey(ctx, realmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "hint-rp", Name: "Hint RP", Type: "confidential",
+		RedirectURIs:           []string{"https://hint.test/cb"},
+		PostLogoutRedirectURIs: []string{"https://hint.test/bye"},
+		GrantTypes:             []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "hinted", Password: "hinted-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realmID, user.ID, time.Hour, "127.0.0.1", "hint-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, created.Client, user, session.Session.ID,
+		[]string{"openid"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The Realm's access token TTL is floored at a minute, so an expired ID
+	// token cannot be waited out; it is signed here with the Realm's own key,
+	// which is what the endpoint checks.
+	privateKey, metadata, err := data.ActivePrivateKey(ctx, realmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: privateKey},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", metadata.KID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	expired, err := jwt.Signed(signer).Claims(jwt.Claims{
+		Issuer: realm.IssuerURL, Subject: user.ID.String(), Audience: jwt.Audience{"hint-rp"},
+		IssuedAt: jwt.NewNumericDate(now.Add(-2 * time.Hour)),
+		Expiry:   jwt.NewNumericDate(now.Add(-time.Hour)), ID: uuid.NewString(),
+	}).Claims(map[string]any{"typ": "ID", "azp": "hint-rp", "sid": session.Session.ID.String()}).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	noRedirect := server.Client()
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	logoutTo := func(hint string) string {
+		t.Helper()
+		response, getErr := noRedirect.Get(server.URL + "/realms/master/protocol/openid-connect/logout?" +
+			url.Values{"id_token_hint": {hint}, "post_logout_redirect_uri": {"https://hint.test/bye"}}.Encode())
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response.Header.Get("Location")
+	}
+
+	if where := logoutTo(tokens.IDToken); !strings.HasPrefix(where, "https://hint.test/bye") {
+		t.Fatalf("an unexpired ID token was not accepted as a hint (%q), so the cases below would prove nothing", where)
+	}
+	if where := logoutTo(expired); !strings.HasPrefix(where, "https://hint.test/bye") {
+		t.Errorf("an expired ID token was not accepted as a hint: logout went to %q instead of the "+
+			"address the relying party registered", where)
+	}
+	if where := logoutTo(tokens.AccessToken); strings.HasPrefix(where, "https://hint.test/bye") {
+		t.Error("an access token was accepted as an id_token_hint")
+	}
+}
+
 // A refresh token presented after it was rotated is the strongest sign this
 // service has that one was taken, and revoking the family is the whole of the
 // response: it takes the working token away from whoever is holding it. The
