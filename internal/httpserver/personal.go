@@ -19,7 +19,14 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err)
 		return
 	}
-	roles, _ := s.store.RealmRolesForUser(r.Context(), user.ID)
+	// Discarding this error answered "roles": [] with a 200, which the console
+	// renders as an account holding nothing — the same screen a person with no
+	// Roles sees, so a fault reading them looks like a decision someone made.
+	roles, err := s.store.RealmRolesForUser(r.Context(), user.ID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
 	response := map[string]any{
 		"user":       user,
 		"roles":      roles,

@@ -8554,3 +8554,120 @@ func TestIntegrationEveryAuthorizationResponseCarriesTheAdvertisedIssuer(t *test
 		}
 	}
 }
+
+// userinfo is where a relying party that keeps no claims of its own asks what
+// somebody may do, and realm_access.roles is the answer it acts on. Both Role
+// lookups behind the `roles` scope discarded their error, so a fault reading
+// them produced an empty list and a 200 — the service stating that this account
+// holds nothing, in exactly the words it uses for an account whose Roles were
+// all taken away. A relying party cannot tell those apart, so it demotes the
+// person for the length of the fault and restores them when it clears, with
+// nothing on either side saying why.
+//
+// Token issuance already refuses the same two lookups, so the two endpoints
+// serving the same scope disagreed about what an unreadable Role means.
+func TestIntegrationUserInfoRefusesWhenRolesCannotBeRead(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "roles-reader", Name: "Roles Reader", Type: "confidential",
+		RedirectURIs:  []string{"https://reader.example.test/cb"},
+		GrantTypes:    []string{"authorization_code"},
+		DefaultScopes: []string{"openid", "roles"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "role-holder", Password: "role-holder-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "roles-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	issued, err := service.IssueUserTokens(ctx, realm, created.Client, user, session.Session.ID,
+		[]string{"openid", "roles"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	userInfo := func() (int, map[string]any) {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodGet,
+			server.URL+"/realms/master/protocol/openid-connect/userinfo", nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Authorization", "Bearer "+issued.AccessToken)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer response.Body.Close()
+		var decoded map[string]any
+		if decodeErr := json.NewDecoder(response.Body).Decode(&decoded); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		return response.StatusCode, decoded
+	}
+
+	// The healthy answer first: without it, every refusal below would prove
+	// only that this token never worked.
+	status, claims := userInfo()
+	if status != http.StatusOK {
+		t.Fatalf("userinfo answered %d for a freshly issued token: %v", status, claims)
+	}
+	access, _ := claims["realm_access"].(map[string]any)
+	granted, _ := access["roles"].([]any)
+	if len(granted) == 0 {
+		t.Fatalf("the account carried no Roles to begin with, so an empty list below would prove nothing: %v", claims)
+	}
+
+	// Each Role table is taken away in turn, because the two lookups are
+	// separate calls and covering one leaves the other free to go on
+	// discarding. Renaming keeps the table's identity, so putting it back
+	// restores the schema exactly; the schema itself belongs to this test.
+	for _, table := range []string{"user_roles", "user_client_roles"} {
+		if _, err := data.Pool.Exec(ctx, "ALTER TABLE "+table+" RENAME TO "+table+"_hidden"); err != nil {
+			t.Fatal(err)
+		}
+		status, body := userInfo()
+		if _, err := data.Pool.Exec(ctx, "ALTER TABLE "+table+"_hidden RENAME TO "+table); err != nil {
+			t.Fatal(err)
+		}
+		if status == http.StatusOK {
+			t.Errorf("with %s unreadable userinfo answered 200 and %v — a relying party reads that as an "+
+				"account that holds nothing, which is not what this service knows", table, body)
+			continue
+		}
+		if status != http.StatusInternalServerError {
+			t.Errorf("with %s unreadable userinfo answered %d; the token is fine and the caller has nothing "+
+				"to fix, so anything but a 5xx has relying parties discard a working credential", table, status)
+		}
+		if body["error"] != "server_error" {
+			t.Errorf("with %s unreadable userinfo answered error=%v, want server_error", table, body["error"])
+		}
+	}
+
+	// And it recovers: the refusal has to be about the fault, not about this
+	// token, or the endpoint would stay broken for it once the fault clears.
+	if status, claims := userInfo(); status != http.StatusOK {
+		t.Fatalf("userinfo answered %d once the Roles were readable again: %v", status, claims)
+	}
+}
