@@ -46,7 +46,15 @@ func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, "realm_not_found", "Realm을 찾을 수 없습니다.")
 		return
 	}
-	issuer := strings.TrimRight(realm.IssuerURL, "/")
+	// The issuer published here is the realm's own string, untouched. Every
+	// iss this server writes — the claim in a token, the parameter on an
+	// authorization response — is that same string, and a relying party is
+	// told to compare them literally. Trimming a trailing slash off only this
+	// one copy could not make a mismatched realm work; it could only publish
+	// a clean issuer while every iss carried the slash, hiding the mismatch
+	// in the one place someone would look for it. The trim belongs where it
+	// already is: the store, which normalises and validates on the way in.
+	issuer := realm.IssuerURL
 	protocol := issuer + "/protocol/openid-connect"
 	writeJSON(w, http.StatusOK, map[string]any{
 		"issuer":                                        issuer,
@@ -66,15 +74,25 @@ func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 		"introspection_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post"},
 		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_basic", "client_secret_post", "none"},
 		"code_challenge_methods_supported":              []string{"S256"},
-		"backchannel_logout_supported":                  true,
-		"backchannel_logout_session_supported":          true,
-		"frontchannel_logout_supported":                 false,
-		"request_parameter_supported":                   false,
-		"request_uri_parameter_supported":               false,
-		"require_request_uri_registration":              false,
-		"tls_client_certificate_bound_access_tokens":    false,
-		"scopes_supported":                              []string{"openid", "profile", "email", "roles"},
-		"claims_supported":                              []string{"iss", "sub", "aud", "exp", "iat", "auth_time", "jti", "sid", "azp", "scope", "preferred_username", "email", "email_verified", "name", "realm_access", "resource_access", "at_hash"},
+		// Every authorization response this server sends already carries iss,
+		// success and error alike. Saying so here is what lets it be used:
+		// RFC 9207 has a relying party reject a response missing iss only
+		// when the metadata promises the parameter, so a client library
+		// reading this document without the flag keeps accepting responses
+		// without one — which is the attack. The mix-up it prevents is
+		// invisible to the honest server, because the response the client is
+		// deciding about came from somewhere else; only the client can catch
+		// it, and only if told to look.
+		"authorization_response_iss_parameter_supported": true,
+		"backchannel_logout_supported":                   true,
+		"backchannel_logout_session_supported":           true,
+		"frontchannel_logout_supported":                  false,
+		"request_parameter_supported":                    false,
+		"request_uri_parameter_supported":                false,
+		"require_request_uri_registration":               false,
+		"tls_client_certificate_bound_access_tokens":     false,
+		"scopes_supported":                               []string{"openid", "profile", "email", "roles"},
+		"claims_supported":                               []string{"iss", "sub", "aud", "exp", "iat", "auth_time", "jti", "sid", "azp", "scope", "preferred_username", "email", "email_verified", "name", "realm_access", "resource_access", "at_hash"},
 	})
 }
 
