@@ -8411,3 +8411,146 @@ func TestIntegrationJWKSIsCacheableNoLongerThanAKeySetCanBeStale(t *testing.T) {
 		t.Errorf("the token endpoint is served %q, want no-store", stored)
 	}
 }
+
+// RFC 9207 defends a relying party against a mix-up attack: when it talks to
+// more than one issuer, an attacker who can steer the browser can hand a code
+// minted by a hostile issuer to the callback of an honest one. The honest
+// server cannot see this happen — it is the client, comparing the iss on the
+// response against the issuer it configured, that catches it. That comparison
+// is byte-for-byte, and section 3 tells the client to require iss only when
+// the metadata says the parameter is there; without the announcement a client
+// library has to keep accepting responses without it, which is the attack.
+//
+// So the announcement is not decoration: it is the whole of what makes the
+// parameter useful, and it is a promise about every authorization response,
+// not the happy one. This drives all four routes out of the endpoint — the
+// error before any session is consulted, the code minted from an existing SSO
+// session, the sign-in form's own redirect, and prompt=none with nobody
+// signed in — and holds each to carrying the very string discovery published.
+func TestIntegrationEveryAuthorizationResponseCarriesTheAdvertisedIssuer(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "mixup", Name: "Mixup", Type: "public",
+		RedirectURIs:  []string{"https://mixup.example.test/cb"},
+		GrantTypes:    []string{"authorization_code"},
+		DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	discovery, err := server.Client().Get(server.URL + "/realms/master/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.NewDecoder(discovery.Body).Decode(&document); err != nil {
+		t.Fatal(err)
+	}
+	_ = discovery.Body.Close()
+	if document["authorization_response_iss_parameter_supported"] != true {
+		t.Fatalf("every authorization response carries iss, yet discovery advertises %v — a relying party reading this cannot turn the check on",
+			document["authorization_response_iss_parameter_supported"])
+	}
+	issuer, _ := document["issuer"].(string)
+	if issuer == "" {
+		t.Fatal("discovery published no issuer")
+	}
+
+	verifier := strings.Repeat("mixup-response-check", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	authorize := func(sessionToken, extra string) *url.URL {
+		target := server.URL + "/realms/master/protocol/openid-connect/auth?client_id=mixup" +
+			"&redirect_uri=" + url.QueryEscape("https://mixup.example.test/cb") +
+			"&scope=openid&state=s&code_challenge=" + challenge + "&code_challenge_method=S256" + extra
+		request, reqErr := http.NewRequest(http.MethodGet, target, nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		if sessionToken != "" {
+			request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionToken})
+		}
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		location, parseErr := url.Parse(response.Header.Get("Location"))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		return location
+	}
+
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "mixup-probe", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The sign-in form answers with the redirect in a JSON body rather than a
+	// Location header, so its copy of iss is written by different code and
+	// could drift on its own.
+	pending := authorize("", "&response_type=code")
+	if pending.Path != "/login" || pending.Query().Get("request") == "" {
+		t.Fatalf("a request with no session did not reach the sign-in form: %s", pending)
+	}
+	body, err := json.Marshal(map[string]string{
+		"username": "admin", "password": "bootstrap-password-123", "request": pending.Query().Get("request")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signIn, err := server.Client().Post(server.URL+"/api/v1/auth/login", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signedIn struct {
+		RedirectTo string `json:"redirect_to"`
+	}
+	if err := json.NewDecoder(signIn.Body).Decode(&signedIn); err != nil {
+		t.Fatal(err)
+	}
+	_ = signIn.Body.Close()
+	if signIn.StatusCode != http.StatusOK {
+		t.Fatalf("signing in to complete the request answered %d", signIn.StatusCode)
+	}
+	formRedirect, err := url.Parse(signedIn.RedirectTo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, answer := range []struct {
+		what     string
+		response *url.URL
+		expect   string
+	}{
+		{"a code minted from an existing SSO session", authorize(session.Token, "&response_type=code"), "code"},
+		{"the redirect the sign-in form hands back", formRedirect, "code"},
+		{"a response_type this server does not support", authorize(session.Token, "&response_type=token"), "error"},
+		{"prompt=none with nobody signed in", authorize("", "&response_type=code&prompt=none"), "error"},
+	} {
+		if answer.response.Query().Get(answer.expect) == "" {
+			t.Errorf("%s did not carry %s at all: %s", answer.what, answer.expect, answer.response)
+			continue
+		}
+		if got := answer.response.Query().Get("iss"); got != issuer {
+			t.Errorf("%s carries iss %q, but discovery published issuer %q — a relying party comparing them rejects a response this server meant to send",
+				answer.what, got, issuer)
+		}
+	}
+}
