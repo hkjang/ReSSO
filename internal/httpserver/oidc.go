@@ -594,9 +594,30 @@ func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 		result["email_verified"] = user.EmailVerified
 	}
 	if slices.Contains(scopes, "roles") {
-		roles, _ := s.store.RealmRolesForUser(r.Context(), user.ID)
+		// Both errors used to be discarded, which turned a Role lookup that
+		// failed into realm_access.roles: [] with a 200 beside it — the service
+		// asserting that this person holds no Roles at all. That is not a
+		// degraded answer, it is the wrong one, and it is indistinguishable
+		// from an administrator having just taken every Role away. A relying
+		// party reading these claims to decide what somebody may do therefore
+		// demotes them for the length of the fault and restores them
+		// afterwards, with nothing anywhere saying why.
+		//
+		// The same two calls behind the same scope already fail the request at
+		// token issuance (internal/oidc.IssueUserTokens), so this endpoint was
+		// the one place where an unreadable Role turned into a claim rather
+		// than an error.
+		roles, rolesErr := s.store.RealmRolesForUser(r.Context(), user.ID)
+		if rolesErr != nil {
+			s.writeUserInfoUnavailable(w, r, "realm_roles", rolesErr)
+			return
+		}
+		clientRoles, clientRolesErr := s.store.ClientRolesForUser(r.Context(), user.ID)
+		if clientRolesErr != nil {
+			s.writeUserInfoUnavailable(w, r, "client_roles", clientRolesErr)
+			return
+		}
 		result["realm_access"] = map[string]any{"roles": roles}
-		clientRoles, _ := s.store.ClientRolesForUser(r.Context(), user.ID)
 		resources := make(map[string]any, len(clientRoles))
 		for clientID, assigned := range clientRoles {
 			resources[clientID] = map[string]any{"roles": assigned}
@@ -604,6 +625,21 @@ func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 		result["resource_access"] = resources
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// writeUserInfoUnavailable refuses a userinfo request whose claims could not be
+// read, instead of answering it with the claims that could.
+//
+// The status is deliberately 5xx rather than the 401 every other refusal here
+// uses: the token is fine and the caller has nothing to fix, so telling it the
+// token is invalid would have relying parties discard a working credential and
+// sign people out over a fault on this side. It also keeps the failure visible
+// in the request counter and the access log, which a 200 carrying half the
+// claims would not be.
+func (s *Server) writeUserInfoUnavailable(w http.ResponseWriter, r *http.Request, stage string, err error) {
+	s.logger.Error("userinfo could not read the claims it was asked for", "trace_id", traceIDFrom(r.Context()),
+		"realm", chi.URLParam(r, "realm"), "stage", stage, "error", err)
+	writeOAuthError(w, http.StatusInternalServerError, "server_error", "claims could not be read")
 }
 
 func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
