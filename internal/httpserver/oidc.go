@@ -686,8 +686,14 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid form body")
 		return
 	}
+	// The three lookups this endpoint makes before it reaches the two below
+	// already had the same problem those were fixed for, and being in front of
+	// them meant a fault arrived here first and the later care never ran: the
+	// Realm, the revocation state, and the refresh-token table each answered
+	// active=false whether they said no or failed to answer at all.
 	realm, err := s.realmFromPath(r)
 	if err != nil {
+		s.recordUnjudgedIntrospection(r, "realm", err)
 		writeJSON(w, http.StatusOK, map[string]any{"active": false})
 		return
 	}
@@ -701,7 +707,18 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 	// that Realm. Restricting this to the issuing client made the resource
 	// server pattern impossible: an API validating tokens minted for a
 	// different client always saw active=false.
-	if verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, ""); verifyErr == nil {
+	verified, verifyErr := s.oidc.Verify(r.Context(), realm, raw, "")
+	// A token whose revocation state could not be read has a good signature
+	// and claims that check out; only "has this been revoked" is unanswered.
+	// It is not a refresh token either — those are opaque and would never have
+	// parsed this far — so the fallback below has nothing to add and would only
+	// fail a second time against the same store.
+	if errors.Is(verifyErr, ressooidc.ErrTokenStateUnavailable) {
+		s.recordUnjudgedIntrospection(r, "revocation_state", verifyErr)
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	if verifyErr == nil {
 		// A session identifier is what distinguishes a token issued to a
 		// person from a client's own credentials, whose subject is the client
 		// identifier rather than a user.
@@ -748,11 +765,16 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 	}
 	// A refresh token stays private to the client that holds it: its metadata
 	// is disclosed only to that client, not to every resource server.
-	if refresh, active, inspectErr := s.store.InspectRefreshToken(r.Context(), raw); inspectErr == nil && refresh.RealmID == realm.ID && refresh.ClientID == client.ID {
+	refresh, active, inspectErr := s.store.InspectRefreshToken(r.Context(), raw)
+	if inspectErr == nil && refresh.RealmID == realm.ID && refresh.ClientID == client.ID {
 		writeJSON(w, http.StatusOK, map[string]any{"active": active, "client_id": client.ClientID,
 			"scope": strings.Join(refresh.Scope, " "), "exp": refresh.ExpiresAt.Unix()})
 		return
 	}
+	// No such refresh token is the ordinary answer here — every access token
+	// that failed verification above arrives at this line — and is not
+	// recorded. A lookup that could not run is.
+	s.recordUnjudgedIntrospection(r, "refresh_token", inspectErr)
 	writeJSON(w, http.StatusOK, map[string]any{"active": false})
 }
 
@@ -769,8 +791,9 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 // server refusing every request and nothing here to say why — the shape this
 // service has already fixed for logins and for token issuance.
 //
-// A session or an account that is gone is a real answer rather than a failure,
-// so only errors that are not that are recorded.
+// A Realm, a session, an account or a refresh token that is not there is a
+// real answer rather than a failure, so only errors that are not that are
+// recorded.
 func (s *Server) recordUnjudgedIntrospection(r *http.Request, stage string, err error) {
 	if err == nil || errors.Is(err, store.ErrNotFound) {
 		return
