@@ -555,13 +555,38 @@ func (s *Server) writeClientAuthError(w http.ResponseWriter, r *http.Request, er
 }
 
 func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
+	// Each of the four lookups below can fail for two unrelated reasons: the
+	// thing it looked for is gone, which is a fact about the token, or the
+	// lookup itself did not complete, which is a fact about this service. All
+	// four used to report both as invalid_token — the answer that tells the
+	// relying party to throw the credential away and sign the person out. So a
+	// database that stopped answering did not degrade this endpoint, it
+	// invalidated every token in the Realm at once, and the fault said nothing
+	// anywhere: 401 is the ordinary reply here, so the request counter and the
+	// access log read as a quiet period of expired tokens.
+	//
+	// That distinction was already drawn twice in this file — for the Roles
+	// below and, differently, for introspection — and these were the calls in
+	// front of both, so a fault reached them first and the later care never ran.
 	realm, err := s.realmFromPath(r)
 	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			s.writeUserInfoUnavailable(w, r, "realm", err)
+			return
+		}
 		writeBearerError(w, "invalid_token")
 		return
 	}
 	raw := bearerToken(r)
 	verified, err := s.oidc.Verify(r.Context(), realm, raw, "")
+	// A token whose revocation state could not be read is unjudged, not bad:
+	// the signature and the claims already checked out and only the "has this
+	// been revoked" question is unanswered. Refusing is right; refusing as
+	// invalid_token is not.
+	if errors.Is(err, ressooidc.ErrTokenStateUnavailable) {
+		s.writeUserInfoUnavailable(w, r, "revocation_state", err)
+		return
+	}
 	if err != nil || verified.Extra.Type != "Bearer" {
 		writeBearerError(w, "invalid_token")
 		return
@@ -572,14 +597,24 @@ func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, err := s.store.UserByID(r.Context(), userID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.writeUserInfoUnavailable(w, r, "user", err)
+		return
+	}
 	if err != nil || !user.Enabled {
 		writeBearerError(w, "invalid_token")
 		return
 	}
-	if sid, parseErr := uuid.Parse(verified.Extra.SessionID); parseErr != nil {
+	sid, parseErr := uuid.Parse(verified.Extra.SessionID)
+	if parseErr != nil {
 		writeBearerError(w, "invalid_token")
 		return
-	} else if _, sessionErr := s.store.SessionAuthTime(r.Context(), sid); sessionErr != nil {
+	}
+	if _, sessionErr := s.store.SessionAuthTime(r.Context(), sid); sessionErr != nil {
+		if !errors.Is(sessionErr, store.ErrNotFound) {
+			s.writeUserInfoUnavailable(w, r, "session", sessionErr)
+			return
+		}
 		writeBearerError(w, "invalid_token")
 		return
 	}
@@ -627,19 +662,22 @@ func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// writeUserInfoUnavailable refuses a userinfo request whose claims could not be
-// read, instead of answering it with the claims that could.
+// writeUserInfoUnavailable refuses a userinfo request that could not be judged,
+// instead of answering it with the part that worked or blaming the token.
 //
 // The status is deliberately 5xx rather than the 401 every other refusal here
 // uses: the token is fine and the caller has nothing to fix, so telling it the
 // token is invalid would have relying parties discard a working credential and
 // sign people out over a fault on this side. It also keeps the failure visible
-// in the request counter and the access log, which a 200 carrying half the
-// claims would not be.
+// in the request counter and the access log, which neither a 200 carrying half
+// the claims nor a 401 among ordinary expiries would be.
+//
+// stage names which lookup failed, because from the outside every one of them
+// produces the same response and only this line says which.
 func (s *Server) writeUserInfoUnavailable(w http.ResponseWriter, r *http.Request, stage string, err error) {
-	s.logger.Error("userinfo could not read the claims it was asked for", "trace_id", traceIDFrom(r.Context()),
+	s.logger.Error("userinfo could not judge the request it was given", "trace_id", traceIDFrom(r.Context()),
 		"realm", chi.URLParam(r, "realm"), "stage", stage, "error", err)
-	writeOAuthError(w, http.StatusInternalServerError, "server_error", "claims could not be read")
+	writeOAuthError(w, http.StatusInternalServerError, "server_error", "the request could not be completed")
 }
 
 func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
