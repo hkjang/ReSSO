@@ -11,9 +11,23 @@
 #   scripts/test-services.sh --stop       # remove the containers
 set -euo pipefail
 
+# Defined before the --stop branch below, which reaches for it. A function is
+# only there once its definition has run, and that one used to sit further
+# down: the one path that reports a certificate directory it could not remove
+# answered "log: command not found" instead of saying so.
+log() { echo "$*" >&2; }
+
 postgres_container="resso-test-pg"
 directory_container="resso-test-ldap"
 tls_container="resso-test-ldaps"
+# These are what a container created by this run is published on. They are
+# requests, not facts — a container left over from an earlier run keeps the
+# port it was started with, and every path below reuses such a container
+# without looking. So the environment printed at the end described the request
+# while the tests connected to what was actually there: the DSN said 55439, the
+# container had been started on 55450, and all sixty integration tests failed
+# with "connection refused" naming a port nothing had ever listened on. Each
+# variable is replaced with the container's real mapping before it is printed.
 postgres_port="${RESSO_TEST_POSTGRES_PORT:-55439}"
 directory_port="${RESSO_TEST_LDAP_PORT:-13890}"
 tls_port="${RESSO_TEST_LDAPS_PORT:-13636}"
@@ -35,7 +49,47 @@ if [ "${1:-}" = "--stop" ]; then
   exit 0
 fi
 
-log() { echo "$*" >&2; }
+# ensure_running starts a container that is there but stopped, and says why
+# when it will not start.
+#
+# `docker run -d` on a port another process already holds still creates the
+# container and then fails to start it, leaving it behind in Created. Every
+# path below treats an existing container as one it can reuse, so the next run
+# skipped creation and met whatever the reuse path happened to fail on — for
+# PostgreSQL an authentication error, which names neither the port that was
+# taken nor the container that never started.
+ensure_running() {
+  local container="$1" state failure
+  state="$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)"
+  test "${state:-missing}" = running && return
+  log "$container is ${state:-missing} rather than running; starting it"
+  if ! failure="$(docker start "$container" 2>&1)"; then
+    log "$container would not start: $failure"
+    log "remove it and run again: scripts/test-services.sh --stop"
+    exit 1
+  fi
+}
+
+# published_port reports the host port a container is actually reachable on,
+# having first made sure it is running. See the note on the port variables
+# above for why the request is not enough.
+published_port() {
+  local container="$1" port="$2" mapping
+  ensure_running "$container"
+  # Captured and then trimmed rather than piped into `head -1`: under
+  # `set -o pipefail` the consumer leaving first reports the producer's status,
+  # a trap this script has already been caught by twice further down.
+  mapping="$(docker port "$container" "$port" 2>/dev/null || true)"
+  mapping="${mapping%%$'\n'*}"
+  case "$mapping" in
+    *:*) echo "${mapping##*:}" ;;
+    *)
+      log "$container publishes no host port for ${port}, so nothing can reach it"
+      log "remove it and run again: scripts/test-services.sh --stop"
+      exit 1
+      ;;
+  esac
+}
 
 start_postgres() {
   if ! docker inspect "$postgres_container" >/dev/null 2>&1; then
@@ -44,6 +98,7 @@ start_postgres() {
       -e POSTGRES_USER=resso -e POSTGRES_PASSWORD=resso -e POSTGRES_DB=resso \
       postgres:17-alpine >/dev/null
   fi
+  postgres_port="$(published_port "$postgres_container" 5432)"
   # The trigram indexes are only built when pg_trgm is present, and the test
   # that covers that path skips without it — quietly, which is the failure this
   # script exists to prevent. So this waits for the extension to actually be
@@ -170,11 +225,15 @@ wait_for_directory() {
 }
 
 start_directory() {
-  docker inspect "$directory_container" >/dev/null 2>&1 && return
+  if docker inspect "$directory_container" >/dev/null 2>&1; then
+    directory_port="$(published_port "$directory_container" 389)"
+    return
+  fi
   log "starting the directory on ${directory_port}"
   docker run -d --name "$directory_container" -p "127.0.0.1:${directory_port}:389" \
     -e LDAP_ORGANISATION="ReSSO Test" -e LDAP_DOMAIN="example.test" \
     -e LDAP_ADMIN_PASSWORD="adminpassword" osixia/openldap:1.5.0 >/dev/null
+  directory_port="$(published_port "$directory_container" 389)"
   wait_for_directory "$directory_container"
   add_memberof_overlay "$directory_container"
   # Adding an overlay makes the server reload, so it has to be waited for again
@@ -207,13 +266,17 @@ make_certificates() {
 }
 
 start_tls_directory() {
-  docker inspect "$tls_container" >/dev/null 2>&1 && return
+  if docker inspect "$tls_container" >/dev/null 2>&1; then
+    tls_port="$(published_port "$tls_container" 636)"
+    return
+  fi
   make_certificates
   log "starting the TLS directory on ${tls_port}"
   docker run -d --name "$tls_container" -p "127.0.0.1:${tls_port}:636" \
     -e LDAP_ORGANISATION="ReSSO Test" -e LDAP_DOMAIN="example.test" \
     -e LDAP_ADMIN_PASSWORD="adminpassword" -e LDAP_TLS_VERIFY_CLIENT="never" \
     -v "$certs:/container/service/slapd/assets/certs" osixia/openldap:1.5.0 >/dev/null
+  tls_port="$(published_port "$tls_container" 636)"
   wait_for_directory "$tls_container"
   seed_directory "$tls_container"
   # The TLS listener answers some time after plain LDAP does, and how long
@@ -266,6 +329,29 @@ start_tls_directory() {
 start_postgres
 start_directory
 start_tls_directory
+
+# Every readiness check above reaches its service through `docker exec`, from
+# inside the container — which is not the path the environment below hands to
+# the tests. So nothing had ever tried the published ports, and a port that
+# went nowhere was first met by sixty integration tests failing at once, each
+# blaming the address this script had just told them to use.
+#
+# Deliberately weak: docker publishes a port the moment the container starts,
+# so an accepted connection does not mean the server behind it is ready. The
+# loops above are what establish that. This only answers the question they
+# cannot — whether the address being printed leads anywhere at all.
+refuses_connection() {
+  ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+for service in "PostgreSQL:${postgres_port}" "the directory:${directory_port}" \
+               "the TLS directory:${tls_port}"; do
+  if refuses_connection "${service##*:}"; then
+    log "${service%%:*} publishes ${service##*:} and nothing accepts a connection there"
+    log "remove the containers and run again: scripts/test-services.sh --stop"
+    exit 1
+  fi
+done
 
 cat <<ENV
 export RESSO_TEST_POSTGRES_DSN="postgres://resso:resso@127.0.0.1:${postgres_port}/resso?sslmode=disable"
