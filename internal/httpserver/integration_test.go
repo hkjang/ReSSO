@@ -3293,6 +3293,126 @@ func TestIntegrationAnIntrospectionItCannotJudgeIsDistinguishable(t *testing.T) 
 	}
 }
 
+// The counter above was only reached by the two lookups at the bottom of the
+// handler. Three run in front of them — the Realm, the token's revocation
+// state, and the refresh-token table — and each answered active=false whether
+// it had said no or had failed to answer at all. So a fault reached those
+// three first and the care taken further down never ran: the store error was
+// dropped where it happened, the response was 200, and the counter operators
+// are pointed at stayed flat while every resource server refused every request.
+func TestIntegrationTheLookupsInFrontOfIntrospectionAreAlsoCounted(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceServer, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "unjudged-early-rs", Name: "RS", Type: "confidential",
+		RedirectURIs: []string{"https://early.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "unjudged-early", Password: "unjudged-early-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "introspection", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, resourceServer.Client, user, session.Session.ID,
+		[]string{"openid"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	metrics := observability.NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+	introspect := func(token string) (int, bool) {
+		t.Helper()
+		form := url.Values{"token": {token}, "client_id": {"unjudged-early-rs"},
+			"client_secret": {resourceServer.ClientSecret}}
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token/introspect", form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		var decoded map[string]any
+		if decodeErr := json.NewDecoder(response.Body).Decode(&decoded); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		active, _ := decoded["active"].(bool)
+		return response.StatusCode, active
+	}
+	exported := func() string {
+		t.Helper()
+		var out strings.Builder
+		metrics.WritePrometheus(&out)
+		return out.String()
+	}
+
+	// Two answers that are real answers rather than faults, so that what the
+	// counter records below is the fault and not merely traffic: a token this
+	// service issued, and a string that is no token of any kind — the latter
+	// reaches the refresh-token lookup, finds nothing, and must stay uncounted.
+	if status, active := introspect(tokens.AccessToken); status != http.StatusOK || !active {
+		t.Fatalf("a healthy introspection answered %d active=%v", status, active)
+	}
+	if status, active := introspect("not-a-token-at-all"); status != http.StatusOK || active {
+		t.Fatalf("an unknown token answered %d active=%v, want 200 and inactive", status, active)
+	}
+	if strings.Contains(exported(), "resso_introspection_errors_total{") {
+		t.Errorf("introspections the service judged correctly were counted as unjudged:\n%s", exported())
+	}
+
+	// Renaming keeps the table's identity, so putting it back restores the
+	// schema exactly; the schema itself belongs to this test.
+	for _, unreadable := range []struct{ table, stage, token, lookup string }{
+		{"realms", "realm", tokens.AccessToken, "the Realm the request names"},
+		{"revoked_access_tokens", "revocation_state", tokens.AccessToken, "whether the token has been revoked"},
+		{"refresh_tokens", "refresh_token", "not-a-token-at-all", "the refresh token the caller may hold"},
+	} {
+		if _, err := data.Pool.Exec(ctx, "ALTER TABLE "+unreadable.table+" RENAME TO "+unreadable.table+"_hidden"); err != nil {
+			t.Fatal(err)
+		}
+		status, active := introspect(unreadable.token)
+		if _, err := data.Pool.Exec(ctx, "ALTER TABLE "+unreadable.table+"_hidden RENAME TO "+unreadable.table); err != nil {
+			t.Fatal(err)
+		}
+		// The answer deliberately does not change: a resource server handed a
+		// 5xx might fail open, so refusing is still the safe direction.
+		if status != http.StatusOK || active {
+			t.Errorf("with %s unreadable introspection answered %d active=%v, want 200 and inactive",
+				unreadable.table, status, active)
+		}
+		want := `resso_introspection_errors_total{stage="` + unreadable.stage + `"} 1`
+		if !strings.Contains(exported(), want) {
+			t.Errorf("introspection could not read %s and said so nowhere: no %s\n%s",
+				unreadable.lookup, want, exported())
+		}
+	}
+
+	// And it recovers, or each count above would be about this token rather
+	// than about the fault.
+	if status, active := introspect(tokens.AccessToken); status != http.StatusOK || !active {
+		t.Errorf("introspection answered %d active=%v once every lookup was readable again", status, active)
+	}
+}
+
 // Revoking an access token had no test that it works, only one that a failure
 // to record it is reported. The revocation handler decides between three
 // outcomes and this is the branch none of them covered, so the whole path from
