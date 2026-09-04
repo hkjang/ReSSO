@@ -9,7 +9,7 @@
 | Authorization Code | 구현. 1회 사용이며 재사용 시 해당 Session·Client의 Refresh Token 폐기 |
 | PKCE S256 | 구현, Public Client 강제 |
 | 인가 응답 `iss` (RFC 9207) | 구현. 성공과 오류 응답 모두에 붙이며, Discovery의 `authorization_response_iss_parameter_supported`로 알립니다. 값은 Discovery의 `issuer`와 같은 문자열이므로 RP에서 Mix-Up 공격 방어를 위한 `iss` 검증을 강제로 켜도 됩니다 |
-| `prompt` | 사양대로 공백으로 구분된 목록으로 읽습니다. `login`은 SSO Session이 있어도 재인증을 요구하고, `none`은 재사용할 Session이 없으면 `login_required`를 반환합니다. 화면이 없는 `consent`·`select_account`는 무시하며, 그것들이 함께 와도 `login`·`none` 처리는 그대로입니다. 서로 모순되는 `none`과 `login`을 함께 요구하면 `invalid_request`로 거절합니다 |
+| `prompt` | 사양대로 공백으로 구분된 목록으로 읽습니다. `login`은 SSO Session이 있어도 재인증을 요구하고, `none`은 재사용할 Session이 없으면 `login_required`를 반환합니다. Session이 **없는** 것과 이 서비스가 Session을 **조회하지 못한** 것은 구분하며, 후자는 `server_error`입니다 — `login_required`는 RP가 조용한 갱신에서 "사용자가 로그아웃했다"로 읽고 자신의 Session도 끝내는 신호이므로, 이쪽 장애를 그렇게 알리면 장애가 전 RP 로그아웃이 됩니다. 화면이 없는 `consent`·`select_account`는 무시하며, 그것들이 함께 와도 `login`·`none` 처리는 그대로입니다. 서로 모순되는 `none`과 `login`을 함께 요구하면 `invalid_request`로 거절합니다 |
 | `id_token_hint` | 구현. 지정한 계정과 현재 Session의 사용자가 다르면 조용히 코드를 발급하지 않고 재인증을 요구합니다 |
 | `request` / `request_uri` | 미지원. 무시하지 않고 `request_not_supported` / `request_uri_not_supported`로 거절합니다 |
 | `max_age` | 구현. 마지막 인증이 지정한 시간보다 오래되었으면 SSO Session이 있어도 재인증을 요구하며, `prompt=none`이면 `login_required`를 반환합니다 |
