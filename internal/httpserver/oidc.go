@@ -223,7 +223,24 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !prompts["login"] {
-		if authenticated, sessionErr := s.store.SessionByToken(r.Context(), sessionCookie(r)); sessionErr == nil && authenticated.User.RealmID == realm.ID {
+		authenticated, sessionErr := s.store.SessionByToken(r.Context(), sessionCookie(r))
+		// Not being signed in and not being able to read whether somebody is
+		// signed in were the same answer here, and the first of the two is a
+		// statement: prompt=none replies login_required, which says there is no
+		// SSO session, and a relying party doing silent renewal reads that as
+		// the person having signed out and ends its own session on the strength
+		// of it. So a fault confined to this service logged everybody out of
+		// every relying party instead of degrading. The very next lookup already
+		// answers server_error when it cannot run; this one runs before it, so
+		// an outage reached it first and that care never happened.
+		if sessionErr != nil && !errors.Is(sessionErr, store.ErrNotFound) {
+			s.logger.Error("the SSO session could not be read at the authorization endpoint",
+				"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "error", sessionErr)
+			redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error",
+				"the SSO session is unavailable")
+			return
+		}
+		if sessionErr == nil && authenticated.User.RealmID == realm.ID {
 			// The existing session may be reused only if it belongs to the
 			// account the relying party named and authenticated recently
 			// enough for what it asked.
@@ -917,10 +934,31 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 	if requested := values.Get("post_logout_redirect_uri"); requested != "" && client != nil && store.PostLogoutURIAllowed(*client, requested) {
 		redirectTo = requested
 	}
-	if session, sessionErr := s.store.SessionByToken(r.Context(), sessionCookie(r)); sessionErr == nil && session.Session.RealmID == realm.ID {
+	session, sessionErr := s.store.SessionByToken(r.Context(), sessionCookie(r))
+	switch {
+	case sessionErr == nil && session.Session.RealmID == realm.ID:
 		ended, detail := s.endSession(r, session.Session.ID)
 		s.audit(r, &realm.ID, &session.User.ID, session.User.Username, "LOGOUT",
 			partialIfNot(ended), "session", session.Session.ID.String(), detail)
+	case sessionErr != nil && !errors.Is(sessionErr, store.ErrNotFound):
+		// endSession says a logout that fails to revoke is the most misleading
+		// failure this service has, and answers it with a PARTIAL entry naming
+		// the session so an administrator can end it by hand. Failing to read
+		// the session is the same outcome one step earlier — it stays live, the
+		// relying parties holding refresh tokens bound to it go on renewing, no
+		// back-channel logout is sent — and it reached here first, so none of
+		// that care ran. There was no entry at all: the request looked exactly
+		// like a logout from a browser that was not signed in, the cookies were
+		// cleared, and the relying party was redirected to its post-logout page
+		// as though everything had been ended.
+		//
+		// The session identifier is the one thing missing from the entry,
+		// because reading it is what failed. The rest is the same shape, so a
+		// trail already being watched for result=PARTIAL finds this too.
+		s.logger.Error("logout could not read the session it was asked to end",
+			"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "error", sessionErr)
+		s.audit(r, &realm.ID, nil, "", "LOGOUT", "PARTIAL", "session", "",
+			map[string]any{"session_revoked": false, "error": "look the session up: " + sessionErr.Error()})
 	}
 	s.clearBrowserCookies(w, r)
 	if redirectTo != "" {

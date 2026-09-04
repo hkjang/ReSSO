@@ -2666,6 +2666,145 @@ func TestIntegrationLogoutRecordsASessionItCouldNotEnd(t *testing.T) {
 	}
 }
 
+// The two OpenID Connect endpoints that read the browser's SSO session treated
+// "there is no session" and "the session could not be read" as one answer, and
+// both of those answers are statements a relying party acts on. Every other
+// lookup either side of these two already tells the difference.
+func TestIntegrationTheSSOSessionSaysWhenItCannotBeRead(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "silent-probe", Name: "Silent Probe", Type: "public",
+		RedirectURIs: []string{"https://silent.example.test/cb"}, PostLogoutRedirectURIs: []string{"https://silent.example.test/bye"},
+		GrantTypes: []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "unreadable-session-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	browser := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	verifier := strings.Repeat("silent-probe-verifier", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	get := func(target string) (*http.Response, *url.URL) {
+		t.Helper()
+		request, reqErr := http.NewRequest(http.MethodGet, target, nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		response, doErr := browser.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = response.Body.Close()
+		location, parseErr := url.Parse(response.Header.Get("Location"))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		return response, location
+	}
+	authorize := func(extra string) *url.URL {
+		t.Helper()
+		_, location := get(server.URL + "/realms/master/protocol/openid-connect/auth?response_type=code" +
+			"&client_id=silent-probe&redirect_uri=" + url.QueryEscape("https://silent.example.test/cb") +
+			"&scope=openid&state=s&code_challenge=" + challenge + "&code_challenge_method=S256" + extra)
+		return location
+	}
+	logouts := func() (int, string, map[string]any) {
+		t.Helper()
+		page, auditErr := data.ListAudit(ctx, store.AuditFilter{EventType: "LOGOUT", Limit: 1})
+		if auditErr != nil {
+			t.Fatal(auditErr)
+		}
+		if page.Total == 0 {
+			return 0, "", nil
+		}
+		var detail map[string]any
+		_ = json.Unmarshal(page.Items[0].Detail, &detail)
+		return page.Total, page.Items[0].Result, detail
+	}
+
+	// While the session is readable, the session is what both endpoints answer
+	// from: a silent renewal gets a code, and there is nothing to log out of a
+	// browser that presents no cookie at all.
+	if code := authorize("&prompt=none").Query().Get("code"); code == "" {
+		t.Fatal("prompt=none was not answered with a code while the session was readable; " +
+			"the outcomes below would say nothing about the fix")
+	}
+	anonymous, err := browser.Get(server.URL + "/realms/master/protocol/openid-connect/logout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = anonymous.Body.Close()
+	if total, _, _ := logouts(); total != 0 {
+		t.Fatalf("a logout from a browser that was not signed in was audited %d time(s)", total)
+	}
+
+	// Now the session cannot be read at all. The account, the Realm and the
+	// Client are all still there, so only this one lookup fails.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE sso_sessions RENAME TO sso_sessions_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "ALTER TABLE sso_sessions_hidden RENAME TO sso_sessions")
+	})
+
+	// login_required is a relying party's cue that the person signed out, and
+	// acting on it means ending its own session. A fault here is not that.
+	silent := authorize("&prompt=none")
+	if got := silent.Query().Get("error"); got != "server_error" {
+		t.Errorf("prompt=none answered error=%q while the session could not be read; "+
+			"login_required tells the relying party to sign the person out", got)
+	}
+	if silent.Query().Get("code") != "" {
+		t.Error("prompt=none was answered with a code while the session could not be read")
+	}
+	// The interactive form is the same claim made to a person: they are signed
+	// in, and the sign-in they would be sent to do reads the same table.
+	if got := authorize("").Query().Get("error"); got != "server_error" {
+		t.Errorf("an ordinary authorization request answered error=%q while the session "+
+			"could not be read, want server_error", got)
+	}
+
+	// Logout clears the cookies either way, so the person and the relying party
+	// both see themselves signed out while the session stays live. The audit
+	// entry is the only handle on it.
+	response, location := get(server.URL + "/realms/master/protocol/openid-connect/logout" +
+		"?client_id=silent-probe&post_logout_redirect_uri=" + url.QueryEscape("https://silent.example.test/bye"))
+	if response.StatusCode >= 400 {
+		t.Errorf("logout answered %d; the cookies are gone by then and the person has no "+
+			"remedy to offer", response.StatusCode)
+	}
+	if location.String() != "https://silent.example.test/bye" {
+		t.Errorf("logout redirected to %q, want the relying party's post-logout page", location)
+	}
+	total, result, detail := logouts()
+	if total == 0 {
+		t.Fatal("a logout that could not read the session it was asked to end was not audited at all")
+	}
+	if result != "PARTIAL" {
+		t.Errorf("logout audited as %s, want PARTIAL", result)
+	}
+	if detail["session_revoked"] != false || detail["error"] == nil {
+		t.Errorf("logout did not record what failed: %v", detail)
+	}
+}
+
 // Naming collisions are the most ordinary mistake an administrator makes, and
 // every one of them reached the console as the raw constraint violation —
 // `duplicate key value violates unique constraint "clients_realm_id_client_id_key"
