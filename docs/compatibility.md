@@ -18,6 +18,7 @@
 | Client Credentials | Confidential Client 구현 |
 | UserInfo / JWKS | 구현 |
 | Introspection / Revocation | 구현. Access Token은 같은 Realm의 모든 Confidential Client가 조회 가능 |
+| Client 인증 (`client_secret_basic` / `client_secret_post`) | 구현. Token·Introspection·Revocation이 공유합니다. Secret을 대조해서 거절한 경우만 401 `invalid_client`이며, 반복되면 429 + `Retry-After`입니다. Client를 조회하지 못했거나 저장된 Secret을 읽지 못해 **대조 자체를 못 한** 경우는 500 `server_error`이고 실패 횟수로 세지 않습니다 — RP는 `invalid_client`에서만 설정을 의심하고 500에는 재시도하면 됩니다 |
 | RP-Initiated Logout | 구현. `id_token_hint` 또는 `client_id`. `id_token_hint`는 만료된 ID Token도 받습니다(RP가 로그아웃 시점에 들고 있는 것이 보통 만료된 토큰입니다). Access Token은 hint가 아닙니다 |
 | Back-Channel Logout | 구현. Session 참여 Client에 서명된 `logout_token` 전송 |
 | ID Token `at_hash` | 구현 |

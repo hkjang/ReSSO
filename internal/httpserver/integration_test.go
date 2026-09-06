@@ -9147,3 +9147,140 @@ func TestIntegrationUserInfoRefusesWhenItCannotJudgeTheRequest(t *testing.T) {
 		t.Fatalf("userinfo answered %d once every lookup was readable again: %v", status, claims)
 	}
 }
+
+// The three OIDC endpoints that authenticate a caller — token, introspection
+// and revocation — share one credential check, and it reported a lookup that
+// did not run the same way as a secret that did not match. invalid_client is a
+// statement about the caller's credentials, so a clients table that stopped
+// answering did not degrade these endpoints: it told every integration in the
+// Realm at once that it had been rejected, and a relying party told that has
+// nothing to retry.
+//
+// The count that follows each of those answers is the part that outlives the
+// fault. The failure buckets exist to bound secret guessing; filling them from
+// this service's own outage locks the client out for the rest of the window, so
+// the right secret goes on being refused after the store has recovered.
+func TestIntegrationClientAuthSeparatesAnOutageFromAWrongSecret(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+		ClientID: "outage-client", Name: "Outage Client", Type: "confidential",
+		RedirectURIs:  []string{"https://outage.example.test/cb"},
+		GrantTypes:    []string{"client_credentials"},
+		DefaultScopes: []string{"openid"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	call := func(path string, form url.Values) (int, map[string]any) {
+		t.Helper()
+		form.Set("client_id", "outage-client")
+		form.Set("client_secret", created.ClientSecret)
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/"+path, form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		var decoded map[string]any
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		return response.StatusCode, decoded
+	}
+	endpoints := []struct {
+		name, path string
+		form       url.Values
+	}{
+		{"token", "token", url.Values{"grant_type": {"client_credentials"}, "scope": {"openid"}}},
+		{"introspection", "token/introspect", url.Values{"token": {"not-a-token"}}},
+		{"revocation", "revoke", url.Values{"token": {"not-a-token"}}},
+	}
+
+	// The healthy answers first: without them every refusal below would prove
+	// only that this secret never worked.
+	for _, endpoint := range endpoints {
+		if status, body := call(endpoint.path, endpoint.form); status != http.StatusOK {
+			t.Fatalf("%s answered %d for a client with the right secret: %v", endpoint.name, status, body)
+		}
+	}
+
+	// Both lookups the check makes are taken away in turn: they run in order, so
+	// a fault reaches the first of them and covering only the second would leave
+	// the answer unchanged. Renaming keeps the identity of what it renames, so
+	// putting it back restores the schema exactly.
+	for _, unreadable := range []struct{ hide, restore, lookup string }{
+		{"ALTER TABLE clients RENAME TO clients_hidden",
+			"ALTER TABLE clients_hidden RENAME TO clients", "which client is calling"},
+		{"ALTER TABLE clients RENAME COLUMN secret_hash TO secret_hash_moved",
+			"ALTER TABLE clients RENAME COLUMN secret_hash_moved TO secret_hash", "the secret to compare against"},
+	} {
+		if _, err := data.Pool.Exec(ctx, unreadable.hide); err != nil {
+			t.Fatal(err)
+		}
+		answers := make(map[string]int, len(endpoints))
+		bodies := make(map[string]map[string]any, len(endpoints))
+		for _, endpoint := range endpoints {
+			answers[endpoint.name], bodies[endpoint.name] = call(endpoint.path, endpoint.form)
+		}
+		if _, err := data.Pool.Exec(ctx, unreadable.restore); err != nil {
+			t.Fatal(err)
+		}
+		for _, endpoint := range endpoints {
+			status, body := answers[endpoint.name], bodies[endpoint.name]
+			if status == http.StatusUnauthorized {
+				t.Errorf("with %s unreadable %s answered 401 %v — it never checked the secret, and a relying "+
+					"party told invalid_client believes its credentials were rejected", unreadable.lookup,
+					endpoint.name, body)
+				continue
+			}
+			if status != http.StatusInternalServerError {
+				t.Errorf("with %s unreadable %s answered %d, want 500: the fault is ours and the caller has "+
+					"nothing to fix", unreadable.lookup, endpoint.name, status)
+			}
+			if body["error"] != "server_error" {
+				t.Errorf("with %s unreadable %s answered error=%v, want server_error", unreadable.lookup,
+					endpoint.name, body["error"])
+			}
+		}
+		// And it recovers, which is only true if the refusals above were about
+		// the fault rather than about this client.
+		for _, endpoint := range endpoints {
+			if status, body := call(endpoint.path, endpoint.form); status != http.StatusOK {
+				t.Fatalf("%s answered %d once %s was readable again: %v", endpoint.name, status,
+					unreadable.lookup, body)
+			}
+		}
+	}
+
+	// The lockout is the lasting damage: an outage long enough to fill the
+	// bucket used to leave the client refused for the rest of the window with
+	// nothing wrong on either side. The right secret is sent throughout, so
+	// every failure counted here would be one this service invented.
+	for attempt := 1; attempt <= clientAuthMaxFailures+1; attempt++ {
+		if _, err := data.Pool.Exec(ctx, "ALTER TABLE clients RENAME TO clients_hidden"); err != nil {
+			t.Fatal(err)
+		}
+		status, body := call("token", url.Values{"grant_type": {"client_credentials"}, "scope": {"openid"}})
+		if _, err := data.Pool.Exec(ctx, "ALTER TABLE clients_hidden RENAME TO clients"); err != nil {
+			t.Fatal(err)
+		}
+		if status == http.StatusTooManyRequests {
+			t.Fatalf("attempt %d during the outage was rate limited (%v): the attempts belong to the caller, "+
+				"and this one never got a credential checked", attempt, body)
+		}
+	}
+	if status, body := call("token", url.Values{"grant_type": {"client_credentials"}, "scope": {"openid"}}); status != http.StatusOK {
+		t.Fatalf("after an outage of %d requests the right secret answered %d: %v — the lockout outlived the "+
+			"fault that caused it", clientAuthMaxFailures+1, status, body)
+	}
+}

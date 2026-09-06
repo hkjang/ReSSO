@@ -496,10 +496,23 @@ type rateLimitedError struct{ retryAfter time.Duration }
 
 func (e *rateLimitedError) Error() string { return "client authentication is rate limited" }
 
+// clientAuthUnavailableError reports that a credential could not be checked, as
+// opposed to being checked and found wrong.
+type clientAuthUnavailableError struct{ err error }
+
+func (e *clientAuthUnavailableError) Error() string {
+	return "client authentication could not be completed: " + e.err.Error()
+}
+
+func (e *clientAuthUnavailableError) Unwrap() error { return e.err }
+
 // authenticateOIDCClient resolves and verifies the calling client. Failed
 // attempts are counted per source address and per client identifier so that
 // guessing a client secret is bounded, and so an unauthenticated caller cannot
 // keep the credential verification path busy.
+//
+// Only a credential this service actually judged is a failed attempt: see the
+// lookup error handled below.
 func (s *Server) authenticateOIDCClient(r *http.Request, realm domain.Realm) (domain.Client, bool, error) {
 	clientID, secret, basic := r.BasicAuth()
 	if !basic {
@@ -518,6 +531,22 @@ func (s *Server) authenticateOIDCClient(r *http.Request, realm domain.Realm) (do
 		}
 	}
 	client, authenticated, err := s.verifyOIDCClient(r, realm, clientID, secret)
+	// A lookup that did not complete has judged nothing about the credential.
+	// Answering invalid_client tells a correctly configured relying party its
+	// secret is wrong, and this path is shared by the token, introspection and
+	// revocation endpoints — so a clients table that stopped answering did not
+	// degrade them, it told every integration in the Realm at once that its
+	// credentials had been rejected. The failure was also counted against both
+	// buckets, which is the part that outlives the fault: twenty such requests
+	// fill the client's bucket, and from then on the right secret is answered
+	// 429 for the rest of the window, long after the store recovered. Nothing
+	// said so either — 401 here is the ordinary answer to a stale secret, so the
+	// request counter and the access log read as a quiet period.
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.logger.Error("client authentication could not be decided", "trace_id", traceIDFrom(r.Context()),
+			"realm", realm.Name, "client", clientID, "error", err)
+		return domain.Client{}, false, &clientAuthUnavailableError{err: err}
+	}
 	if err != nil || !authenticated {
 		for _, bucket := range buckets {
 			bucket.limiter.Fail(bucket.key)
@@ -555,8 +584,17 @@ func (s *Server) verifyOIDCClient(r *http.Request, realm domain.Realm, clientID,
 }
 
 // writeClientAuthError emits the shared invalid_client response, upgrading it
-// to 429 with a Retry-After when the caller is being throttled.
+// to 429 with a Retry-After when the caller is being throttled and to 500 when
+// the credential could not be checked at all.
 func (s *Server) writeClientAuthError(w http.ResponseWriter, r *http.Request, err error) {
+	var unavailable *clientAuthUnavailableError
+	if errors.As(err, &unavailable) {
+		// No WWW-Authenticate header: it asks the caller to present credentials
+		// again, and the credentials it has are not what went wrong here.
+		writeOAuthError(w, http.StatusInternalServerError, "server_error",
+			"client authentication could not be completed")
+		return
+	}
 	var limited *rateLimitedError
 	if errors.As(err, &limited) {
 		retryAfter := int(limited.retryAfter.Seconds())
