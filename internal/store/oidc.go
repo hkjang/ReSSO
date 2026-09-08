@@ -24,7 +24,11 @@ type AuthorizationRequest struct {
 	CodeChallenge       string
 	CodeChallengeMethod string
 	Prompt              string
-	ExpiresAt           time.Time
+	// IDTokenHintSubject is the account the relying party's id_token_hint
+	// named, carried with the parked request so that the login which follows
+	// can be held to it. Empty means no hint was sent.
+	IDTokenHintSubject string
+	ExpiresAt          time.Time
 }
 
 func (s *Store) CreateAuthorizationRequest(ctx context.Context, request AuthorizationRequest) (string, error) {
@@ -39,10 +43,11 @@ func (s *Store) CreateAuthorizationRequest(ctx context.Context, request Authoriz
 		request.ExpiresAt = time.Now().UTC().Add(5 * time.Minute)
 	}
 	_, err = s.Pool.Exec(ctx, `INSERT INTO authorization_requests(id,token_hash,realm_id,client_id,redirect_uri,
-        response_type,scope,state,nonce,code_challenge,code_challenge_method,prompt,expires_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, request.ID, s.Sealer.Digest(token),
+        response_type,scope,state,nonce,code_challenge,code_challenge_method,prompt,id_token_hint_subject,expires_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, request.ID, s.Sealer.Digest(token),
 		request.RealmID, request.ClientID, request.RedirectURI, request.ResponseType, request.Scope,
-		request.State, request.Nonce, request.CodeChallenge, request.CodeChallengeMethod, request.Prompt, request.ExpiresAt)
+		request.State, request.Nonce, request.CodeChallenge, request.CodeChallengeMethod, request.Prompt,
+		request.IDTokenHintSubject, request.ExpiresAt)
 	if err != nil {
 		return "", fmt.Errorf("save authorization request: %w", err)
 	}
@@ -53,7 +58,7 @@ func scanAuthorizationRequest(row pgx.Row) (AuthorizationRequest, error) {
 	var request AuthorizationRequest
 	err := row.Scan(&request.ID, &request.RealmID, &request.ClientID, &request.RedirectURI,
 		&request.ResponseType, &request.Scope, &request.State, &request.Nonce, &request.CodeChallenge,
-		&request.CodeChallengeMethod, &request.Prompt, &request.ExpiresAt)
+		&request.CodeChallengeMethod, &request.Prompt, &request.IDTokenHintSubject, &request.ExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuthorizationRequest{}, ErrNotFound
 	}
@@ -62,7 +67,8 @@ func scanAuthorizationRequest(row pgx.Row) (AuthorizationRequest, error) {
 
 func (s *Store) AuthorizationRequestByToken(ctx context.Context, token string) (AuthorizationRequest, error) {
 	return scanAuthorizationRequest(s.Pool.QueryRow(ctx, `SELECT id,realm_id,client_id,redirect_uri,response_type,
-        scope,state,nonce,code_challenge,code_challenge_method,prompt,expires_at FROM authorization_requests
+        scope,state,nonce,code_challenge,code_challenge_method,prompt,id_token_hint_subject,expires_at
+        FROM authorization_requests
         WHERE token_hash=ANY($1::bytea[]) AND consumed_at IS NULL AND expires_at>now()`, s.Sealer.Digests(token)))
 }
 
@@ -70,7 +76,7 @@ func (s *Store) ConsumeAuthorizationRequest(ctx context.Context, token string) (
 	return scanAuthorizationRequest(s.Pool.QueryRow(ctx, `UPDATE authorization_requests SET consumed_at=now()
         WHERE token_hash=ANY($1::bytea[]) AND consumed_at IS NULL AND expires_at>now()
         RETURNING id,realm_id,client_id,redirect_uri,response_type,scope,state,nonce,code_challenge,
-        code_challenge_method,prompt,expires_at`, s.Sealer.Digests(token)))
+        code_challenge_method,prompt,id_token_hint_subject,expires_at`, s.Sealer.Digests(token)))
 }
 
 type AuthorizationCode struct {

@@ -165,6 +165,33 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	s.setBrowserCookies(w, r, newSession.Token, newSession.CSRFToken, newSession.Session.ExpiresAt)
 	response := map[string]any{"authenticated": true, "csrf_token": newSession.CSRFToken, "redirect_to": "/"}
 	if authRequest != nil {
+		// id_token_hint names the account the relying party believes it is
+		// renewing, and until now it was compared only against a session that
+		// already existed. A request that arrives here has no such session —
+		// often precisely because the hint did not match the one in the
+		// browser — so the comparison never ran where it decides the most:
+		// whoever signed in at the form got the code, and the relying party
+		// was handed a different person than the one it asked about. The
+		// specification has the answer be an error rather than a code for
+		// somebody else.
+		//
+		// The request is deliberately left unconsumed: signing in again as the
+		// account that was named finishes the flow from this same form, rather
+		// than sending the person back to the relying party to start over. The
+		// account is not named in the message — whoever is at the keyboard has
+		// just proved they are somebody else.
+		if authRequest.IDTokenHintSubject != "" && authRequest.IDTokenHintSubject != result.User.ID.String() {
+			// The credential was accepted and the session is real, so this is
+			// a successful login by every measure the counter takes; what did
+			// not happen is recorded in the trail, where the reason fits.
+			s.metrics.Add(metricLogins, 1, "success")
+			s.audit(r, &realm.ID, &result.User.ID, result.User.Username, "LOGIN_SUCCESS", "PARTIAL",
+				"session", newSession.Session.ID.String(),
+				map[string]any{"authorization_code": "not_issued", "reason": "id_token_hint_mismatch"})
+			writeError(w, r, http.StatusForbidden, "account_mismatch",
+				"이 애플리케이션은 이전에 사용하던 계정으로 다시 로그인하도록 요청했습니다. 방금 로그인한 계정은 그 계정이 아닙니다. 요청한 계정으로 로그인하세요.")
+			return
+		}
 		consumed, err := s.store.ConsumeAuthorizationRequest(r.Context(), input.Request)
 		if err != nil {
 			// The session was created a moment ago and is being taken back.

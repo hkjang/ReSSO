@@ -331,9 +331,17 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "login_required", "no active SSO session")
 		return
 	}
+	// The hint travels with the parked request. Checking it only above meant
+	// checking it only where it was least likely to matter: a request that
+	// reaches the form is usually here because the session in the browser was
+	// not the account named, and the form then handed the code to whoever
+	// signed in. max_age needs nothing of the kind — a login at that form
+	// always authenticates afresh, so the proof it asks to be recent is the
+	// one it is about to produce.
 	pending := store.AuthorizationRequest{RealmID: realm.ID, ClientID: client.ID, RedirectURI: redirectURI,
 		ResponseType: "code", Scope: scopes, State: query.Get("state"), Nonce: query.Get("nonce"),
-		CodeChallenge: challenge, CodeChallengeMethod: method, Prompt: prompt}
+		CodeChallenge: challenge, CodeChallengeMethod: method, Prompt: prompt,
+		IDTokenHintSubject: hintedSubject}
 	token, err := s.store.CreateAuthorizationRequest(r.Context(), pending)
 	if err != nil {
 		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authorization request could not be saved")

@@ -11,9 +11,9 @@
 | PKCE S256 | 구현, Public Client 강제 |
 | 인가 응답 `iss` (RFC 9207) | 구현. 성공과 오류 응답 모두에 붙이며, Discovery의 `authorization_response_iss_parameter_supported`로 알립니다. 값은 Discovery의 `issuer`와 같은 문자열이므로 RP에서 Mix-Up 공격 방어를 위한 `iss` 검증을 강제로 켜도 됩니다 |
 | `prompt` | 사양대로 공백으로 구분된 목록으로 읽습니다. `login`은 SSO Session이 있어도 재인증을 요구하고, `none`은 재사용할 Session이 없으면 `login_required`를 반환합니다. Session이 **없는** 것과 이 서비스가 Session을 **조회하지 못한** 것은 구분하며, 후자는 `server_error`입니다 — `login_required`는 RP가 조용한 갱신에서 "사용자가 로그아웃했다"로 읽고 자신의 Session도 끝내는 신호이므로, 이쪽 장애를 그렇게 알리면 장애가 전 RP 로그아웃이 됩니다. 화면이 없는 `consent`·`select_account`는 무시하며, 그것들이 함께 와도 `login`·`none` 처리는 그대로입니다. 서로 모순되는 `none`과 `login`을 함께 요구하면 `invalid_request`로 거절합니다 |
-| `id_token_hint` | 구현. 지정한 계정과 현재 Session의 사용자가 다르면 조용히 코드를 발급하지 않고 재인증을 요구합니다 |
+| `id_token_hint` | 구현. 지정한 계정과 현재 Session의 사용자가 다르면 조용히 코드를 발급하지 않고 재인증을 요구합니다. **그 재인증까지 hint를 지킵니다** — hint는 인가 요청과 함께 보관되고, 로그인 화면에서 다른 계정으로 로그인하면 코드를 발급하지 않고 403 `account_mismatch`로 답합니다(로그인 자체는 성공하며 감사 기록은 `LOGIN_SUCCESS` `result=PARTIAL`, 상세 `reason=id_token_hint_mismatch`입니다). 요청은 소진되지 않으므로 같은 화면에서 지정된 계정으로 다시 로그인하면 흐름이 이어집니다. 응답은 어느 계정인지 밝히지 않습니다 |
 | `request` / `request_uri` | 미지원. 무시하지 않고 `request_not_supported` / `request_uri_not_supported`로 거절합니다 |
-| `max_age` | 구현. 마지막 인증이 지정한 시간보다 오래되었으면 SSO Session이 있어도 재인증을 요구하며, `prompt=none`이면 `login_required`를 반환합니다 |
+| `max_age` | 구현. 마지막 인증이 지정한 시간보다 오래되었으면 SSO Session이 있어도 재인증을 요구하며, `prompt=none`이면 `login_required`를 반환합니다. 로그인 화면을 거친 요청은 항상 새 Session을 만들므로(`auth_time`이 그 시점입니다) 값을 따로 보관하지 않아도 충족됩니다 |
 | ID Token / JWT Access Token | RS256 구현 |
 | Refresh Token | 회전·재사용 탐지 구현 |
 | Client Credentials | Confidential Client 구현 |
