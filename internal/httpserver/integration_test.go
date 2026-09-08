@@ -1475,6 +1475,123 @@ func TestIntegrationAuthorizationRefusesUnsupportedAndMismatchedHints(t *testing
 	}
 }
 
+// The hint above is checked against the session already in the browser, which
+// is the path where it is least likely to decide anything: a request that does
+// not match is sent to the login form, and the form knew nothing about it. So
+// the guarantee the compatibility guide states — a hinted account that differs
+// from the one signing in is not answered with a code — held for silent renewal
+// and stopped exactly where a person can act: whoever typed a password got the
+// code, and the relying party was handed a different account without a word.
+func TestIntegrationLoginHoldsTheRequestToItsIDTokenHint(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "hint-login", Name: "Hint Login", Type: "public",
+		RedirectURIs: []string{"https://hint-login.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	// The hint is a real ID token for an account that is not the one which
+	// will sign in below.
+	hint := issueIntegrationIDToken(t, data, realm, "hint-login", "renewed-account")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	browser := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	verifier := strings.Repeat("hint-login-verifier", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	// No session cookie, so the request is parked and the person sent to the
+	// form — the ordinary way a relying party's renewal reaches a human.
+	authorization, err := browser.Get(server.URL + "/realms/master/protocol/openid-connect/auth?response_type=code" +
+		"&client_id=hint-login&redirect_uri=" + url.QueryEscape("https://hint-login.example.test/cb") +
+		"&scope=openid&state=s&code_challenge=" + challenge + "&code_challenge_method=S256" +
+		"&id_token_hint=" + url.QueryEscape(hint))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = authorization.Body.Close()
+	parked, err := url.Parse(authorization.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestToken := parked.Query().Get("request")
+	if requestToken == "" {
+		t.Fatalf("a hinted authorization did not park a request for the login form: %q", parked)
+	}
+
+	signIn := func(username, password string) (int, map[string]any) {
+		t.Helper()
+		body := fmt.Sprintf(`{"realm":"master","username":%q,"password":%q,"request":%q}`,
+			username, password, requestToken)
+		response, postErr := browser.Post(server.URL+"/api/v1/auth/login", "application/json", strings.NewReader(body))
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		decoded := map[string]any{}
+		if decodeErr := json.NewDecoder(response.Body).Decode(&decoded); decodeErr != nil {
+			t.Fatalf("decode login response: %v", decodeErr)
+		}
+		return response.StatusCode, decoded
+	}
+
+	status, body := signIn("admin", "bootstrap-password-123")
+	if status != http.StatusForbidden {
+		t.Errorf("signing in as an account the hint did not name answered %d, want %d (%v)",
+			status, http.StatusForbidden, body)
+	}
+	if got, _ := body["error"].(string); got != "account_mismatch" {
+		t.Errorf("the refusal was reported as %q, want account_mismatch", got)
+	}
+	if target, _ := body["redirect_to"].(string); strings.Contains(target, "code=") {
+		t.Errorf("a code was issued for an account the relying party did not ask about: %q", target)
+	}
+	// The message must not disclose whose account was named; whoever is at the
+	// keyboard has just proved they are somebody else.
+	if message, _ := body["message"].(string); strings.Contains(message, "renewed-account") {
+		t.Errorf("the refusal named the hinted account: %q", message)
+	}
+	// The login itself happened, and only the trail says the code did not.
+	page, err := data.ListAudit(ctx, store.AuditFilter{RealmID: &realm.ID, EventType: "LOGIN_SUCCESS", Result: "PARTIAL"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("LOGIN_SUCCESS result=PARTIAL entries = %d, want 1", len(page.Items))
+	}
+	if detail := string(page.Items[0].Detail); !strings.Contains(detail, "id_token_hint_mismatch") {
+		t.Errorf("the trail does not say why no code was issued: %s", detail)
+	}
+
+	// The request was not consumed, so the flow finishes from the same form
+	// once the account the relying party named signs in.
+	status, body = signIn("renewed-account", "renewed-account-password-1234")
+	if status != http.StatusOK {
+		t.Fatalf("the hinted account was refused: %d %v", status, body)
+	}
+	target, _ := body["redirect_to"].(string)
+	if !strings.Contains(target, "code=") {
+		t.Errorf("the hinted account did not receive a code: %q", target)
+	}
+	if !strings.HasPrefix(target, "https://hint-login.example.test/cb") {
+		t.Errorf("the code was sent somewhere other than the registered redirect URI: %q", target)
+	}
+}
+
 // issueIntegrationIDToken mints a real ID token for a freshly created account,
 // which is how a hint naming a different person is produced without forging
 // anything the server would refuse for the wrong reason.
