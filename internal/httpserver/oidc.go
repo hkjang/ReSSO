@@ -172,6 +172,26 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 	}
 	query := r.URL.Query()
 	client, err := s.store.ClientByIdentifier(r.Context(), realm.ID, query.Get("client_id"))
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		// "unknown client_id" is a statement about the relying party's own
+		// registration, and the relying party cannot retry it: a library that
+		// receives it has been told the identifier it was configured with is
+		// not registered here, which is a deployment mistake to be fixed by
+		// hand, not an outage to wait out. So a clients table that stopped
+		// answering did not degrade the authorization endpoint, it told every
+		// integration in the Realm at once that it had been deregistered.
+		//
+		// Nothing else in this handler answers that way — every store call
+		// below replies server_error when it cannot run — but this one runs in
+		// front of all of them, so a fault reached it first and that care never
+		// happened. The answer cannot be redirected either: redirect_uri is
+		// validated against this very record on the next line, so there is no
+		// target yet that has been shown to belong to the caller.
+		s.logger.Error("the client named in the authorization request could not be looked up",
+			"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "error", err)
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "the client registration is unavailable")
+		return
+	}
 	if err != nil || !client.Enabled {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "unknown client_id")
 		return
@@ -979,17 +999,13 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 		// client nil, which dropped post_logout_redirect_uri without a word and
 		// stranded the browser on this service's login page.
 		if verified, verifyErr := s.oidc.IDTokenHint(r.Context(), realm, hint); verifyErr == nil {
-			if found, findErr := s.store.ClientByIdentifier(r.Context(), realm.ID, verified.Extra.AuthorizedParty); findErr == nil && found.Enabled {
-				client = &found
-			}
+			client = s.logoutClient(r, realm, verified.Extra.AuthorizedParty)
 		}
 	} else if identifier := values.Get("client_id"); identifier != "" {
 		// RP-Initiated Logout 1.0 allows client_id in place of an
 		// id_token_hint. The redirect target is still checked against the
 		// client's registered list, so this cannot become an open redirect.
-		if found, findErr := s.store.ClientByIdentifier(r.Context(), realm.ID, identifier); findErr == nil && found.Enabled {
-			client = &found
-		}
+		client = s.logoutClient(r, realm, identifier)
 	}
 	redirectTo := ""
 	if requested := values.Get("post_logout_redirect_uri"); requested != "" && client != nil && store.PostLogoutURIAllowed(*client, requested) {
@@ -1037,6 +1053,36 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/login?logged_out=1", http.StatusFound)
+}
+
+// logoutClient resolves the Client whose registered list decides whether a
+// post-logout redirect target may be used, and reports nil when there is none
+// to be had.
+//
+// A lookup that did not complete is not a Client that is absent, and both used
+// to be the same silent nil. Unlike the authorization endpoint this one cannot
+// turn the difference into an answer — the requested target has not been shown
+// to belong to the caller, so there is nowhere safe to redirect an error, and
+// the logout itself still has to be carried out — which is exactly why it has
+// to be written down instead. Left unsaid, a clients table that stopped
+// answering looks the same as a relying party naming a target it does not own:
+// the browser is stranded on this service's page at the end of a logout that
+// otherwise worked.
+func (s *Server) logoutClient(r *http.Request, realm domain.Realm, identifier string) *domain.Client {
+	found, err := s.store.ClientByIdentifier(r.Context(), realm.ID, identifier)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Error("the client named at logout could not be looked up",
+				"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "error", err)
+		}
+		return nil
+	}
+	// A switched-off Client decides nothing, so its registered targets are not
+	// honoured either.
+	if !found.Enabled {
+		return nil
+	}
+	return &found
 }
 
 func bearerToken(r *http.Request) string {

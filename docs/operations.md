@@ -30,6 +30,13 @@ PostgreSQL에는 사용자, Client, Session, Refresh Token의 HMAC digest, 감�
 
 보존 기간이 더 길어야 한다면 표준 출력을 조직의 수집 Agent가 SIEM으로 전달하도록 구성하세요. 관리자 UI의 내장 로그 저장은 장애 분석 편의를 위한 보조 계층입니다.
 
+`clients` 조회가 멈추면 다음 두 줄을 찾으세요. 둘 다 감사 이벤트가 아니라 서버 로그에만 남습니다.
+
+| 로그 메시지 | 어디서 | 호출자가 받는 답 |
+|---|---|---|
+| `the client named in the authorization request could not be looked up` | 인가 Endpoint | 500 `server_error`. 400 `invalid_request` "unknown client_id"는 이제 등록되지 않았거나 꺼진 Client에만 나갑니다 |
+| `the client named at logout could not be looked up` | RP-Initiated Logout | 답은 바뀌지 않습니다 — 로그아웃은 수행되지만 `post_logout_redirect_uri`를 쓰지 못해 브라우저가 이 서비스의 페이지로 돌아옵니다. RP가 등록하지 않은 목적지를 보냈을 때와 겉모습이 같으므로, 이 로그가 유일한 구분입니다 |
+
 ## Health Check
 
 ```text

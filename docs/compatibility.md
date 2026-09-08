@@ -7,6 +7,7 @@
 | Realm 기반 Issuer | 구현 |
 | OIDC Discovery | 구현. Realm이 **없거나 꺼져 있으면** 404 `realm_not_found`, 이 서비스가 Realm을 **조회하지 못하면** 500 `internal_error`입니다 — JWKS·인가·로그아웃 Endpoint도 같습니다. RP 라이브러리는 404를 "이 Issuer는 존재하지 않는다"는 설정 오류로 읽고 캐시하기도 하므로, 이쪽 장애는 404가 아니라 재시도할 5xx로 알립니다. Revocation은 같은 이유로 200 대신 503입니다(200은 "일치하는 Token이 없다"는 뜻이라, 조회조차 못 한 경우에 쓰면 아직 살아 있는 Token을 폐기했다고 답하는 것이 됩니다) |
 | Authorization Code | 구현. 1회 사용이며 재사용 시 해당 Session·Client의 Refresh Token 폐기 |
+| 인가 Endpoint의 `client_id` | 등록되지 않았거나 **꺼진** Client는 400 `invalid_request` "unknown client_id", 이 서비스가 Client를 **조회하지 못하면** 500 `server_error`입니다. 400은 RP의 설정에 관한 단언이라 RP가 재시도할 것이 없으므로(사람이 등록을 고쳐야 합니다), 이쪽 장애를 그렇게 알리면 Realm의 모든 연동에 "너희는 등록이 해지되었다"고 한꺼번에 통지하는 것이 됩니다. 500은 `redirect_uri`로 리다이렉트되지 않고 본문으로 나갑니다 — `redirect_uri` 검증이 바로 이 Client 레코드로 이루어지므로, 이 시점에는 호출자의 것임이 확인된 목적지가 없습니다 |
 | PKCE S256 | 구현, Public Client 강제 |
 | 인가 응답 `iss` (RFC 9207) | 구현. 성공과 오류 응답 모두에 붙이며, Discovery의 `authorization_response_iss_parameter_supported`로 알립니다. 값은 Discovery의 `issuer`와 같은 문자열이므로 RP에서 Mix-Up 공격 방어를 위한 `iss` 검증을 강제로 켜도 됩니다 |
 | `prompt` | 사양대로 공백으로 구분된 목록으로 읽습니다. `login`은 SSO Session이 있어도 재인증을 요구하고, `none`은 재사용할 Session이 없으면 `login_required`를 반환합니다. Session이 **없는** 것과 이 서비스가 Session을 **조회하지 못한** 것은 구분하며, 후자는 `server_error`입니다 — `login_required`는 RP가 조용한 갱신에서 "사용자가 로그아웃했다"로 읽고 자신의 Session도 끝내는 신호이므로, 이쪽 장애를 그렇게 알리면 장애가 전 RP 로그아웃이 됩니다. 화면이 없는 `consent`·`select_account`는 무시하며, 그것들이 함께 와도 `login`·`none` 처리는 그대로입니다. 서로 모순되는 `none`과 `login`을 함께 요구하면 `invalid_request`로 거절합니다 |
@@ -18,7 +19,7 @@
 | Client Credentials | Confidential Client 구현 |
 | UserInfo / JWKS | 구현 |
 | Introspection / Revocation | 구현. Access Token은 같은 Realm의 모든 Confidential Client가 조회 가능 |
-| RP-Initiated Logout | 구현. `id_token_hint` 또는 `client_id`. `id_token_hint`는 만료된 ID Token도 받습니다(RP가 로그아웃 시점에 들고 있는 것이 보통 만료된 토큰입니다). Access Token은 hint가 아닙니다 |
+| RP-Initiated Logout | 구현. `id_token_hint` 또는 `client_id`. `id_token_hint`는 만료된 ID Token도 받습니다(RP가 로그아웃 시점에 들고 있는 것이 보통 만료된 토큰입니다). Access Token은 hint가 아닙니다. 어느 쪽으로 지목하든 Client를 **조회하지 못하면** `post_logout_redirect_uri`는 쓰지 않습니다(등록 목록을 읽지 못한 목적지를 허용할 수는 없습니다). 로그아웃 자체는 그대로 수행하고 브라우저는 이 서비스의 페이지로 돌아오며, 그 이유는 `the client named at logout could not be looked up` 로그로만 드러납니다 |
 | Back-Channel Logout | 구현. Session 참여 Client에 서명된 `logout_token` 전송 |
 | ID Token `at_hash` | 구현 |
 | Keycloak `realm_access` / `resource_access` Claim | 구현 |
