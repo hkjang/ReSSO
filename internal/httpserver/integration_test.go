@@ -9147,3 +9147,183 @@ func TestIntegrationUserInfoRefusesWhenItCannotJudgeTheRequest(t *testing.T) {
 		t.Fatalf("userinfo answered %d once every lookup was readable again: %v", status, claims)
 	}
 }
+
+// Every OIDC endpoint starts with the same lookup — the Realm named in the
+// route — and each of these reported a lookup that did not complete as a Realm
+// that is not there. None of those answers are ones the caller displays; they
+// are all acted on. 404 realm_not_found tells a relying party the issuer it was
+// configured with does not exist, which its library reads as a configuration
+// error rather than an outage and may hold on to past the fault. Revocation was
+// worse: it answered 200, the reply for a token this server does not recognise,
+// so somebody revoking a leaked token was told it was gone while it stayed
+// valid — and, because the entry is written after the Realm is resolved, the
+// trail said nothing at all.
+//
+// The lookup runs before everything else, so a fault reaches it first and the
+// care each of these endpoints already takes further down never runs.
+func TestIntegrationOIDCEndpointsDoNotReportAFaultAsAMissingRealm(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "realm-outage-rp", Name: "Realm Outage RP", Type: "confidential",
+		RedirectURIs:  []string{"https://rp.example.test/cb"},
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		DefaultScopes: []string{"openid", "profile"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	// Authorization and logout both answer with a redirect when they work, and
+	// following it would report the status of the login page instead of theirs.
+	client := server.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	const prefix = "/realms/master"
+	endpoints := []struct {
+		name, method, path string
+		form               url.Values
+		healthy            int
+		// What the endpoint has to answer once the Realm cannot be looked up,
+		// and what it must not answer: the reply that says the Realm is absent.
+		unavailable      int
+		unavailableError string
+		absent           int
+	}{
+		{name: "discovery", method: http.MethodGet, path: prefix + "/.well-known/openid-configuration",
+			healthy: http.StatusOK, unavailable: http.StatusInternalServerError,
+			unavailableError: "internal_error", absent: http.StatusNotFound},
+		{name: "jwks", method: http.MethodGet, path: prefix + "/protocol/openid-connect/certs",
+			healthy: http.StatusOK, unavailable: http.StatusInternalServerError,
+			unavailableError: "internal_error", absent: http.StatusNotFound},
+		{name: "authorization", method: http.MethodGet,
+			path: prefix + "/protocol/openid-connect/auth?response_type=code&scope=openid" +
+				"&client_id=realm-outage-rp&redirect_uri=" + url.QueryEscape("https://rp.example.test/cb"),
+			healthy: http.StatusFound, unavailable: http.StatusInternalServerError,
+			unavailableError: "internal_error", absent: http.StatusNotFound},
+		{name: "logout", method: http.MethodGet, path: prefix + "/protocol/openid-connect/logout",
+			healthy: http.StatusFound, unavailable: http.StatusInternalServerError,
+			unavailableError: "internal_error", absent: http.StatusNotFound},
+		{name: "revocation", method: http.MethodPost, path: prefix + "/protocol/openid-connect/revoke",
+			form: url.Values{"token": {"not-a-token"}, "client_id": {"realm-outage-rp"},
+				"client_secret": {created.ClientSecret}},
+			healthy: http.StatusOK, unavailable: http.StatusServiceUnavailable,
+			unavailableError: "temporarily_unavailable", absent: http.StatusOK},
+	}
+	call := func(method, path string, form url.Values) (int, map[string]any) {
+		t.Helper()
+		var request *http.Request
+		var requestErr error
+		if form == nil {
+			request, requestErr = http.NewRequest(method, server.URL+path, nil)
+		} else {
+			request, requestErr = http.NewRequest(method, server.URL+path, strings.NewReader(form.Encode()))
+			if requestErr == nil {
+				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			}
+		}
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		// A redirect and an empty 200 carry no body, so a decode failure here is
+		// the ordinary case rather than a fault.
+		var decoded map[string]any
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		return response.StatusCode, decoded
+	}
+
+	// The healthy answers first: without them every refusal below would prove
+	// only that these requests never worked.
+	for _, endpoint := range endpoints {
+		if status, body := call(endpoint.method, endpoint.path, endpoint.form); status != endpoint.healthy {
+			t.Fatalf("%s answered %d against a Realm that is there, want %d: %v",
+				endpoint.name, status, endpoint.healthy, body)
+		}
+	}
+
+	// Renaming keeps the table's identity, so putting it back restores the
+	// schema exactly; the schema itself belongs to this test.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE realms RENAME TO realms_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	statuses := make([]int, len(endpoints))
+	bodies := make([]map[string]any, len(endpoints))
+	for index, endpoint := range endpoints {
+		statuses[index], bodies[index] = call(endpoint.method, endpoint.path, endpoint.form)
+	}
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE realms_hidden RENAME TO realms"); err != nil {
+		t.Fatal(err)
+	}
+	for index, endpoint := range endpoints {
+		if statuses[index] == endpoint.absent {
+			t.Errorf("with realms unreadable %s answered %d %v — the same answer it gives for a Realm this "+
+				"server does not host, which a relying party acts on rather than retries",
+				endpoint.name, statuses[index], bodies[index])
+			continue
+		}
+		if statuses[index] != endpoint.unavailable {
+			t.Errorf("with realms unreadable %s answered %d, want %d: the fault is ours and the caller has "+
+				"nothing to fix", endpoint.name, statuses[index], endpoint.unavailable)
+		}
+		if bodies[index]["error"] != endpoint.unavailableError {
+			t.Errorf("with realms unreadable %s answered error=%v, want %s",
+				endpoint.name, bodies[index]["error"], endpoint.unavailableError)
+		}
+	}
+
+	// A revocation that did not happen is the one an incident asks about, so it
+	// has to be in the trail even though the Client could not be authenticated
+	// without the Realm.
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "TOKEN_REVOKED", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failures := 0
+	for _, item := range page.Items {
+		if item.Result != "FAILURE" {
+			continue
+		}
+		failures++
+		var detail map[string]any
+		if err := json.Unmarshal(item.Detail, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if detail["revoked"] != "none" {
+			t.Errorf("the trail records revoked=%v for a revocation that could not run", detail["revoked"])
+		}
+		if detail["error"] == nil {
+			t.Error("the trail does not say why the revocation failed")
+		}
+	}
+	if failures != 1 {
+		t.Errorf("TOKEN_REVOKED entries with result=FAILURE = %d, want 1: a caller told its token was gone "+
+			"while nothing was looked up leaves nothing else to find", failures)
+	}
+
+	// And it recovers: each refusal has to be about the fault rather than about
+	// these requests, or the endpoints would stay broken once the fault clears.
+	for _, endpoint := range endpoints {
+		if status, body := call(endpoint.method, endpoint.path, endpoint.form); status != endpoint.healthy {
+			t.Fatalf("%s answered %d once the Realm was readable again, want %d: %v",
+				endpoint.name, status, endpoint.healthy, body)
+		}
+	}
+}
