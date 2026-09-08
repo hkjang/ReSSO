@@ -27,6 +27,12 @@ const (
 	// active=false, so without this series the two are the same call in every
 	// signal the service publishes.
 	metricIntrospectionErrors = "resso_introspection_errors_total"
+	// metricAuthorizationErrors counts the authorization requests the service
+	// could not serve. Most of them leave as a 302 carrying error=server_error
+	// to the relying party's redirect_uri, which is the same status a granted
+	// authorization leaves with — so in the request counter and the access log
+	// an outage here is indistinguishable from a busy, healthy endpoint.
+	metricAuthorizationErrors = "resso_authorization_errors_total"
 	metricLogoutNotices       = backchannel.MetricName
 	MetricFederationSync      = "resso_federation_sync_total"
 	metricFederationSync      = MetricFederationSync
@@ -44,6 +50,8 @@ func registerMetrics(registry *observability.Registry) {
 	registry.Counter(metricClientAuth, "Failed OIDC client authentications.", "realm")
 	registry.Counter(metricIntrospectionErrors,
 		"Introspections the service could not judge, by the lookup that failed.", "stage")
+	registry.Counter(metricAuthorizationErrors,
+		"Authorization requests the service could not serve, by the step that failed.", "stage")
 	registry.Counter(metricLogoutNotices, "Back-channel logout deliveries, by outcome.", "result")
 	registry.Counter(metricFederationSync, "Scheduled LDAP federation syncs, by outcome.", "result")
 }

@@ -164,6 +164,9 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 	realm, err := s.realmFromPath(r)
 	if err != nil {
 		if s.realmLookupFailed(r, "authorization", err) {
+			// realmLookupFailed already wrote the log line; only the count is
+			// missing here.
+			s.metrics.Add(metricAuthorizationErrors, 1, "realm")
 			writeError(w, r, http.StatusInternalServerError, "internal_error", "요청을 처리하지 못했습니다.")
 			return
 		}
@@ -189,6 +192,7 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 		// target yet that has been shown to belong to the caller.
 		s.logger.Error("the client named in the authorization request could not be looked up",
 			"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "error", err)
+		s.metrics.Add(metricAuthorizationErrors, 1, "client")
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "the client registration is unavailable")
 		return
 	}
@@ -293,8 +297,7 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 		// answers server_error when it cannot run; this one runs before it, so
 		// an outage reached it first and that care never happened.
 		if sessionErr != nil && !errors.Is(sessionErr, store.ErrNotFound) {
-			s.logger.Error("the SSO session could not be read at the authorization endpoint",
-				"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "error", sessionErr)
+			s.recordUnservedAuthorization(r, realm.Name, "sso_session", sessionErr)
 			redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error",
 				"the SSO session is unavailable")
 			return
@@ -307,6 +310,7 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 			if reusable && maxAge >= 0 {
 				recent, authErr := s.store.SessionAuthenticatedRecently(r.Context(), authenticated.Session.ID, maxAge)
 				if authErr != nil {
+					s.recordUnservedAuthorization(r, realm.Name, "auth_time", authErr)
 					redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authentication time is unavailable")
 					return
 				}
@@ -319,6 +323,7 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 					CodeChallengeMethod: method,
 				})
 				if codeErr != nil {
+					s.recordUnservedAuthorization(r, realm.Name, "authorization_code", codeErr)
 					redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authorization code could not be created")
 					return
 				}
@@ -344,10 +349,32 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 		IDTokenHintSubject: hintedSubject}
 	token, err := s.store.CreateAuthorizationRequest(r.Context(), pending)
 	if err != nil {
+		s.recordUnservedAuthorization(r, realm.Name, "authorization_request", err)
 		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authorization request could not be saved")
 		return
 	}
 	http.Redirect(w, r, "/login?request="+url.QueryEscape(token), http.StatusFound)
+}
+
+// recordUnservedAuthorization counts and logs an authorization request this
+// service could not serve.
+//
+// Every failure it records leaves as a 302 — the specification says an error
+// this endpoint can safely redirect belongs on the relying party's
+// redirect_uri, and that is right — which is also the status a granted
+// authorization leaves with. So `resso_http_requests_total` records a healthy
+// redirect either way, the access log line says status=302, and three of the
+// four callers discarded the store error where it happened. An outage that
+// took every authorization in a Realm therefore looked, in every signal this
+// service publishes, like an endpoint doing its job: the login screen simply
+// stopped being reached and the relying parties reported errors nobody here
+// could see. The two failures answered from this endpoint rather than
+// redirected are counted alongside them, so that one series answers "how many
+// authorizations did we fail to serve" without having to be joined to another.
+func (s *Server) recordUnservedAuthorization(r *http.Request, realm, stage string, err error) {
+	s.metrics.Add(metricAuthorizationErrors, 1, stage)
+	s.logger.Error("an authorization request could not be served", "trace_id", traceIDFrom(r.Context()),
+		"realm", realm, "stage", stage, "error", err)
 }
 
 func (s *Server) token(w http.ResponseWriter, r *http.Request) {
