@@ -9593,3 +9593,160 @@ func TestIntegrationAuthorizationDoesNotReportAFaultAsAnUnknownClient(t *testing
 		t.Fatalf("authorization answered %d to %q once clients was readable again: %v", status, location, body)
 	}
 }
+
+// The authorization endpoint answers most of its own faults with a 302 to the
+// relying party's redirect_uri carrying error=server_error, because that is
+// where an error this endpoint can safely redirect belongs. That is also the
+// status a granted authorization leaves with, so `resso_http_requests_total`
+// recorded a healthy redirect either way and the access log said status=302 —
+// an outage that took every authorization in a Realm was indistinguishable
+// from a busy endpoint doing its job, and three of the four store errors were
+// discarded where they happened. This pins the series that separates them.
+func TestIntegrationAuthorizationCountsTheRequestsItCouldNotServe(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "unserved-authorization-rp", Name: "Unserved Authorization RP", Type: "confidential",
+		RedirectURIs:  []string{"https://rp.example.test/cb"},
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		DefaultScopes: []string{"openid", "profile"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A signed-in browser is needed for the steps that only run when a session
+	// can be reused: the freshness check and the code itself.
+	session, err := data.CreateSession(ctx, realm.ID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "authorization-metrics-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	metrics := observability.NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+	// Following the redirect would report the status of the login page or of
+	// the relying party's host instead of this endpoint's.
+	client := server.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	authorize := func(realmName, identifier, cookie, extra string) (int, string) {
+		t.Helper()
+		target := server.URL + "/realms/" + realmName + "/protocol/openid-connect/auth" +
+			"?response_type=code&scope=openid&client_id=" + url.QueryEscape(identifier) +
+			"&redirect_uri=" + url.QueryEscape("https://rp.example.test/cb") + extra
+		request, reqErr := http.NewRequest(http.MethodGet, target, nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		if cookie != "" {
+			request.AddCookie(&http.Cookie{Name: "resso_session", Value: cookie})
+		}
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		_, _ = io.Copy(io.Discard, response.Body)
+		return response.StatusCode, response.Header.Get("Location")
+	}
+	exported := func() string {
+		t.Helper()
+		var out strings.Builder
+		metrics.WritePrometheus(&out)
+		return out.String()
+	}
+
+	// The answers that are answers rather than faults come first, so that what
+	// the counter holds below is the fault and not merely traffic.
+	if status, location := authorize("master", created.Client.ClientID, "", ""); status != http.StatusFound ||
+		!strings.HasPrefix(location, "/login?request=") {
+		t.Fatalf("a signed-out authorization answered %d to %q, want 302 to the login page", status, location)
+	}
+	if status, location := authorize("master", created.Client.ClientID, session.Token, ""); status != http.StatusFound ||
+		!strings.Contains(location, "code=") {
+		t.Fatalf("a signed-in authorization answered %d to %q, want 302 carrying a code", status, location)
+	}
+	if status, _ := authorize("no-such-realm", created.Client.ClientID, "", ""); status != http.StatusNotFound {
+		t.Fatalf("an authorization for a Realm nobody created answered %d, want 404", status)
+	}
+	if status, _ := authorize("master", "never-registered", "", ""); status != http.StatusBadRequest {
+		t.Fatalf("an authorization naming an unregistered client_id answered %d, want 400", status)
+	}
+	if strings.Contains(exported(), "resso_authorization_errors_total{") {
+		t.Errorf("authorizations the service answered correctly were counted as unserved:\n%s", exported())
+	}
+
+	// Renaming keeps the table's identity, so putting it back restores the
+	// schema exactly; the schema itself belongs to this test.
+	for _, unserved := range []struct {
+		hide, stage, realm, cookie, extra, step string
+		wantStatus                              int
+		redirected                              bool
+	}{
+		{hide: "realms", stage: "realm", realm: "master", step: "the Realm named in the route",
+			wantStatus: http.StatusInternalServerError},
+		{hide: "clients", stage: "client", realm: "master", step: "the client_id the request names",
+			wantStatus: http.StatusInternalServerError},
+		{hide: "sso_sessions", stage: "sso_session", realm: "master", cookie: session.Token,
+			step: "whether the browser is signed in", wantStatus: http.StatusFound, redirected: true},
+		// The freshness check runs only for a session that may be reused, and it
+		// is the one step no hidden table reaches on its own — every table it
+		// reads is read by the session lookup in front of it. A max_age the
+		// database cannot turn into an interval fails inside that query and
+		// nowhere else, which is exactly this branch.
+		{stage: "auth_time", realm: "master", cookie: session.Token, extra: "&max_age=9999999999999999",
+			step: "how recently the session authenticated", wantStatus: http.StatusFound, redirected: true},
+		{hide: "authorization_codes", stage: "authorization_code", realm: "master", cookie: session.Token,
+			step: "creating the code", wantStatus: http.StatusFound, redirected: true},
+		{hide: "authorization_requests", stage: "authorization_request", realm: "master",
+			step: "parking the request for the login form", wantStatus: http.StatusFound, redirected: true},
+	} {
+		if unserved.hide != "" {
+			if _, err := data.Pool.Exec(ctx, "ALTER TABLE "+unserved.hide+" RENAME TO "+unserved.hide+"_hidden"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		status, location := authorize(unserved.realm, created.Client.ClientID, unserved.cookie, unserved.extra)
+		if unserved.hide != "" {
+			if _, err := data.Pool.Exec(ctx, "ALTER TABLE "+unserved.hide+"_hidden RENAME TO "+unserved.hide); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if status != unserved.wantStatus {
+			t.Errorf("with %s failing authorization answered %d, want %d", unserved.stage, status, unserved.wantStatus)
+		}
+		// A redirected fault is the whole point: this is the answer that carries
+		// the same status as a granted authorization.
+		if unserved.redirected && !strings.Contains(location, "error=server_error") {
+			t.Errorf("with %s failing authorization redirected to %q, want error=server_error",
+				unserved.stage, location)
+		}
+		if unserved.redirected && strings.Contains(location, "code=") {
+			t.Errorf("with %s failing authorization handed out a code anyway: %q", unserved.stage, location)
+		}
+		want := `resso_authorization_errors_total{stage="` + unserved.stage + `"} 1`
+		if !strings.Contains(exported(), want) {
+			t.Errorf("authorization could not complete %s and said so nowhere a time series would show it: no %s\n%s",
+				unserved.step, want, exported())
+		}
+	}
+
+	// And it recovers, or each count above would be about this request rather
+	// than about the fault.
+	if status, location := authorize("master", created.Client.ClientID, session.Token, ""); status != http.StatusFound ||
+		!strings.Contains(location, "code=") {
+		t.Errorf("authorization answered %d to %q once every table was readable again", status, location)
+	}
+}
