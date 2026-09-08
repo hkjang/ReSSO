@@ -9327,3 +9327,152 @@ func TestIntegrationOIDCEndpointsDoNotReportAFaultAsAMissingRealm(t *testing.T) 
 		}
 	}
 }
+
+// The authorization endpoint resolves the Client named in the query before it
+// does anything else, and it reported a lookup that did not complete as a
+// Client that is not registered: 400 invalid_request "unknown client_id".
+//
+// That answer is a statement about the relying party's own deployment, and it
+// leaves the relying party nothing to retry — its library has been told the
+// identifier it was configured with is not registered here, which is a mistake
+// somebody has to go and fix. So a clients table that stopped answering did not
+// degrade this endpoint, it told every integration in the Realm at once that it
+// had been deregistered. Every other store call in the handler already answers
+// server_error when it cannot run; this one runs in front of all of them.
+func TestIntegrationAuthorizationDoesNotReportAFaultAsAnUnknownClient(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "client-outage-rp", Name: "Client Outage RP", Type: "confidential",
+		RedirectURIs:           []string{"https://rp.example.test/cb"},
+		PostLogoutRedirectURIs: []string{"https://rp.example.test/bye"},
+		GrantTypes:             []string{"authorization_code", "refresh_token"},
+		DefaultScopes:          []string{"openid", "profile"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	// Authorization and logout both answer with a redirect when they work, and
+	// following it would report the status of the login page instead of theirs.
+	client := server.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	const prefix = "/realms/master/protocol/openid-connect"
+	authorize := func(identifier string) (int, map[string]any, string) {
+		t.Helper()
+		target := server.URL + prefix + "/auth?response_type=code&scope=openid&client_id=" +
+			url.QueryEscape(identifier) + "&redirect_uri=" + url.QueryEscape("https://rp.example.test/cb")
+		response, doErr := client.Get(target)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		var decoded map[string]any
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		return response.StatusCode, decoded, response.Header.Get("Location")
+	}
+	// The Client decides whether a post-logout target may be used, so a lookup
+	// that cannot run must not make one usable.
+	logout := func() (int, string) {
+		t.Helper()
+		response, doErr := client.Get(server.URL + prefix + "/logout?client_id=client-outage-rp" +
+			"&post_logout_redirect_uri=" + url.QueryEscape("https://rp.example.test/bye"))
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		return response.StatusCode, response.Header.Get("Location")
+	}
+
+	// The healthy answers first: without them every refusal below would prove
+	// only that these requests never worked.
+	if status, body, location := authorize(created.Client.ClientID); status != http.StatusFound ||
+		!strings.HasPrefix(location, "/login?request=") {
+		t.Fatalf("authorization answered %d to %q against a readable clients table, want 302 to the login "+
+			"page: %v", status, location, body)
+	}
+	if status, location := logout(); status != http.StatusFound || location != "https://rp.example.test/bye" {
+		t.Fatalf("logout answered %d to %q against a readable clients table, want 302 to the registered "+
+			"post-logout target", status, location)
+	}
+	// A client_id that really is not registered is a fact about the caller, and
+	// it has to keep its old answer.
+	if status, body, _ := authorize("never-registered"); status != http.StatusBadRequest ||
+		body["error"] != "invalid_request" {
+		t.Fatalf("authorization answered %d %v for a client_id nobody registered, want 400 invalid_request",
+			status, body)
+	}
+
+	// Renaming keeps the table's identity, so putting it back restores the
+	// schema exactly; the schema itself belongs to this test.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE clients RENAME TO clients_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	outageStatus, outageBody, _ := authorize(created.Client.ClientID)
+	logoutStatus, logoutLocation := logout()
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE clients_hidden RENAME TO clients"); err != nil {
+		t.Fatal(err)
+	}
+
+	if outageStatus == http.StatusBadRequest {
+		t.Errorf("with clients unreadable authorization answered %d %v — the same answer it gives for a "+
+			"client_id that was never registered, which a relying party has to fix by hand rather than retry",
+			outageStatus, outageBody)
+	} else if outageStatus != http.StatusInternalServerError {
+		t.Errorf("with clients unreadable authorization answered %d, want 500: the fault is ours and the "+
+			"caller has nothing to fix", outageStatus)
+	}
+	if outageBody["error"] != "server_error" {
+		t.Errorf("with clients unreadable authorization answered error=%v, want server_error", outageBody["error"])
+	}
+	// The redirect target is only allowed by the Client's registered list, so a
+	// lookup that could not read that list still cannot honour it.
+	if logoutStatus != http.StatusFound || logoutLocation == "https://rp.example.test/bye" {
+		t.Errorf("with clients unreadable logout answered %d to %q — a target that was never checked against "+
+			"a registered list", logoutStatus, logoutLocation)
+	}
+
+	// A switched-off Client is a fact about the caller too, and splitting the
+	// fault out of this branch must not have taken it with it.
+	setEnabled := func(enabled bool) {
+		t.Helper()
+		if _, err := data.UpdateClient(ctx, created.Client.ID, store.UpdateClientInput{
+			Name: created.Client.Name, RedirectURIs: created.Client.RedirectURIs,
+			PostLogoutRedirectURIs: created.Client.PostLogoutRedirectURIs,
+			WebOrigins:             created.Client.WebOrigins, GrantTypes: created.Client.GrantTypes,
+			DefaultScopes: created.Client.DefaultScopes, RequirePKCE: created.Client.RequirePKCE,
+			Enabled:                enabled,
+			AccessTokenTTLSeconds:  created.Client.AccessTokenTTLSeconds,
+			RefreshTokenTTLSeconds: created.Client.RefreshTokenTTLSeconds,
+			BackchannelLogoutURI:   created.Client.BackchannelLogoutURI}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setEnabled(false)
+	if status, body, _ := authorize(created.Client.ClientID); status != http.StatusBadRequest ||
+		body["error"] != "invalid_request" {
+		t.Fatalf("authorization answered %d %v for a switched-off Client, want 400 invalid_request", status, body)
+	}
+	setEnabled(true)
+
+	// And it recovers: the refusal has to be about the fault rather than about
+	// this request, or the endpoint would stay broken once the fault clears.
+	if status, body, location := authorize(created.Client.ClientID); status != http.StatusFound ||
+		!strings.HasPrefix(location, "/login?request=") {
+		t.Fatalf("authorization answered %d to %q once clients was readable again: %v", status, location, body)
+	}
+}
