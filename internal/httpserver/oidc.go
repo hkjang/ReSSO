@@ -40,9 +40,36 @@ func (s *Server) realmFromPath(r *http.Request) (domain.Realm, error) {
 	return realm, nil
 }
 
+// realmLookupFailed reports whether a realmFromPath error is a fault on this
+// side rather than the Realm being absent, and names which endpoint met it.
+//
+// This is the first store call every OIDC endpoint makes, so a fault reaches it
+// before the care each of those endpoints already takes further down. Answering
+// "no such Realm" for it is not a degraded answer but a different one, and the
+// callers of these endpoints act on it: 404 realm_not_found tells a relying
+// party the issuer it was configured with does not exist, which its library
+// reads as a configuration error and may cache, and revocation used to answer
+// 200 — the caller told a leaked token was gone when nothing had been looked up
+// at all.
+//
+// A Realm that is genuinely absent or switched off is still that, so only
+// errors that are not store.ErrNotFound are reported here.
+func (s *Server) realmLookupFailed(r *http.Request, endpoint string, err error) bool {
+	if errors.Is(err, store.ErrNotFound) {
+		return false
+	}
+	s.logger.Error("the Realm named in the route could not be looked up", "trace_id", traceIDFrom(r.Context()),
+		"realm", chi.URLParam(r, "realm"), "endpoint", endpoint, "error", err)
+	return true
+}
+
 func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 	realm, err := s.realmFromPath(r)
 	if err != nil {
+		if s.realmLookupFailed(r, "discovery", err) {
+			writeError(w, r, http.StatusInternalServerError, "internal_error", "요청을 처리하지 못했습니다.")
+			return
+		}
 		writeError(w, r, http.StatusNotFound, "realm_not_found", "Realm을 찾을 수 없습니다.")
 		return
 	}
@@ -99,6 +126,14 @@ func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
 	realm, err := s.realmFromPath(r)
 	if err != nil {
+		if s.realmLookupFailed(r, "jwks", err) {
+			// The key-set lookup a line below already answers 5xx for a fault of
+			// its own; this call runs in front of it, so without the same
+			// distinction the fault arrived here first and was published as a
+			// missing issuer instead.
+			writeError(w, r, http.StatusInternalServerError, "internal_error", "요청을 처리하지 못했습니다.")
+			return
+		}
 		writeError(w, r, http.StatusNotFound, "realm_not_found", "Realm을 찾을 수 없습니다.")
 		return
 	}
@@ -128,6 +163,10 @@ func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 	realm, err := s.realmFromPath(r)
 	if err != nil {
+		if s.realmLookupFailed(r, "authorization", err) {
+			writeError(w, r, http.StatusInternalServerError, "internal_error", "요청을 처리하지 못했습니다.")
+			return
+		}
 		writeError(w, r, http.StatusNotFound, "realm_not_found", "Realm을 찾을 수 없습니다.")
 		return
 	}
@@ -828,6 +867,20 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	}
 	realm, err := s.realmFromPath(r)
 	if err != nil {
+		// Below, every failure to revoke answers 503 and records FAILURE. This
+		// lookup runs in front of all of them and did neither: a Realm that
+		// could not be read left with 200 and no audit entry at all, which is
+		// the answer for a Realm this server does not host — the caller is told
+		// the token is gone when the token was never looked for. The Client
+		// cannot be authenticated without the Realm, so the entry is keyed on
+		// the Realm named in the route, which is the only party known here.
+		if s.realmLookupFailed(r, "revocation", err) {
+			s.audit(r, nil, nil, "", "TOKEN_REVOKED", "FAILURE", "realm", chi.URLParam(r, "realm"),
+				map[string]any{"revoked": "none", "error": "resolve the realm: " + err.Error()})
+			writeOAuthError(w, http.StatusServiceUnavailable, "temporarily_unavailable",
+				"the token could not be revoked and is still valid; retry after a short delay")
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -898,6 +951,14 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	realm, err := s.realmFromPath(r)
 	if err != nil {
+		if s.realmLookupFailed(r, "logout", err) {
+			// The session lookup further down already refuses this way and
+			// audits a logout it could not carry out; answering 404 here ended
+			// the request before either could happen, with the session still
+			// alive and nothing in the trail.
+			writeError(w, r, http.StatusInternalServerError, "internal_error", "요청을 처리하지 못했습니다.")
+			return
+		}
 		writeError(w, r, http.StatusNotFound, "realm_not_found", "Realm을 찾을 수 없습니다.")
 		return
 	}

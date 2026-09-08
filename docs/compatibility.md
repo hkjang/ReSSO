@@ -5,7 +5,7 @@
 | 기능 | 상태 |
 |---|---|
 | Realm 기반 Issuer | 구현 |
-| OIDC Discovery | 구현 |
+| OIDC Discovery | 구현. Realm이 **없거나 꺼져 있으면** 404 `realm_not_found`, 이 서비스가 Realm을 **조회하지 못하면** 500 `internal_error`입니다 — JWKS·인가·로그아웃 Endpoint도 같습니다. RP 라이브러리는 404를 "이 Issuer는 존재하지 않는다"는 설정 오류로 읽고 캐시하기도 하므로, 이쪽 장애는 404가 아니라 재시도할 5xx로 알립니다. Revocation은 같은 이유로 200 대신 503입니다(200은 "일치하는 Token이 없다"는 뜻이라, 조회조차 못 한 경우에 쓰면 아직 살아 있는 Token을 폐기했다고 답하는 것이 됩니다) |
 | Authorization Code | 구현. 1회 사용이며 재사용 시 해당 Session·Client의 Refresh Token 폐기 |
 | PKCE S256 | 구현, Public Client 강제 |
 | 인가 응답 `iss` (RFC 9207) | 구현. 성공과 오류 응답 모두에 붙이며, Discovery의 `authorization_response_iss_parameter_supported`로 알립니다. 값은 Discovery의 `issuer`와 같은 문자열이므로 RP에서 Mix-Up 공격 방어를 위한 `iss` 검증을 강제로 켜도 됩니다 |
