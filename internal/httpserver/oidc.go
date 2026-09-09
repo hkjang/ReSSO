@@ -3,6 +3,7 @@ package httpserver
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/url"
 	"slices"
@@ -160,6 +161,26 @@ func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"keys": result})
 }
 
+// maxAuthenticationAge caps the max_age this endpoint carries into the
+// freshness query.
+//
+// The freshness check asks the database to build an interval out of the number
+// the caller sent, and a number large enough — anything past about 9.2e12
+// seconds — is one no interval can hold, so the query failed with "interval out
+// of range". That failure is indistinguishable here from a store that stopped
+// answering: the request left as a redirected server_error and counted itself
+// on resso_authorization_errors_total{stage="auth_time"}, the series operators
+// are told to read as an outage. So any caller, unauthenticated, could raise an
+// alert about a database that was perfectly healthy by sending one query
+// parameter.
+//
+// Clamping loses nothing. An SSO session lives at most session_ttl_seconds and
+// that is bounded at 30 days, so every max_age at or beyond that is satisfied by
+// any session that exists at all — the answer to a value this large was never in
+// doubt, it simply could not be computed. This bound is sixty years past the
+// point where the two agree.
+const maxAuthenticationAge = math.MaxInt32
+
 func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 	realm, err := s.realmFromPath(r)
 	if err != nil {
@@ -247,12 +268,18 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 	// relying party exactly like a reauthentication that happened.
 	maxAge := -1
 	if raw := strings.TrimSpace(query.Get("max_age")); raw != "" {
-		parsed, parseErr := strconv.Atoi(raw)
-		if parseErr != nil || parsed < 0 {
+		// A value too large for an int64 is still a non-negative number of
+		// seconds, and refusing it while clamping the merely enormous would
+		// draw the line somewhere the specification does not. ParseInt reports
+		// the range and saturates, so both arrive at the same bound below;
+		// anything that is not a number at all, and anything negative, is
+		// still refused.
+		parsed, parseErr := strconv.ParseInt(raw, 10, 64)
+		if (parseErr != nil && !errors.Is(parseErr, strconv.ErrRange)) || parsed < 0 {
 			redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "invalid_request", "max_age must be a non-negative number of seconds")
 			return
 		}
-		maxAge = parsed
+		maxAge = int(min(parsed, maxAuthenticationAge))
 	}
 	// id_token_hint names the account the relying party believes it is
 	// renewing. Ignoring it meant a silent renewal could come back with a code

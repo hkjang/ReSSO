@@ -1376,6 +1376,23 @@ func TestIntegrationMaxAgeForcesReauthentication(t *testing.T) {
 	if malformed.Query().Get("error") != "invalid_request" {
 		t.Errorf("malformed max_age returned %q", malformed.Query().Get("error"))
 	}
+	// A limit too large for the database to turn into an interval is still a
+	// limit, and one every session meets — an SSO session lives at most 30 days.
+	// Carrying it through failed inside the freshness query, so the caller's own
+	// number came back as server_error and counted on the series that says this
+	// service could not serve an authorization. Both the enormous and the
+	// larger-than-an-int64 reach the same bound.
+	for _, huge := range []string{"9999999999999999", "99999999999999999999999999"} {
+		got := authorize("&max_age=" + huge)
+		if got.Query().Get("code") == "" || got.Query().Get("error") != "" {
+			t.Errorf("max_age=%s was not satisfied by the session that exists: %s", huge, got)
+		}
+	}
+	// Negative is refused as before: no session authenticated less than no time
+	// ago, so there is nothing to clamp it to.
+	if negative := authorize("&max_age=-1"); negative.Query().Get("error") != "invalid_request" {
+		t.Errorf("negative max_age returned %q", negative.Query().Get("error"))
+	}
 }
 
 // A relying party sends request objects to protect the parameters inside them,
@@ -9684,6 +9701,13 @@ func TestIntegrationAuthorizationCountsTheRequestsItCouldNotServe(t *testing.T) 
 	if status, _ := authorize("master", "never-registered", "", ""); status != http.StatusBadRequest {
 		t.Fatalf("an authorization naming an unregistered client_id answered %d, want 400", status)
 	}
+	// A max_age no interval can hold is the caller's number, not a fault here:
+	// it used to fail inside the freshness query and count itself below, so
+	// anyone could raise this alert about a database that was answering.
+	if status, location := authorize("master", created.Client.ClientID, session.Token, "&max_age=9999999999999999"); status != http.StatusFound ||
+		!strings.Contains(location, "code=") {
+		t.Fatalf("an authorization with an absurd max_age answered %d to %q, want 302 carrying a code", status, location)
+	}
 	if strings.Contains(exported(), "resso_authorization_errors_total{") {
 		t.Errorf("authorizations the service answered correctly were counted as unserved:\n%s", exported())
 	}
@@ -9691,9 +9715,9 @@ func TestIntegrationAuthorizationCountsTheRequestsItCouldNotServe(t *testing.T) 
 	// Renaming keeps the table's identity, so putting it back restores the
 	// schema exactly; the schema itself belongs to this test.
 	for _, unserved := range []struct {
-		hide, stage, realm, cookie, extra, step string
-		wantStatus                              int
-		redirected                              bool
+		hide, stage, realm, cookie, step string
+		wantStatus                       int
+		redirected                       bool
 	}{
 		{hide: "realms", stage: "realm", realm: "master", step: "the Realm named in the route",
 			wantStatus: http.StatusInternalServerError},
@@ -9701,13 +9725,17 @@ func TestIntegrationAuthorizationCountsTheRequestsItCouldNotServe(t *testing.T) 
 			wantStatus: http.StatusInternalServerError},
 		{hide: "sso_sessions", stage: "sso_session", realm: "master", cookie: session.Token,
 			step: "whether the browser is signed in", wantStatus: http.StatusFound, redirected: true},
-		// The freshness check runs only for a session that may be reused, and it
-		// is the one step no hidden table reaches on its own — every table it
-		// reads is read by the session lookup in front of it. A max_age the
-		// database cannot turn into an interval fails inside that query and
-		// nowhere else, which is exactly this branch.
-		{stage: "auth_time", realm: "master", cookie: session.Token, extra: "&max_age=9999999999999999",
-			step: "how recently the session authenticated", wantStatus: http.StatusFound, redirected: true},
+		// The auth_time stage has no row here. The freshness check runs only for
+		// a session that may be reused, and every table it reads is read by the
+		// session lookup in front of it, so no hidden table reaches it on its
+		// own. What used to reach it was a max_age too large to become an
+		// interval — but that was the caller's number failing inside the query,
+		// counted here as a fault of this service, which is the thing the clamp
+		// in front of it removed. The stage stays in the handler for a session
+		// that disappears between the two lookups and for the store itself
+		// failing; neither is reachable on demand. The clamp is held by
+		// TestIntegrationMaxAgeForcesReauthentication and by the absurd max_age
+		// among the answered requests above.
 		{hide: "authorization_codes", stage: "authorization_code", realm: "master", cookie: session.Token,
 			step: "creating the code", wantStatus: http.StatusFound, redirected: true},
 		{hide: "authorization_requests", stage: "authorization_request", realm: "master",
@@ -9718,7 +9746,7 @@ func TestIntegrationAuthorizationCountsTheRequestsItCouldNotServe(t *testing.T) 
 				t.Fatal(err)
 			}
 		}
-		status, location := authorize(unserved.realm, created.Client.ClientID, unserved.cookie, unserved.extra)
+		status, location := authorize(unserved.realm, created.Client.ClientID, unserved.cookie, "")
 		if unserved.hide != "" {
 			if _, err := data.Pool.Exec(ctx, "ALTER TABLE "+unserved.hide+"_hidden RENAME TO "+unserved.hide); err != nil {
 				t.Fatal(err)
