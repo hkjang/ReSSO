@@ -79,6 +79,65 @@ test('repeated failures explain the lockout policy before the account is locked'
   vi.unstubAllGlobals()
 })
 
+test('an account the relying party did not ask for is not told its password may lock the account', async () => {
+  const user = userEvent.setup()
+  // 403 account_mismatch is a login that succeeded: the password was accepted,
+  // the session exists, and the service cleared the account's failure count
+  // before declining to mint a code for an account the relying party did not
+  // name. The page counted it as a failed attempt all the same, so a third one
+  // produced "keep failing and the account locks; ask an administrator before
+  // it does" — advice to doubt a password that was right, about an account that
+  // cannot lock. And the refusal shared its red line with a wrong password, so
+  // nothing said the form in front of the person was still the way through.
+  const fetchMock = vi.fn(async (input: string) => {
+    if (input.startsWith('/api/v1/auth/challenge/')) {
+      return new Response(challengeBody, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    return new Response(JSON.stringify({
+      error: 'account_mismatch',
+      message: '이 애플리케이션은 이전에 사용하던 계정으로 다시 로그인하도록 요청했습니다. 방금 로그인한 계정은 그 계정이 아닙니다. 요청한 계정으로 로그인하세요.',
+    }), { status: 403, headers: { 'Content-Type': 'application/json' } })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+
+  renderLogin('/login?request=live-token')
+  await screen.findByText(/사내 포털에서 마스터 계정 인증을 요청했습니다/)
+  await user.type(screen.getByRole('textbox', { name: '아이디' }), 'someone-else')
+  await user.type(screen.getByLabelText(/비밀번호/, { selector: 'input' }), 'their-right-password')
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await user.click(screen.getByRole('button', { name: /로그인/ }))
+    await screen.findByText(/요청한 계정으로 로그인하세요/)
+  }
+
+  expect(screen.queryByText(/반복 실패하면 계정이 일정 시간 잠기며/)).not.toBeInTheDocument()
+  // The request is left unconsumed on purpose, so the way out is this form —
+  // going back to the relying party only lands on the same comparison.
+  expect(await screen.findByText(/이 화면에서 요청한 계정으로 다시 로그인하면/)).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /로그인/ })).toBeEnabled()
+  vi.unstubAllGlobals()
+})
+
+test('a fault on this side is not counted toward the lockout warning either', async () => {
+  const user = userEvent.setup()
+  // Nothing was recorded against the account: the service did not finish the
+  // attempt. Its own message is kept, but the lockout policy has no bearing.
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    error: 'internal_error', message: '로그인을 처리하지 못했습니다.', trace_id: 'trace-7',
+  }), { status: 500, headers: { 'Content-Type': 'application/json' } }))
+  vi.stubGlobal('fetch', fetchMock)
+
+  renderLogin()
+  await user.type(screen.getByRole('textbox', { name: '아이디' }), 'admin')
+  await user.type(screen.getByLabelText(/비밀번호/, { selector: 'input' }), 'correct horse battery staple')
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await user.click(screen.getByRole('button', { name: /로그인/ }))
+    await screen.findByText('로그인을 처리하지 못했습니다.')
+  }
+
+  expect(screen.queryByText(/반복 실패하면 계정이 일정 시간 잠기며/)).not.toBeInTheDocument()
+  vi.unstubAllGlobals()
+})
+
 test('a locked account is told it is locked, not that its password is wrong', async () => {
   const user = userEvent.setup()
   // The server answers 401 here, not 429, so the countdown that already
