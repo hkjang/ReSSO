@@ -4,7 +4,7 @@ import ArrowForwardRoundedIcon from '@mui/icons-material/ArrowForwardRounded'
 import LockRoundedIcon from '@mui/icons-material/LockRounded'
 import VisibilityOffRoundedIcon from '@mui/icons-material/VisibilityOffRounded'
 import VisibilityRoundedIcon from '@mui/icons-material/VisibilityRounded'
-import { Alert, Box, Button, CircularProgress, IconButton, InputAdornment, Link, Paper, Stack, TextField, Typography } from '@mui/material'
+import { Alert, AlertTitle, Box, Button, CircularProgress, IconButton, InputAdornment, Link, Paper, Stack, TextField, Typography } from '@mui/material'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { api, APIError, jsonBody } from '../lib/api'
 import { useAuth } from '../lib/auth-context'
@@ -22,6 +22,33 @@ interface Challenge {
   realm: { name: string; display_name: string }
   client: { client_id: string; name: string }
   expires_at: string
+}
+
+/**
+ * Whether the service actually weighed the credential and turned it down.
+ *
+ * The page counted every refused submission alike, and the third one puts up
+ * "keep failing and the account locks for a while; ask an administrator before
+ * it does". Only an answer about the credential earns that, and those are the
+ * 401s — a wrong password, an account already locked, a disabled one — each of
+ * which the service records against the account before answering.
+ *
+ * The others are not attempts:
+ *
+ *   - `403 account_mismatch` is a login that *succeeded*. The password was
+ *     accepted, the session exists and its cookies are in the browser, and the
+ *     service cleared the account's failure count on the way past
+ *     (ResetLoginRateLimit) before declining to mint a code for an account the
+ *     relying party did not ask for. Counting it told someone whose password
+ *     was right to doubt it, and to call the help desk about an account that
+ *     cannot lock.
+ *   - `500` and status 0 are this service not finishing the attempt. Nothing
+ *     was recorded against the account either.
+ *   - `429` carries a Retry-After, and the countdown below says when to try
+ *     again, which is the more exact answer than the policy.
+ */
+function credentialWasChecked(error: unknown): boolean {
+  return error instanceof APIError && error.status === 401
 }
 
 export function LoginPage() {
@@ -66,7 +93,7 @@ export function LoginPage() {
       navigate('/', { replace: true })
     },
     onError: (error) => {
-      setFailures((count) => count + 1)
+      if (credentialWasChecked(error)) setFailures((count) => count + 1)
       // A lockout carries its own Retry-After, so the countdown that already
       // exists for rate limiting can tell the user exactly when they may try
       // again instead of leaving them to keep guessing at their password.
@@ -90,6 +117,14 @@ export function LoginPage() {
   }
   const rateLimited = waitSeconds > 0
   const errorMessage = login.error instanceof APIError ? login.error.message : login.error ? '로그인하지 못했습니다.' : ''
+  // The one refusal whose way out is this form rather than the relying party.
+  // The service leaves the authorization request unconsumed on purpose, so
+  // signing in again as the account that was named finishes the flow from
+  // here; going back over there only mints a request token that lands on the
+  // same comparison. Shown as its own notice because the red line it shared
+  // with a wrong password read as "that did not work", and nothing said the
+  // form in front of the person was still the way through.
+  const accountMismatch = login.error instanceof APIError && login.error.code === 'account_mismatch'
   const blocked = login.isPending || challenge.isError || rateLimited || !username.trim() || !password
   // A challenge that could not be read is not a login request that expired.
   // The service answers 404 only for a request token that is gone — spent,
@@ -139,7 +174,15 @@ export function LoginPage() {
               )}
             </Alert>
           )}
-          {errorMessage && !rateLimited && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
+          {errorMessage && !rateLimited && !accountMismatch && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
+          {accountMismatch && !rateLimited && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              <AlertTitle sx={{ mb: .5 }}>{errorMessage}</AlertTitle>
+              <Typography variant="body2">
+                연결한 서비스로 돌아가지 마세요. 이 화면에서 요청한 계정으로 다시 로그인하면 그대로 이어집니다.
+              </Typography>
+            </Alert>
+          )}
           {rateLimited && lockedOut && (
             <Alert severity="warning" sx={{ mb: 2 }}>
               연속된 로그인 실패로 계정이 잠겼습니다. <strong>{formatWait(waitSeconds)}</strong> 후에 다시 시도하거나, 관리자에게 잠금 해제를 요청하세요.
