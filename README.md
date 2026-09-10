@@ -19,6 +19,15 @@ ReSSO는 Go와 React로 만든 오프라인 운영용 Keycloak-compatible OIDC S
 - 관리자용 구조화 서버 로그 조회, Trace ID, 민감 필드 마스킹, Prometheus `/metrics`
 - React/MUI 정적 자산을 Go 바이너리에 포함한 단일 오프라인 Docker 이미지
 
+## 가이드 문서
+
+화면 캡처가 들어간 두 문서가 정본입니다. 아래 README는 그 요약이 아니라 개발·연동 참고용입니다.
+
+| 문서 | 읽는 사람 |
+|---|---|
+| [사용자 가이드](docs/USER_GUIDE.md) ([PDF](docs/USER_GUIDE.pdf)) | 로그인하고 개인 설정을 쓰는 사람 |
+| [관리자 가이드](docs/ADMIN_GUIDE.md) ([PDF](docs/ADMIN_GUIDE.pdf)) | 설치·운영하는 사람 |
+
 ## 환경변수
 
 PostgreSQL과 최초 관리자 값이 필요하며, 키 보호 설정은 분리형 Keyring 또는 기존 단일 키 중 하나를 선택합니다. Reverse Proxy를 사용하는 경우 신뢰할 Proxy CIDR을 선택적으로 지정합니다.
