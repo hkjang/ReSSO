@@ -12,10 +12,16 @@ vi.mock('../lib/auth-context', () => ({
   }),
 }))
 
-function renderLogin() {
+function renderLogin(entry = '/login') {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={queryClient}><MemoryRouter initialEntries={['/login']}><LoginPage /></MemoryRouter></QueryClientProvider>)
+  return render(<QueryClientProvider client={queryClient}><MemoryRouter initialEntries={[entry]}><LoginPage /></MemoryRouter></QueryClientProvider>)
 }
+
+const challengeBody = JSON.stringify({
+  realm: { name: 'master', display_name: '마스터' },
+  client: { client_id: 'portal', name: '사내 포털' },
+  expires_at: '2026-01-01T00:00:00Z',
+})
 
 test('login form remains usable and exposes the service version', async () => {
   const user = userEvent.setup()
@@ -93,5 +99,53 @@ test('a locked account is told it is locked, not that its password is wrong', as
   expect(notice.textContent).toContain('약 10분')
   expect(notice.textContent).toContain('잠금 해제')
   expect(screen.getByRole('button', { name: /후 재시도/ })).toBeDisabled()
+  vi.unstubAllGlobals()
+})
+
+test('a spent login request is the only failure that sends the person back to the service', async () => {
+  // 404 is the one answer that means the request token is gone — spent,
+  // expired or never issued — and starting over is then the only way out.
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: 'not_found', message: '요청한 항목을 찾을 수 없습니다.' }), {
+    status: 404, headers: { 'Content-Type': 'application/json' },
+  }))
+  vi.stubGlobal('fetch', fetchMock)
+
+  renderLogin('/login?request=spent-token')
+
+  expect(await screen.findByText(/로그인 요청이 만료되었습니다/)).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: '다시 시도' })).not.toBeInTheDocument()
+  vi.unstubAllGlobals()
+})
+
+test('a fault on this side is not reported as an expired login request', async () => {
+  const user = userEvent.setup()
+  // The page used to answer every failed challenge with "your login request
+  // expired, start again over there". For a store that did not answer, that
+  // sent the person off for a fresh request token to meet the same fault
+  // again, while the request they held was still intact — and left the form
+  // disabled with nothing to press once the fault had cleared.
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'internal_error', message: '요청을 처리하지 못했습니다.', trace_id: 'trace-42' }), {
+      status: 500, headers: { 'Content-Type': 'application/json' },
+    }))
+    .mockResolvedValueOnce(new Response(challengeBody, { status: 200, headers: { 'Content-Type': 'application/json' } }))
+  vi.stubGlobal('fetch', fetchMock)
+
+  renderLogin('/login?request=live-token')
+
+  const notice = await screen.findByText(/로그인 요청을 확인하지 못했습니다/)
+  expect(notice.textContent).toContain('다시 시작하지 말고')
+  expect(screen.queryByText(/로그인 요청이 만료되었습니다/)).not.toBeInTheDocument()
+  expect(notice.textContent).toContain('trace-42')
+
+  // Retrying is offered because this cause can clear on its own, and once it
+  // has, the same request finishes from this form.
+  await user.click(screen.getByRole('button', { name: '다시 시도' }))
+  expect(await screen.findByText(/사내 포털에서 마스터 계정 인증을 요청했습니다/)).toBeInTheDocument()
+  expect(screen.queryByText(/로그인 요청을 확인하지 못했습니다/)).not.toBeInTheDocument()
+
+  await user.type(screen.getByRole('textbox', { name: '아이디' }), 'admin')
+  await user.type(screen.getByLabelText(/비밀번호/, { selector: 'input' }), 'correct horse battery staple')
+  expect(screen.getByRole('button', { name: /로그인/ })).toBeEnabled()
   vi.unstubAllGlobals()
 })

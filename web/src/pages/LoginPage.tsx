@@ -91,6 +91,25 @@ export function LoginPage() {
   const rateLimited = waitSeconds > 0
   const errorMessage = login.error instanceof APIError ? login.error.message : login.error ? '로그인하지 못했습니다.' : ''
   const blocked = login.isPending || challenge.isError || rateLimited || !username.trim() || !password
+  // A challenge that could not be read is not a login request that expired.
+  // The service answers 404 only for a request token that is gone — spent,
+  // expired, or never issued — and that is the one case where starting over at
+  // the connected service is the way out. Every other failure is this
+  // service's own: a store that did not answer (500), or a restart this page
+  // fetched into (status 0). Both were shown as "your login request expired,
+  // start again over there", which is not a description but an instruction:
+  // the person leaves, the relying party mints a fresh request token, and the
+  // same fault meets them here again — while the request they already had was
+  // sitting there untouched, and a moment's wait was all it needed. The alert
+  // was also the page's only word on the subject and had nothing to press, so
+  // the form stayed disabled after the cause had cleared.
+  //
+  // The console already separates these everywhere else (ErrorAlert in
+  // components/Feedback.tsx retries exactly status 0, 429 and 5xx, and no
+  // others); this page, the only one someone who is not signed in ever sees,
+  // was the one that threw the distinction away.
+  const challengeError = challenge.error instanceof APIError ? challenge.error : undefined
+  const requestGone = challengeError?.status === 404
 
   return (
     <Box sx={{ minHeight: '100vh', display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'minmax(360px, 520px) 1fr' }, bgcolor: '#0b1220' }}>
@@ -107,7 +126,19 @@ export function LoginPage() {
           </Typography>
           {loggedOut && <Alert severity="success" sx={{ mb: 2 }}>안전하게 로그아웃되었습니다.</Alert>}
           {expired && !errorMessage && <Alert severity="warning" sx={{ mb: 2 }}>세션이 만료되어 로그아웃되었습니다. 다시 로그인하세요.</Alert>}
-          {challenge.isError && <Alert severity="error" sx={{ mb: 2 }}>로그인 요청이 만료되었습니다. 연결한 서비스에서 다시 시작하세요.</Alert>}
+          {challenge.isError && requestGone && <Alert severity="error" sx={{ mb: 2 }}>로그인 요청이 만료되었습니다. 연결한 서비스에서 다시 시작하세요.</Alert>}
+          {challenge.isError && !requestGone && (
+            <Alert
+              severity="warning"
+              sx={{ mb: 2 }}
+              action={<Button color="inherit" size="small" onClick={() => { void challenge.refetch() }} disabled={challenge.isFetching}>다시 시도</Button>}
+            >
+              로그인 요청을 확인하지 못했습니다. 요청은 그대로 남아 있으니 연결한 서비스에서 다시 시작하지 말고, 잠시 후 다시 시도하세요.
+              {challengeError?.traceId && (
+                <Typography component="span" className="mono" sx={{ display: 'block', fontSize: 12, mt: .5 }}>trace: {challengeError.traceId}</Typography>
+              )}
+            </Alert>
+          )}
           {errorMessage && !rateLimited && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
           {rateLimited && lockedOut && (
             <Alert severity="warning" sx={{ mb: 2 }}>
