@@ -41,9 +41,13 @@ test('취소하면 원래 요청이 서버가 준 메시지로 실패한다', as
   vi.stubGlobal('fetch', vi.fn(() => answer(403, { error: 'reauthentication_required', message: '보호된 작업입니다.' })))
   render(<ReauthenticationGate><div>화면</div></ReauthenticationGate>)
 
-  const result = api('/api/admin/v1/realms/r1/keys/rotate', { method: 'POST' })
+  // 거절을 받아 둘 사람을 먼저 붙여 놓고 취소한다. 클릭을 기다리는 동안 거절이
+  // 먼저 도착하면, 아무도 받지 않은 rejection이 되어 vitest가 테스트는 모두
+  // 통과시키면서 종료 코드 1을 낸다.
+  const settled = expect(api('/api/admin/v1/realms/r1/keys/rotate', { method: 'POST' }))
+    .rejects.toMatchObject({ code: 'reauthentication_required', message: '보호된 작업입니다.' })
   await user.click(await screen.findByRole('button', { name: '취소' }))
-  await expect(result).rejects.toMatchObject({ code: 'reauthentication_required', message: '보호된 작업입니다.' })
+  await settled
 })
 
 // 비밀번호를 잘못 쳤다고 진행하던 작업이 실패하면, 운영자는 처음부터 다시 한다.
