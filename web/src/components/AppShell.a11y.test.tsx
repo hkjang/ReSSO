@@ -102,7 +102,8 @@ test('팔레트 검색 입력은 placeholder가 아닌 이름으로 찾을 수 �
   renderShell()
   await user.keyboard('{Control>}k{/Control}')
 
-  const search = await screen.findByRole('textbox', { name: '메뉴, 사용자, Client 검색' })
+  // 방향키로 고르는 목록을 거느리게 되면서 역할이 combobox가 되었다.
+  const search = await screen.findByRole('combobox', { name: '메뉴, 명령, 사용자, Client 검색' })
   await user.type(search, '사용')
-  expect(search).toHaveAccessibleName('메뉴, 사용자, Client 검색')
+  expect(search).toHaveAccessibleName('메뉴, 명령, 사용자, Client 검색')
 })

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link as RouterLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import AccountCircleRoundedIcon from '@mui/icons-material/AccountCircleRounded'
 import AdminPanelSettingsRoundedIcon from '@mui/icons-material/AdminPanelSettingsRounded'
@@ -18,12 +18,14 @@ import SearchRoundedIcon from '@mui/icons-material/SearchRounded'
 import SecurityRoundedIcon from '@mui/icons-material/SecurityRounded'
 import SettingsRoundedIcon from '@mui/icons-material/SettingsRounded'
 import VpnKeyRoundedIcon from '@mui/icons-material/VpnKeyRounded'
-import { Avatar, Box, Button, Chip, Dialog, DialogContent, DialogTitle, Divider, Drawer, IconButton, InputAdornment, List, ListItemButton, ListItemIcon, ListItemText, Menu, MenuItem, Stack, TextField, Tooltip, Typography, useMediaQuery } from '@mui/material'
+import { Avatar, Box, Button, Chip, Divider, Drawer, IconButton, List, ListItemButton, ListItemIcon, ListItemText, Menu, MenuItem, Stack, Tooltip, Typography, useMediaQuery } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
 import { useTheme } from '@mui/material/styles'
-import { visuallyHidden } from '@mui/utils'
 import { api } from '../lib/api'
 import { useAuth } from '../lib/auth-context'
+import { rememberDestination } from '../lib/recent'
+import { CommandPalette } from './CommandPalette'
+import type { PaletteCommand } from './CommandPalette'
 import type { Realm } from '../types'
 
 const drawerWidth = 264
@@ -72,6 +74,9 @@ export function AppShell() {
     if (!settled.current) { settled.current = true; return }
     mainRef.current?.focus()
   }, [location.pathname])
+  // What the palette offers before anything is typed. Recorded from the route
+  // rather than from the click, so arriving by any means counts.
+  useEffect(() => { rememberDestination(location.pathname) }, [location.pathname])
   const isAdmin = location.pathname.startsWith('/admin')
   const realms = useQuery({
     queryKey: ['realms'],
@@ -109,7 +114,23 @@ export function AppShell() {
     return () => window.removeEventListener('keydown', keydown)
   }, [])
 
-  const switchContext = () => navigate(isAdmin ? '/personal' : '/admin')
+  const switchContext = useCallback(() => navigate(isAdmin ? '/personal' : '/admin'), [isAdmin, navigate])
+  // A palette that only goes places stops one step short of what the pattern
+  // is for. These are the actions an operator otherwise has to hunt for in the
+  // profile menu, reachable by name from the same keystroke.
+  const commands = useMemo<PaletteCommand[]>(() => {
+    const list: PaletteCommand[] = []
+    if (me?.permissions.admin) {
+      list.push({
+        label: isAdmin ? '개인 설정으로 전환' : '서비스 관리로 전환',
+        description: '관리 화면과 내 계정 화면을 오갑니다',
+        icon: isAdmin ? AccountCircleRoundedIcon : AdminPanelSettingsRoundedIcon,
+        run: switchContext,
+      })
+    }
+    list.push({ label: '로그아웃', description: '이 브라우저의 세션을 종료합니다', icon: LogoutRoundedIcon, run: () => void logout() })
+    return list
+  }, [isAdmin, me?.permissions.admin, logout, switchContext])
   const drawer = (
     <Stack sx={{ width: drawerWidth, height: '100%', bgcolor: '#101828', color: '#d0d5dd', overflow: 'hidden' }}>
       <Stack direction="row" alignItems="center" spacing={1.2} sx={{ px: 2.5, height: 68, flex: '0 0 auto' }}>
@@ -182,45 +203,8 @@ export function AppShell() {
         </Stack>
         <Box component="main" id="main-content" ref={mainRef} tabIndex={-1} sx={{ p: { xs: 2, sm: 3, xl: 4 }, maxWidth: 1680, mx: 'auto', outline: 'none' }}><Outlet /></Box>
       </Box>
-      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} items={navItems} admin={Boolean(me?.permissions.admin)} />
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} destinations={navItems}
+        commands={commands} admin={Boolean(me?.permissions.admin)} onNavigate={navigate} />
     </Box>
-  )
-}
-
-function CommandPalette({ open, onClose, items, admin }: { open: boolean; onClose: () => void; items: NavItem[]; admin: boolean }) {
-  const [query, setQuery] = useState('')
-  const navigate = useNavigate()
-  // Clear the query as the palette closes, adjusting during render so the next
-  // open never shows the previous search for a frame.
-  const [wasOpen, setWasOpen] = useState(open)
-  if (wasOpen !== open) {
-    setWasOpen(open)
-    if (!open) setQuery('')
-  }
-  const remote = useQuery({
-    queryKey: ['quick-search', query],
-    queryFn: () => api<{ items: Array<{ kind: string; id: string; label: string; description: string; path: string }> }>(`/api/admin/v1/quick-search?q=${encodeURIComponent(query)}`),
-    enabled: open && admin && query.trim().length >= 2,
-    staleTime: 10_000,
-  })
-  const filtered = items.filter((item) => `${item.label} ${item.keywords ?? ''}`.toLowerCase().includes(query.toLowerCase()))
-  const go = (path: string) => { onClose(); navigate(path) }
-  return (
-    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth PaperProps={{ sx: { position: 'fixed', top: { xs: 8, sm: 72 }, m: 1, maxHeight: 'min(680px, calc(100vh - 32px))' } }}>
-      {/* MUI는 DialogTitle이 없어도 aria-labelledby를 붙이므로, 제목을 렌더하지 않으면
-          없는 id를 가리켜 이름 없는 대화 상자가 된다. 디자인상 제목을 보이지 않으므로
-          시각적으로만 감춘다. */}
-      <DialogTitle sx={visuallyHidden}>빠른 이동 및 검색</DialogTitle>
-      {/* placeholder는 접근 가능한 이름이 아니고, 입력을 시작하면 사라진다. */}
-      <TextField autoFocus placeholder="메뉴, 사용자, Client 검색…" value={query} onChange={(e) => setQuery(e.target.value)}
-        inputProps={{ 'aria-label': '메뉴, 사용자, Client 검색' }}
-        InputProps={{ startAdornment: <InputAdornment position="start"><SearchRoundedIcon /></InputAdornment> }} sx={{ '& fieldset': { border: 0 }, px: 1, pt: 1 }} />
-      <Divider />
-      <DialogContent sx={{ p: 1, overflowY: 'auto' }}>
-        <Typography variant="overline" color="text.secondary" sx={{ px: 1.5 }}>빠른 이동</Typography>
-        <List dense>{filtered.map((item) => { const Icon = item.icon; return <ListItemButton key={item.path} onClick={() => go(item.path)} sx={{ borderRadius: 1 }}><ListItemIcon><Icon /></ListItemIcon><ListItemText primary={item.label} secondary={item.keywords} /></ListItemButton> })}</List>
-        {remote.data?.items.length ? <><Divider sx={{ my: 1 }} /><Typography variant="overline" color="text.secondary" sx={{ px: 1.5 }}>검색 결과</Typography><List dense>{remote.data.items.map((item) => <ListItemButton key={`${item.kind}-${item.id}`} onClick={() => go(item.path)} sx={{ borderRadius: 1 }}><ListItemIcon><SearchRoundedIcon /></ListItemIcon><ListItemText primary={item.label} secondary={`${item.kind} · ${item.description}`} /></ListItemButton>)}</List></> : null}
-      </DialogContent>
-    </Dialog>
   )
 }
