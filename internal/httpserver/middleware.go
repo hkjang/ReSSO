@@ -50,7 +50,10 @@ func (s *Server) commonMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+		// The console document replaces this with a wider one while a tracking
+		// snippet is on for that path (see serveConsoleDocument); everything
+		// else keeps it as written.
+		w.Header().Set("Content-Security-Policy", basePolicy)
 		if s.requestIsSecure(r) {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}

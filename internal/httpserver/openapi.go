@@ -111,7 +111,17 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 				"get":        openAPIReadOperation("Administration", "Realm의 개인 API 키 조회 (metadata)"),
 			},
 			"/api/admin/v1/system-logs": openAPIReadPath("Administration", "서버 구조화 로그 조회"),
-			"/mcp":                      openAPIPath("post", "MCP", "MCP Streamable HTTP JSON-RPC endpoint", true),
+			"/api/admin/v1/tracking": map[string]any{
+				"get": openAPIReadOperation("Administration", "방문 추적 설정과 그 설정이 만드는 콘텐츠 보안 정책 조회"),
+				"put": openAPIOperation("Administration", "방문 추적 설정 변경 (서비스 관리자)", true),
+			},
+			"/api/admin/v1/tracking/violations": map[string]any{
+				"get":    openAPIReadOperation("Administration", "콘텐츠 보안 정책이 차단한 출처 목록 (이 인스턴스의 메모리)"),
+				"delete": openAPIOperation("Administration", "차단 기록 비우기", true),
+			},
+			"/api/admin/v1/tracking/allowed-hosts": openAPIPath("post", "Administration", "차단된 출처 하나를 허용 목록에 추가", true),
+			cspReportPath:                          openAPIPath("post", "Metadata", "브라우저의 콘텐츠 보안 정책 위반 신고 수신 (인증 없음, 항상 204)", false),
+			"/mcp":                                 openAPIPath("post", "MCP", "MCP Streamable HTTP JSON-RPC endpoint", true),
 
 			// The document is served as the API contract, so it has to cover
 			// every route the server registers. A test walks the router and

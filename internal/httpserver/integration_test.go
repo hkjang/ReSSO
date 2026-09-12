@@ -5170,7 +5170,10 @@ func TestIntegrationEveryMutatingAPIRouteRequiresACSRFToken(t *testing.T) {
 		if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
 			return nil
 		}
-		if !strings.HasPrefix(route, "/api/") || route == "/api/v1/auth/login" {
+		// The policy report sink is a report the browser sends without any
+		// credential, so it can carry no token; it records nothing but a
+		// bounded in-memory list of blocked origins.
+		if !strings.HasPrefix(route, "/api/") || route == "/api/v1/auth/login" || route == cspReportPath {
 			return nil
 		}
 		path := placeholder.ReplaceAllString(route, "00000000-0000-0000-0000-000000000001")
@@ -8466,7 +8469,9 @@ func TestIntegrationAnAPIKeyCannotChangeAnything(t *testing.T) {
 	type route struct{ method, template string }
 	var writes, reads []route
 	if err := chi.Walk(router, func(method, template string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
-		if !strings.HasPrefix(template, "/api/") || strings.Contains(template, "openapi") {
+		// The policy report sink is credential-less by design and changes no
+		// state a key could reach; see the CSRF walk above.
+		if !strings.HasPrefix(template, "/api/") || strings.Contains(template, "openapi") || template == cspReportPath {
 			return nil
 		}
 		switch method {

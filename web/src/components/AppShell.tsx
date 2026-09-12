@@ -8,6 +8,7 @@ import BadgeRoundedIcon from '@mui/icons-material/BadgeRounded'
 import DashboardRoundedIcon from '@mui/icons-material/DashboardRounded'
 import DnsRoundedIcon from '@mui/icons-material/DnsRounded'
 import GroupsRoundedIcon from '@mui/icons-material/GroupsRounded'
+import InsightsRoundedIcon from '@mui/icons-material/InsightsRounded'
 import KeyRoundedIcon from '@mui/icons-material/KeyRounded'
 import KeyboardCommandKeyRoundedIcon from '@mui/icons-material/KeyboardCommandKeyRounded'
 import LanRoundedIcon from '@mui/icons-material/LanRounded'
@@ -44,6 +45,7 @@ const adminItems: NavItem[] = [
   { label: '감사 이벤트', path: '/admin/audit', icon: PolicyRoundedIcon, keywords: '보안 audit' },
   { label: '서버 로그', path: '/admin/logs', icon: ArticleRoundedIcon, keywords: '운영 오류 trace' },
   { label: 'API · MCP', path: '/admin/integrations', icon: SettingsRoundedIcon, keywords: 'OpenAPI 도구 연동' },
+  { label: '방문 추적', path: '/admin/tracking', icon: InsightsRoundedIcon, keywords: 'analytics momento CSP 스니펫' },
 ]
 
 const personalItems: NavItem[] = [
@@ -93,7 +95,7 @@ export function AppShell() {
   const canRequestRoles = Boolean(capability.data?.enabled)
   const navItems = useMemo(() => {
     if (isAdmin) return adminItems.filter((item) => {
-      if (item.path === '/admin/logs' && !isPlatformAdmin) return false
+      if ((item.path === '/admin/logs' || item.path === '/admin/tracking') && !isPlatformAdmin) return false
       return item.path !== '/admin/approvals' || approvalEnabled
     })
     return personalItems.filter((item) => item.path !== '/personal/requests' || canRequestRoles)

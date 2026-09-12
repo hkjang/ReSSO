@@ -223,3 +223,37 @@ export interface Me {
   permissions: { platform_admin: boolean; realm_admin: boolean; admin: boolean }
   password_policy?: PasswordPolicy
 }
+
+export type TrackingProvider = 'none' | 'momento' | 'ga4' | 'gtm' | 'matomo' | 'custom'
+
+export interface TrackingConfig {
+  enabled: boolean
+  provider: TrackingProvider
+  momento_url: string
+  momento_site_id: string
+  momento_proxy: boolean
+  measurement_id: string
+  matomo_url: string
+  matomo_site_id: string
+  custom_snippet: string
+  allowed_hosts: string
+  include_admin: boolean
+  placement: 'head' | 'body'
+}
+
+export interface TrackingView {
+  config: TrackingConfig
+  /** The Content-Security-Policy the document will carry, nonce elided. */
+  policy: string
+  proxy_path: string
+}
+
+export interface TrackingViolation {
+  origin: string
+  directive: string
+  page: string
+  count: number
+  first_seen: string
+  last_seen: string
+  allowed: boolean
+}
