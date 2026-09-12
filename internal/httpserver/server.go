@@ -17,6 +17,7 @@ import (
 	"github.com/hkjang/ReSSO/internal/oidc"
 	"github.com/hkjang/ReSSO/internal/ratelimit"
 	"github.com/hkjang/ReSSO/internal/store"
+	"github.com/hkjang/ReSSO/internal/tracking"
 	"github.com/hkjang/ReSSO/webui"
 )
 
@@ -49,6 +50,9 @@ type Server struct {
 	clientAuthLimiter  *ratelimit.FailureLimiter
 	addressAuthLimiter *ratelimit.FailureLimiter
 	metrics            *observability.Registry
+	// tracking is the visitor tracking snippet: its configuration, read
+	// through a short cache, and the policy reports browsers sent about it.
+	tracking *trackingState
 }
 
 // New builds the HTTP surface. Pass the registry the rest of the process
@@ -62,7 +66,8 @@ func New(data *store.Store, logger *slog.Logger, trustedProxyCIDRs []*net.IPNet,
 		trustedProxyCIDRs:  trustedProxyCIDRs,
 		clientAuthLimiter:  ratelimit.NewFailureLimiter(clientAuthMaxFailures, clientAuthWindow, clientAuthTrackedKeys),
 		addressAuthLimiter: ratelimit.NewFailureLimiter(addressAuthMaxFailures, clientAuthWindow, clientAuthTrackedKeys),
-		metrics:            metrics}
+		metrics:            metrics,
+		tracking:           newTrackingState()}
 }
 
 // Metrics exposes the registry so that background workers outside the HTTP
@@ -86,6 +91,13 @@ func (s *Server) Handler() http.Handler {
 		r.With(s.requireSession).Post("/logout", s.browserLogout)
 		r.With(s.requireSession).Post("/reauthenticate", s.reauthenticate)
 	})
+	// Where browsers report what the policy refused while a tracking snippet
+	// is on. Unauthenticated by nature — the report carries no credentials.
+	router.Post(cspReportPath, s.receiveCSPReport)
+	// The same-origin path to the Momento collector, answered only while the
+	// Momento provider is on and proxied. Registered here so it is claimed
+	// before the console's catch-all.
+	router.HandleFunc(tracking.MomentoProxyPath+"/*", s.momentoProxy)
 
 	router.Route("/realms/{realm}", func(r chi.Router) {
 		r.Use(s.oidcCORS)
@@ -170,6 +182,11 @@ func (s *Server) spaHandler() http.Handler {
 		panic(err)
 	}
 	files := http.FileServer(http.FS(dist))
+	// The document is read once: it is embedded, so it cannot change under
+	// the process, and it is rewritten per request when a tracking snippet is
+	// on. A binary built without the console has no document, and then the
+	// file server answers as it always did.
+	document, documentErr := fs.ReadFile(dist, "index.html")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/")
 		// A dot is what separates a file from a console route: every route the
@@ -194,6 +211,10 @@ func (s *Server) spaHandler() http.Handler {
 		// built without the console.
 		if namesAFile {
 			http.NotFound(w, r)
+			return
+		}
+		if documentErr == nil {
+			s.serveConsoleDocument(w, r, document)
 			return
 		}
 		w.Header().Set("Cache-Control", "no-cache")

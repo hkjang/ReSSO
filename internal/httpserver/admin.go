@@ -86,6 +86,16 @@ func (s *Server) adminRoutes(r chi.Router) {
 	r.Get("/audit", s.adminListAudit)
 	r.Get("/audit/event-types", s.adminListAuditEventTypes)
 	r.With(s.requirePlatformAdmin).Get("/system-logs", s.adminListSystemLogs)
+	// The tracking snippet is one setting for the installation, not a Realm's,
+	// so it is the service administrator's alone.
+	r.Route("/tracking", func(r chi.Router) {
+		r.Use(s.requirePlatformAdmin)
+		r.Get("/", s.adminGetTracking)
+		r.Put("/", s.adminUpdateTracking)
+		r.Get("/violations", s.adminListTrackingViolations)
+		r.Delete("/violations", s.adminClearTrackingViolations)
+		r.Post("/allowed-hosts", s.adminAllowTrackingHost)
+	})
 }
 
 func parseUUIDParam(w http.ResponseWriter, r *http.Request, name string) (uuid.UUID, bool) {

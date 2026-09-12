@@ -21,6 +21,9 @@ linters:
     - usetesting
 
   settings:
+    misspell:
+      # Momento is the in-house visitor analytics collector, not a memento.
+      ignore-rules: [momento]
     errcheck:
       # Deliberate best-effort writes are marked with `_ =` at the call site.
       check-type-assertions: true
