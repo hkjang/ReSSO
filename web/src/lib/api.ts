@@ -1,3 +1,4 @@
+import { confirmIdentity, reauthenticationRequired } from './reauthentication'
 import { reportUnauthenticated } from './session'
 
 export class APIError extends Error {
@@ -35,6 +36,24 @@ function cookie(name: string): string {
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  try {
+    return await send<T>(path, init)
+  } catch (error) {
+    // A protected action refused for want of a recent password is not a
+    // failure to report — it is a question to ask. Asked once, and the request
+    // the caller made is repeated as it stood, so the page above never learns
+    // there was an interruption.
+    if (!(error instanceof APIError) || error.code !== reauthenticationRequired) throw error
+    // Only a body that can be read twice. Everything here sends a string, but
+    // a stream would arrive at the retry already consumed and the request
+    // would go out empty — which is worse than the refusal.
+    if (init.body !== undefined && typeof init.body !== 'string') throw error
+    if (!(await confirmIdentity())) throw error
+    return send<T>(path, init)
+  }
+}
+
+async function send<T>(path: string, init: RequestInit = {}): Promise<T> {
   const method = (init.method ?? 'GET').toUpperCase()
   const headers = new Headers(init.headers)
   headers.set('Accept', 'application/json')

@@ -59,6 +59,10 @@ type AuthenticatedSession struct {
 	User       domain.User
 	CSRFHash   []byte
 	RealmAdmin bool
+	// AuthenticatedAt is when this session last proved who the user is: when
+	// it began, or when it was re-proved since. Carried on every request so
+	// that a protected action can judge it without a second query.
+	AuthenticatedAt time.Time
 }
 
 // touchSession records that a session was used.
@@ -82,7 +86,7 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 	}
 	var result AuthenticatedSession
 	err := s.Pool.QueryRow(ctx, `SELECT s.id,s.realm_id,s.user_id,u.username,s.ip_address,s.user_agent,s.auth_method,
-        s.created_at,s.last_access,s.expires_at,s.revoked_at,s.csrf_hash,
+        s.created_at,s.last_access,s.expires_at,s.revoked_at,s.csrf_hash,s.authenticated_at,
 		u.id,u.realm_id,u.username,u.email,u.email_verified,u.display_name,u.enabled,u.platform_admin,u.manager_id,
 		u.federation_id,u.external_id,u.external_dn,u.federation_synced_at,
 		u.failed_attempts,u.locked_until,u.password_changed_at,
@@ -94,6 +98,7 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 		&result.Session.ID, &result.Session.RealmID, &result.Session.UserID, &result.Session.Username,
 		&result.Session.IPAddress, &result.Session.UserAgent, &result.Session.AuthMethod, &result.Session.CreatedAt,
 		&result.Session.LastAccess, &result.Session.ExpiresAt, &result.Session.RevokedAt, &result.CSRFHash,
+		&result.AuthenticatedAt,
 		&result.User.ID, &result.User.RealmID, &result.User.Username, &result.User.Email, &result.User.EmailVerified, &result.User.DisplayName,
 		&result.User.Enabled, &result.User.PlatformAdmin, &result.User.ManagerID, &result.User.FederationID,
 		&result.User.ExternalID, &result.User.ExternalDN, &result.User.FederationSyncedAt,
@@ -121,7 +126,7 @@ func (s *Store) SessionByToken(ctx context.Context, rawToken string) (Authentica
 // same database wrote.
 func (s *Store) SessionAuthenticatedRecently(ctx context.Context, id uuid.UUID, withinSeconds int) (bool, error) {
 	var recent bool
-	err := s.Pool.QueryRow(ctx, `SELECT s.created_at > now()-make_interval(secs => $2)
+	err := s.Pool.QueryRow(ctx, `SELECT s.authenticated_at > now()-make_interval(secs => $2)
 		FROM sso_sessions s JOIN realms r ON r.id=s.realm_id
 		WHERE s.id=$1 AND `+sessionIsLive, id, withinSeconds).Scan(&recent)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -130,9 +135,28 @@ func (s *Store) SessionAuthenticatedRecently(ctx context.Context, id uuid.UUID, 
 	return recent, err
 }
 
+// MarkSessionAuthenticated records that this session has just re-proved who
+// the user is.
+//
+// Scoped to a live session so that confirming a password cannot revive one
+// that has expired, been revoked, or gone idle past its Realm's limit: the
+// caller is refused the action either way, and a row updated here would be one
+// whose timestamps no longer describe anything that can be used.
+func (s *Store) MarkSessionAuthenticated(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.Pool.Exec(ctx, `UPDATE sso_sessions s SET authenticated_at=now()
+		FROM realms r WHERE r.id=s.realm_id AND s.id=$1 AND `+sessionIsLive, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) SessionAuthTime(ctx context.Context, id uuid.UUID) (time.Time, error) {
 	var authTime time.Time
-	err := s.Pool.QueryRow(ctx, `SELECT s.created_at FROM sso_sessions s
+	err := s.Pool.QueryRow(ctx, `SELECT s.authenticated_at FROM sso_sessions s
 		JOIN realms r ON r.id=s.realm_id
 		WHERE s.id=$1 AND `+sessionIsLive, id).Scan(&authTime)
 	if errors.Is(err, pgx.ErrNoRows) {

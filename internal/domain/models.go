@@ -199,4 +199,9 @@ type Principal struct {
 	RealmAdmin    bool
 	SessionID     *uuid.UUID
 	Scopes        []string
+	// AuthenticatedAt is when the browser session behind this request last
+	// proved who the user is. Zero for an API key, which proves possession of
+	// a secret and never proves a person, and so can never satisfy a protected
+	// action however recently it was minted.
+	AuthenticatedAt time.Time
 }

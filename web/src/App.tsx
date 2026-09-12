@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { useAuth } from './lib/auth-context'
 import { PageLoading } from './components/Feedback'
 import { AppShell } from './components/AppShell'
+import { ReauthenticationGate } from './components/ReauthenticationGate'
 import { LoginPage } from './pages/LoginPage'
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage').then((module) => ({ default: module.DashboardPage })))
@@ -30,7 +31,9 @@ function ProtectedLayout() {
   // An expired session is announced on the login page so the user knows why
   // they were sent back rather than assuming the console broke.
   if (!authenticated) return <Navigate to={sessionExpired ? '/login?expired=1' : '/login'} replace />
-  return <AppShell />
+  // Inside the signed-in shell, because the question it asks only makes sense
+  // to someone who already has a session.
+  return <ReauthenticationGate><AppShell /></ReauthenticationGate>
 }
 
 function AdminOnly({ children }: { children: ReactNode }) {

@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/hkjang/ReSSO/internal/version"
 )
@@ -19,7 +20,7 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 	changePassword := withPartialSessionRevocation(openAPIJSONOperation("Personal",
 		"내 비밀번호 변경", true, "ChangePasswordInput", "", "204",
 		"Password changed and the other sessions ended"))
-	writeJSON(w, http.StatusOK, map[string]any{
+	document := map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
 			"title":       "ReSSO Administration and Personal API",
@@ -118,6 +119,7 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 			// fails when one is missing, which is how these were found absent.
 			"/api/openapi.json":               openAPIPath("get", "Metadata", "이 OpenAPI 문서", false),
 			"/api/v1/auth/login":              openAPIPath("post", "Personal", "브라우저 로그인", false),
+			"/api/v1/auth/reauthenticate":     openAPIPath("post", "Personal", "보호된 작업 전 비밀번호 재확인", true),
 			"/api/v1/auth/logout":             withPartialTokenRevocation("post", openAPIPath("post", "Personal", "브라우저 로그아웃", true)),
 			"/api/v1/auth/challenge/{token}":  openAPIParameterizedPath("get", "Personal", "로그인 요청 컨텍스트 조회", false, "token"),
 			"/api/v1/me/sessions/{id}":        withPartialTokenRevocation("delete", openAPIParameterizedPath("delete", "Personal", "내 세션 종료", true, "id")),
@@ -155,7 +157,35 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 			},
 			"schemas": openAPISchemas(),
 		},
-	})
+	}
+	// Applied from the same list the router guards with, rather than written
+	// out beside each operation. Two hand-kept lists of the same nine routes
+	// would disagree the first time one grew, and the one that disagrees
+	// silently is the document.
+	markProtectedActions(document)
+	writeJSON(w, http.StatusOK, document)
+}
+
+// markProtectedActions declares, on every operation the router protects, the
+// refusal it can answer with and what to do about it.
+func markProtectedActions(document map[string]any) {
+	paths, _ := document["paths"].(map[string]any)
+	for _, action := range protectedActions {
+		method, path, found := strings.Cut(action, " ")
+		if !found {
+			continue
+		}
+		// chi spells the route at the root of a sub-router with a trailing
+		// slash; the document names the same resource without one.
+		if trimmed := strings.TrimSuffix(path, "/"); trimmed != "" {
+			path = trimmed
+		}
+		item, _ := paths[path].(map[string]any)
+		if item == nil {
+			continue
+		}
+		withReauthentication(strings.ToLower(method), item)
+	}
 }
 
 func openAPIPathParameter(name string) map[string]any {
@@ -401,6 +431,26 @@ func withPartialTokenRevocation(method string, item map[string]any) map[string]a
 		"description": "Session ended, but the refresh tokens issued from it could not be revoked",
 		"content": map[string]any{"application/json": map[string]any{
 			"schema": map[string]any{"$ref": "#/components/schemas/PartialTokenRevocation"},
+		}},
+	}
+	return item
+}
+
+// withReauthentication declares that an operation is a protected action: a
+// valid session is necessary and not sufficient, and the caller must have
+// confirmed their password within the last few minutes.
+//
+// Described rather than left to be discovered, because a client that does not
+// know this code exists reads the 403 as "you are not allowed" and gives up,
+// when the answer is one prompt away. A contract test requires every route in
+// protectedActions to carry it, so the document cannot fall behind the router.
+func withReauthentication(method string, item map[string]any) map[string]any {
+	operation, _ := item[method].(map[string]any)
+	responses, _ := operation["responses"].(map[string]any)
+	responses["403"] = map[string]any{
+		"description": "Protected action: confirm the password at /api/v1/auth/reauthenticate and repeat the request (error code reauthentication_required)",
+		"content": map[string]any{"application/json": map[string]any{
+			"schema": map[string]any{"$ref": "#/components/schemas/Error"},
 		}},
 	}
 	return item

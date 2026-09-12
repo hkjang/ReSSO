@@ -123,7 +123,8 @@ func (s *Server) sessionContext(w http.ResponseWriter, r *http.Request,
 	sid := authenticated.Session.ID
 	principal := domain.Principal{UserID: authenticated.User.ID, RealmID: authenticated.User.RealmID,
 		Username: authenticated.User.Username, PlatformAdmin: authenticated.User.PlatformAdmin,
-		RealmAdmin: authenticated.RealmAdmin, SessionID: &sid}
+		RealmAdmin: authenticated.RealmAdmin, SessionID: &sid,
+		AuthenticatedAt: authenticated.AuthenticatedAt}
 	ctx := context.WithValue(r.Context(), sessionKey, authenticated)
 	ctx = context.WithValue(ctx, principalKey, principal)
 	return r.WithContext(ctx), true
@@ -179,6 +180,46 @@ func (s *Server) requireAdmin(next http.Handler) http.Handler {
 		}
 		if principal.SessionID == nil && !slices.Contains(principal.Scopes, "admin:read") {
 			writeError(w, r, http.StatusForbidden, "insufficient_permission", "admin:read 범위가 필요합니다.")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// protectedActionWindow is how long confirming a password holds good for.
+//
+// Short enough that a stolen session found unattended has usually missed it,
+// long enough to complete a piece of work without re-typing a password between
+// every step of it. One value rather than a per-Realm setting: it governs what
+// an administrator may do to the Realms, so a Realm cannot be the thing that
+// sets it.
+const protectedActionWindow = 5 * time.Minute
+
+// requireRecentAuthentication guards the actions that hand out access rather
+// than merely use it.
+//
+// A console session is a bearer credential: whoever holds the cookie is the
+// administrator until it expires. That is an acceptable trade for reading a
+// dashboard and a poor one for resetting somebody's password, granting a role,
+// rotating a client secret or minting an API key — each of which turns a
+// borrowed session into access that outlives it. Asking for the password again
+// costs the legitimate administrator five seconds once every five minutes, and
+// costs an attacker holding only a cookie everything.
+//
+// An API key can never satisfy this. It proves possession of a secret, which
+// is the thing in question, not who is holding it — and state-changing
+// requests already require a browser session, so this refusal is a second
+// line rather than the first.
+func (s *Server) requireRecentAuthentication(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		principal, ok := principalFrom(r.Context())
+		if !ok || principal.SessionID == nil || principal.AuthenticatedAt.IsZero() ||
+			time.Since(principal.AuthenticatedAt) > protectedActionWindow {
+			// The console turns this exact code into the password prompt and
+			// then repeats the request, so the code is the contract and the
+			// message is for everyone reaching the API another way.
+			writeError(w, r, http.StatusForbidden, "reauthentication_required",
+				"보호된 작업입니다. 비밀번호를 다시 확인한 뒤 진행하세요.")
 			return
 		}
 		next.ServeHTTP(w, r)

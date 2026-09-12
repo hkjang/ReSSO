@@ -84,6 +84,7 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/challenge/{token}", s.authChallenge)
 		r.Post("/login", s.login)
 		r.With(s.requireSession).Post("/logout", s.browserLogout)
+		r.With(s.requireSession).Post("/reauthenticate", s.reauthenticate)
 	})
 
 	router.Route("/realms/{realm}", func(r chi.Router) {
@@ -112,8 +113,8 @@ func (s *Server) Handler() http.Handler {
 			r.Get("/me/sessions", s.mySessions)
 			r.Delete("/me/sessions/{id}", s.revokeMySession)
 			r.Get("/me/api-keys", s.listMyAPIKeys)
-			r.Post("/me/api-keys", s.createMyAPIKey)
-			r.Post("/me/api-keys/{id}/rotate", s.rotateMyAPIKey)
+			r.With(s.requireRecentAuthentication).Post("/me/api-keys", s.createMyAPIKey)
+			r.With(s.requireRecentAuthentication).Post("/me/api-keys/{id}/rotate", s.rotateMyAPIKey)
 			r.Delete("/me/api-keys/{id}", s.revokeMyAPIKey)
 			r.Get("/me/approval-capability", s.myApprovalCapability)
 			r.Get("/me/requestable-roles", s.myRequestableRoles)

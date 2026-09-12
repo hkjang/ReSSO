@@ -321,3 +321,106 @@ func userAuditDetail(before, after domain.User) map[string]any {
 }
 
 func contextCanceled(r *http.Request) error { return r.Context().Err() }
+
+type reauthenticateRequest struct {
+	Password string `json:"password"`
+}
+
+// reauthenticate re-proves who is at the keyboard, without starting a new
+// session.
+//
+// The alternative designs are both worse. Signing out and back in loses
+// whatever the administrator was in the middle of and replaces a session that
+// relying parties may be holding tokens against. Asking for the password
+// inside each protected handler puts the same check in a dozen places and
+// leaves the thirteenth out.
+//
+// It deliberately does not extend, renew or otherwise change the session
+// beyond the one timestamp. What it grants is a window, not a longer life.
+func (s *Server) reauthenticate(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFrom(r.Context())
+	if !ok || principal.SessionID == nil {
+		writeError(w, r, http.StatusUnauthorized, "authentication_required", "로그인이 필요합니다.")
+		return
+	}
+	var input reauthenticateRequest
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	ip := s.clientIP(r)
+	// The same buckets the login form uses, because this is the login form's
+	// credential. Guessing a password here would otherwise be cheaper than
+	// guessing it at the front door, which is the wrong way round: the caller
+	// here already holds a session.
+	ipDecision, rateErr := s.store.ConsumeLoginRateLimit(r.Context(), "login/ip/"+ip, 100, 5*time.Minute)
+	if rateErr != nil {
+		s.logger.Error("reauthentication IP rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", rateErr)
+		writeError(w, r, http.StatusInternalServerError, "internal_error", "요청을 처리하지 못했습니다.")
+		return
+	}
+	if !ipDecision.Allowed {
+		writeLoginRateLimited(w, r, ipDecision.RetryAfterSeconds)
+		return
+	}
+	realm, err := s.store.RealmByID(r.Context(), principal.RealmID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	accountBucket := "login/account/" + realm.ID.String() + "/" + strings.ToLower(principal.Username)
+	accountDecision, accountErr := s.store.CheckLoginRateLimit(r.Context(), accountBucket, 30, 5*time.Minute)
+	if accountErr != nil {
+		s.logger.Error("reauthentication account rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", accountErr)
+		writeError(w, r, http.StatusInternalServerError, "internal_error", "요청을 처리하지 못했습니다.")
+		return
+	}
+	if !accountDecision.Allowed {
+		writeLoginRateLimited(w, r, accountDecision.RetryAfterSeconds)
+		return
+	}
+	// The same credential check the login form performs, so an account whose
+	// password lives in a directory re-proves itself there too rather than
+	// being told its password is wrong.
+	result, err := s.store.Authenticate(r.Context(), realm, principal.Username, input.Password)
+	if err != nil {
+		s.logger.Error("reauthentication failed", "trace_id", traceIDFrom(r.Context()), "error", err)
+		writeError(w, r, http.StatusInternalServerError, "internal_error", "요청을 처리하지 못했습니다.")
+		return
+	}
+	if !result.Success {
+		failureDecision, rateErr := s.store.RecordLoginFailure(r.Context(), accountBucket, 30, 5*time.Minute)
+		if rateErr != nil {
+			s.logger.Error("recording a reauthentication failure failed", "trace_id", traceIDFrom(r.Context()), "error", rateErr)
+		}
+		// Written to the trail under its own event type. A run of these is a
+		// stolen console session being worked, which looks like nothing at all
+		// among ordinary login failures from the sign-in page.
+		s.audit(r, &realm.ID, &principal.UserID, principal.Username, "REAUTHENTICATION", "FAILURE",
+			"session", principal.SessionID.String(), map[string]any{"reason": result.FailureReason})
+		if rateErr == nil && !failureDecision.Allowed {
+			writeLoginRateLimited(w, r, failureDecision.RetryAfterSeconds)
+			return
+		}
+		writeError(w, r, http.StatusUnauthorized, "invalid_credentials", "비밀번호가 올바르지 않습니다.")
+		return
+	}
+	if err := s.store.ResetLoginRateLimit(r.Context(), accountBucket); err != nil {
+		s.logger.Error("resetting the reauthentication rate limit failed", "trace_id", traceIDFrom(r.Context()), "error", err)
+	}
+	// The password was right, and until this write lands nothing has changed:
+	// reporting success without it would send the console back into a
+	// protected action that is about to be refused again, with no explanation
+	// either end can offer.
+	if err := s.store.MarkSessionAuthenticated(r.Context(), *principal.SessionID); err != nil {
+		s.logger.Error("recording a reauthentication failed", "trace_id", traceIDFrom(r.Context()),
+			"session_id", principal.SessionID, "error", err)
+		writeStoreError(w, r, err)
+		return
+	}
+	s.audit(r, &realm.ID, &principal.UserID, principal.Username, "REAUTHENTICATION", "SUCCESS",
+		"session", principal.SessionID.String(), nil)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"reauthenticated":   true,
+		"valid_for_seconds": int(protectedActionWindow.Seconds()),
+	})
+}

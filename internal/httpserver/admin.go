@@ -14,37 +14,61 @@ import (
 	"github.com/hkjang/ReSSO/internal/store"
 )
 
+// protectedActions are the routes a borrowed console session must not be
+// enough for. Each one either hands out access (a password, a role, a client
+// secret, a signing key) or changes the rules that decide who has it, and each
+// leaves behind something that outlives the session that did it. Reading is
+// never protected: the cost of asking is paid on the actions that matter, or
+// it is paid on everything and the prompt stops being read.
+//
+// Kept as a list next to the routes rather than derived from them, because
+// what makes an action protected is what it grants, which nothing in the
+// method or the path can say. The test that pins it walks the router and
+// requires every route here to refuse without a recent password — and requires
+// the rest to be reachable without one, so the guard cannot quietly spread.
+var protectedActions = []string{
+	"POST /api/admin/v1/realms",
+	"PUT /api/admin/v1/realms/{realmID}/",
+	"PUT /api/admin/v1/realms/{realmID}/users/{userID}/password",
+	"PUT /api/admin/v1/realms/{realmID}/users/{userID}/role-mappings",
+	"DELETE /api/admin/v1/realms/{realmID}/user-federations/{federationID}",
+	"POST /api/admin/v1/realms/{realmID}/clients/{clientID}/rotate-secret",
+	"POST /api/admin/v1/realms/{realmID}/keys/rotate",
+	"POST /api/v1/me/api-keys",
+	"POST /api/v1/me/api-keys/{id}/rotate",
+}
+
 func (s *Server) adminRoutes(r chi.Router) {
 	r.Get("/dashboard", s.adminDashboard)
 	r.Get("/quick-search", s.adminQuickSearch)
 	r.Get("/realms", s.adminListRealms)
-	r.With(s.requirePlatformAdmin).Post("/realms", s.adminCreateRealm)
+	r.With(s.requirePlatformAdmin, s.requireRecentAuthentication).Post("/realms", s.adminCreateRealm)
 	r.Route("/realms/{realmID}", func(r chi.Router) {
 		r.Use(s.requireRealmAccess)
 		r.Get("/", s.adminGetRealm)
-		r.Put("/", s.adminUpdateRealm)
+		r.With(s.requireRecentAuthentication).Put("/", s.adminUpdateRealm)
 		r.Get("/users", s.adminListUsers)
 		r.Post("/users", s.adminCreateUser)
 		r.Put("/users/{userID}", s.adminUpdateUser)
-		r.Put("/users/{userID}/password", s.adminResetPassword)
+		r.With(s.requireRecentAuthentication).Put("/users/{userID}/password", s.adminResetPassword)
 		r.Post("/users/{userID}/unlock", s.adminUnlockUser)
 		// The dashboard counts the keys in this Realm that expire within the
 		// week; this is where an administrator can see which they are.
 		r.Get("/api-keys", s.adminListRealmAPIKeys)
 		r.Get("/users/{userID}/role-mappings", s.adminGetUserRoleMappings)
-		r.Put("/users/{userID}/role-mappings", s.adminReplaceUserRoleMappings)
+		r.With(s.requireRecentAuthentication).Put("/users/{userID}/role-mappings", s.adminReplaceUserRoleMappings)
 		r.Get("/user-federations", s.adminListLDAPFederations)
 		r.Post("/user-federations", s.adminCreateLDAPFederation)
 		r.Get("/user-federations/{federationID}", s.adminGetLDAPFederation)
 		r.Put("/user-federations/{federationID}", s.adminUpdateLDAPFederation)
-		r.Delete("/user-federations/{federationID}", s.adminDeleteLDAPFederation)
+		r.With(s.requireRecentAuthentication).Delete("/user-federations/{federationID}", s.adminDeleteLDAPFederation)
 		r.Post("/user-federations/{federationID}/test-connection", s.adminTestLDAPConnection)
 		r.Post("/user-federations/{federationID}/test-authentication", s.adminTestLDAPAuthentication)
 		r.Post("/user-federations/{federationID}/sync", s.adminSyncLDAPFederation)
 		r.Get("/clients", s.adminListClients)
 		r.Post("/clients", s.adminCreateClient)
 		r.Put("/clients/{clientID}", s.adminUpdateClient)
-		r.Post("/clients/{clientID}/rotate-secret", s.adminRotateClientSecret)
+		r.With(s.requireRecentAuthentication).Post("/clients/{clientID}/rotate-secret", s.adminRotateClientSecret)
 		r.Get("/clients/{clientID}/roles", s.adminListClientRoles)
 		r.Post("/clients/{clientID}/roles", s.adminCreateClientRole)
 		r.Delete("/clients/{clientID}/roles/{roleID}", s.adminDeleteClientRole)
@@ -55,7 +79,7 @@ func (s *Server) adminRoutes(r chi.Router) {
 		r.Get("/sessions", s.adminListRealmSessions)
 		r.Delete("/sessions/{sessionID}", s.adminRevokeSession)
 		r.Get("/keys", s.adminListKeys)
-		r.Post("/keys/rotate", s.adminRotateKey)
+		r.With(s.requireRecentAuthentication).Post("/keys/rotate", s.adminRotateKey)
 	})
 	r.Get("/approvals", s.adminListApprovals)
 	r.Post("/approvals/{requestID}/decision", s.adminDecideApproval)

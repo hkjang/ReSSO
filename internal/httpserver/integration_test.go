@@ -1351,9 +1351,12 @@ func TestIntegrationMaxAgeForcesReauthentication(t *testing.T) {
 		t.Fatalf("a fresh session did not satisfy max_age=3600: %s", got)
 	}
 
-	// Age the authentication past what the relying party will accept.
+	// Age the authentication past what the relying party will accept. It is
+	// authenticated_at that is moved, not created_at: a session can re-prove
+	// who the user is without being replaced, so when it began and when it
+	// last proved itself are no longer the same fact.
 	if _, err := data.Pool.Exec(ctx,
-		`UPDATE sso_sessions SET created_at=now()-interval '20 minutes' WHERE id=$1`, session.Session.ID); err != nil {
+		`UPDATE sso_sessions SET authenticated_at=now()-interval '20 minutes' WHERE id=$1`, session.Session.ID); err != nil {
 		t.Fatal(err)
 	}
 	stale := authorize("&max_age=300")
@@ -3545,14 +3548,15 @@ func TestIntegrationAnIntrospectionItCannotJudgeIsDistinguishable(t *testing.T) 
 		t.Errorf("a healthy introspection was counted as unjudged:\n%s", healthy.String())
 	}
 
-	// Only the session lookup breaks; the rest of the service is fine.
+	// Only the session lookup breaks; the rest of the service is fine. The
+	// column moved is the one that lookup reads.
 	if _, err := data.Pool.Exec(ctx,
-		"ALTER TABLE sso_sessions RENAME COLUMN created_at TO created_at_moved"); err != nil {
+		"ALTER TABLE sso_sessions RENAME COLUMN authenticated_at TO authenticated_at_moved"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		_, _ = data.Pool.Exec(context.Background(),
-			"ALTER TABLE sso_sessions RENAME COLUMN created_at_moved TO created_at")
+			"ALTER TABLE sso_sessions RENAME COLUMN authenticated_at_moved TO authenticated_at")
 	})
 
 	// The answer deliberately does not change: refusing is the safe direction.
@@ -9776,5 +9780,233 @@ func TestIntegrationAuthorizationCountsTheRequestsItCouldNotServe(t *testing.T) 
 	if status, location := authorize("master", created.Client.ClientID, session.Token, ""); status != http.StatusFound ||
 		!strings.Contains(location, "code=") {
 		t.Errorf("authorization answered %d to %q once every table was readable again", status, location)
+	}
+}
+
+// A console session is a bearer credential: whoever holds the cookie is the
+// administrator until it expires. That is an acceptable trade for reading a
+// dashboard and a poor one for handing out access — resetting a password,
+// granting a role, rotating a client secret or a signing key, minting an API
+// key — each of which leaves behind something that outlives the session that
+// did it. The list of those actions is written by hand because what makes an
+// action protected is what it grants, which nothing in the method or the path
+// can say; this walks the router and holds the list to it from both sides.
+func TestIntegrationAProtectedActionNeedsThePasswordAgain(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	router, _ := handler.(*chi.Mux)
+	type route struct{ method, template string }
+	var writes []route
+	if err := chi.Walk(router, func(method, template string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		if strings.HasPrefix(template, "/api/") && !isSafeMethod(method) {
+			writes = append(writes, route{method, template})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) < 20 {
+		t.Fatalf("the walk found %d state-changing routes, so it is not covering the API", len(writes))
+	}
+
+	// Each request gets its own session, because the walk includes signing out
+	// and ending a session: one reused across them dies partway and everything
+	// after it reads 401. Staleness is written directly rather than waited for,
+	// since the window is five minutes.
+	ask := func(r route, stale bool) (int, string) {
+		fresh, sessionErr := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+			time.Hour, "127.0.0.1", "stepup-probe", "password")
+		if sessionErr != nil {
+			t.Fatal(sessionErr)
+		}
+		if stale {
+			if _, execErr := data.Pool.Exec(ctx,
+				"UPDATE sso_sessions SET authenticated_at=now()-interval '1 hour' WHERE id=$1",
+				fresh.Session.ID); execErr != nil {
+				t.Fatal(execErr)
+			}
+		}
+		// Every identifier is one nothing answers to: the check under test runs
+		// before the handler looks at them, and with real ones the walk would
+		// take apart the very Realm and account it signs in with.
+		path := strings.NewReplacer(
+			"{realmID}", bootstrap.RealmID.String(),
+			"{userID}", "00000000-0000-0000-0000-0000000000ff",
+			"{sessionID}", "00000000-0000-0000-0000-000000000000",
+			"{federationID}", "00000000-0000-0000-0000-000000000000",
+			"{roleID}", "00000000-0000-0000-0000-000000000000",
+			"{clientID}", "00000000-0000-0000-0000-000000000000",
+			"{requestID}", "00000000-0000-0000-0000-000000000000",
+			"{keyID}", "00000000-0000-0000-0000-000000000000",
+			"{id}", "00000000-0000-0000-0000-000000000000",
+		).Replace(r.template)
+		request, reqErr := http.NewRequest(r.method, server.URL+path, strings.NewReader("{}"))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", fresh.CSRFToken)
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: fresh.Token})
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		var body struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		_ = json.NewDecoder(response.Body).Decode(&body)
+		_ = response.Body.Close()
+		code := body.Code
+		if code == "" {
+			code = body.Error
+		}
+		return response.StatusCode, code
+	}
+
+	walked := map[string]bool{}
+	for _, r := range writes {
+		walked[r.method+" "+r.template] = true
+	}
+	// A typo in the list protects nothing and reads exactly like a route that
+	// is deliberately unprotected, so the list is checked against the router
+	// before it is used to judge the router.
+	for _, action := range protectedActions {
+		if !walked[action] {
+			t.Errorf("protectedActions names %q, which no route matches: it guards nothing", action)
+		}
+	}
+	protected := map[string]bool{}
+	for _, action := range protectedActions {
+		protected[action] = true
+	}
+
+	for _, r := range writes {
+		staleStatus, staleCode := ask(r, true)
+		_, freshCode := ask(r, false)
+		if protected[r.method+" "+r.template] {
+			if staleStatus != http.StatusForbidden || staleCode != "reauthentication_required" {
+				t.Errorf("%s %s answered %d/%q to a session that last proved itself an hour ago, want "+
+					"403/reauthentication_required: a stolen cookie is enough to do it",
+					r.method, r.template, staleStatus, staleCode)
+			}
+			// And the refusal has to be the guard rather than something the
+			// request was going to be refused for anyway.
+			if freshCode == "reauthentication_required" {
+				t.Errorf("%s %s answered reauthentication_required to a session that had just proved "+
+					"itself, so confirming the password changes nothing", r.method, r.template)
+			}
+			continue
+		}
+		if staleCode == "reauthentication_required" {
+			t.Errorf("%s %s demands a recent password but is not in protectedActions: the prompt has "+
+				"spread to an ordinary action, and a prompt that appears everywhere stops being read",
+				r.method, r.template)
+		}
+	}
+}
+
+// The window is what makes the guard usable rather than merely strict: an
+// administrator confirms the password once and finishes the piece of work.
+// None of that is true unless confirming it actually moves the timestamp.
+func TestIntegrationConfirmingThePasswordOpensTheWindowAndNothingElse(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := New(data, logger, nil, nil).Handler()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID,
+		time.Hour, "127.0.0.1", "stepup", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		"UPDATE sso_sessions SET authenticated_at=now()-interval '1 hour' WHERE id=$1", session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	call := func(method, path, body string) (int, string) {
+		request, reqErr := http.NewRequest(method, server.URL+path, strings.NewReader(body))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", session.CSRFToken)
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		raw, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		return response.StatusCode, string(raw)
+	}
+
+	keysPath := "/api/admin/v1/realms/" + bootstrap.RealmID.String() + "/keys/rotate"
+	if status, body := call(http.MethodPost, keysPath, "{}"); status != http.StatusForbidden ||
+		!strings.Contains(body, "reauthentication_required") {
+		t.Fatalf("rotating a signing key answered %d %s before the password was confirmed, want a refusal", status, body)
+	}
+	// A wrong password must leave the window shut. Reporting success here and
+	// opening it anyway is the whole guard undone by one branch.
+	if status, _ := call(http.MethodPost, "/api/v1/auth/reauthenticate", `{"password":"not-the-password"}`); status != http.StatusUnauthorized {
+		t.Fatalf("a wrong password answered %d, want 401", status)
+	}
+	if status, body := call(http.MethodPost, keysPath, "{}"); status != http.StatusForbidden ||
+		!strings.Contains(body, "reauthentication_required") {
+		t.Fatalf("rotating a signing key answered %d %s after a wrong password, want the same refusal", status, body)
+	}
+	if status, body := call(http.MethodPost, "/api/v1/auth/reauthenticate", `{"password":"bootstrap-password-123"}`); status != http.StatusOK {
+		t.Fatalf("the right password answered %d %s, want 200", status, body)
+	}
+	if status, body := call(http.MethodPost, keysPath, "{}"); status < 200 || status > 299 {
+		t.Fatalf("rotating a signing key answered %d %s after the password was confirmed, want it to go through", status, body)
+	}
+
+	// What it grants is a window, not a longer life: the session must not have
+	// been renewed, replaced or otherwise changed by confirming a password.
+	var expires time.Time
+	var revoked *time.Time
+	if err := data.Pool.QueryRow(ctx, "SELECT expires_at,revoked_at FROM sso_sessions WHERE id=$1",
+		session.Session.ID).Scan(&expires, &revoked); err != nil {
+		t.Fatal(err)
+	}
+	if revoked != nil {
+		t.Error("confirming the password revoked the session")
+	}
+	if expires.Sub(session.Session.ExpiresAt).Abs() > time.Second {
+		t.Errorf("confirming the password moved the session's expiry from %s to %s, so re-typing a "+
+			"password would extend a session indefinitely", session.Session.ExpiresAt, expires)
+	}
+
+	// And it belongs in the trail under its own name: a run of failures here is
+	// a stolen console session being worked, which looks like nothing at all
+	// among ordinary login failures from the sign-in page.
+	page, err := data.ListAudit(ctx, store.AuditFilter{EventType: "REAUTHENTICATION"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := map[string]int{}
+	for _, row := range page.Items {
+		results[row.Result]++
+	}
+	if results["SUCCESS"] != 1 || results["FAILURE"] != 1 {
+		t.Errorf("the trail holds %v for REAUTHENTICATION, want one SUCCESS and one FAILURE", results)
 	}
 }
