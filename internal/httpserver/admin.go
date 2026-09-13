@@ -96,6 +96,15 @@ func (s *Server) adminRoutes(r chi.Router) {
 		r.Delete("/violations", s.adminClearTrackingViolations)
 		r.Post("/allowed-hosts", s.adminAllowTrackingHost)
 	})
+	// The relay is the installation's too, and its password goes through
+	// here — the service administrator's alone.
+	r.Route("/mail", func(r chi.Router) {
+		r.Use(s.requirePlatformAdmin)
+		r.Get("/", s.adminGetMail)
+		r.Put("/", s.adminUpdateMail)
+		r.Post("/test", s.adminSendTestMail)
+		r.Get("/deliveries", s.adminListMailDeliveries)
+	})
 }
 
 func parseUUIDParam(w http.ResponseWriter, r *http.Request, name string) (uuid.UUID, bool) {
@@ -900,6 +909,7 @@ func (s *Server) adminDecideApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, &request.RealmID, &principal.UserID, principal.Username, "APPROVAL_DECISION", "SUCCESS", "approval", request.ID.String(), map[string]any{"decision": request.Status})
+	s.notifyApprovalDecided(r, request, principal.UserID)
 	writeJSON(w, http.StatusOK, request)
 }
 

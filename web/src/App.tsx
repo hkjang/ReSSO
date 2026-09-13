@@ -19,6 +19,7 @@ const AuditPage = lazy(() => import('./pages/OperationsPages').then((module) => 
 const LogsPage = lazy(() => import('./pages/OperationsPages').then((module) => ({ default: module.LogsPage })))
 const IntegrationsPage = lazy(() => import('./pages/IntegrationsPage').then((module) => ({ default: module.IntegrationsPage })))
 const TrackingPage = lazy(() => import('./pages/TrackingPage').then((module) => ({ default: module.TrackingPage })))
+const MailPage = lazy(() => import('./pages/MailPage').then((module) => ({ default: module.MailPage })))
 const UserFederationPage = lazy(() => import('./pages/UserFederationPage').then((module) => ({ default: module.UserFederationPage })))
 const ProfilePage = lazy(() => import('./pages/PersonalPages').then((module) => ({ default: module.ProfilePage })))
 const PersonalSecurityPage = lazy(() => import('./pages/PersonalPages').then((module) => ({ default: module.PersonalSecurityPage })))
@@ -68,6 +69,7 @@ export default function App() {
         <Route path="/admin/integrations" element={<AdminOnly><IntegrationsPage /></AdminOnly>} />
         <Route path="/admin/user-federation" element={<AdminOnly><UserFederationPage /></AdminOnly>} />
         <Route path="/admin/tracking" element={<AdminOnly><TrackingPage /></AdminOnly>} />
+        <Route path="/admin/mail" element={<AdminOnly><MailPage /></AdminOnly>} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes></Suspense>

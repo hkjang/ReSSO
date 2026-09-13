@@ -257,3 +257,40 @@ export interface TrackingViolation {
   last_seen: string
   allowed: boolean
 }
+
+// Mail notifications. The settings carry every standard key except the
+// password, which is written through its own field and never read back.
+export type MailSettings = Record<string, string | number | boolean>
+
+export interface MailEventSetting {
+  event: string
+  key: string
+  label: string
+  description: string
+}
+
+export interface MailView {
+  settings: MailSettings
+  password_set: boolean
+  events: MailEventSetting[]
+}
+
+export interface MailDelivery {
+  id: string
+  event: string
+  recipient: string
+  subject: string
+  reference?: string
+  actor_id?: string
+  status: 'queued' | 'sent' | 'failed'
+  attempts: number
+  error_message?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface MailDeliveryPage {
+  items: MailDelivery[]
+  total: number
+  by_status: Record<string, number>
+}

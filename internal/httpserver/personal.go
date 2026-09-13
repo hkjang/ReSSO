@@ -415,6 +415,7 @@ func (s *Server) createMyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, &principal.RealmID, &principal.UserID, principal.Username, "APPROVAL_REQUEST_CREATE", "SUCCESS", "approval", request.ID.String(), nil)
+	s.notifyApprovalRequested(r, request)
 	writeJSON(w, http.StatusCreated, request)
 }
 
@@ -453,5 +454,6 @@ func (s *Server) decideMyReview(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, &request.RealmID, &principal.UserID, principal.Username, "TEAM_LEAD_APPROVAL_DECISION", "SUCCESS",
 		"approval", request.ID.String(), map[string]any{"decision": request.Status})
+	s.notifyApprovalDecided(r, request, principal.UserID)
 	writeJSON(w, http.StatusOK, request)
 }

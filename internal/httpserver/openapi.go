@@ -121,8 +121,14 @@ func (s *Server) openAPISpec(w http.ResponseWriter, r *http.Request) {
 				"delete": openAPIOperation("Administration", "차단 기록 비우기", true),
 			},
 			"/api/admin/v1/tracking/allowed-hosts": openAPIPath("post", "Administration", "차단된 출처 하나를 허용 목록에 추가", true),
-			cspReportPath:                          openAPIPath("post", "Metadata", "브라우저의 콘텐츠 보안 정책 위반 신고 수신 (인증 없음, 항상 204)", false),
-			"/mcp":                                 openAPIPath("post", "MCP", "MCP Streamable HTTP JSON-RPC endpoint", true),
+			"/api/admin/v1/mail": map[string]any{
+				"get": openAPIReadOperation("Administration", "메일 알림 설정 조회 (비밀번호는 설정 여부만)"),
+				"put": openAPIOperation("Administration", "메일 알림 설정 변경 (서비스 관리자)", true),
+			},
+			"/api/admin/v1/mail/test":       openAPIPath("post", "Administration", "저장된 설정으로 시험 메일 한 통 발송", true),
+			"/api/admin/v1/mail/deliveries": openAPIReadPath("Administration", "메일 발송 기록 조회 (본문 없음)"),
+			cspReportPath:                   openAPIPath("post", "Metadata", "브라우저의 콘텐츠 보안 정책 위반 신고 수신 (인증 없음, 항상 204)", false),
+			"/mcp":                          openAPIPath("post", "MCP", "MCP Streamable HTTP JSON-RPC endpoint", true),
 
 			// The document is served as the API contract, so it has to cover
 			// every route the server registers. A test walks the router and

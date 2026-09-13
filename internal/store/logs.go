@@ -171,6 +171,13 @@ func (s *Store) PruneOperationalData(ctx context.Context) error {
 			"DELETE FROM sso_sessions WHERE expires_at < now() - interval '30 days'"},
 		{"system logs past retention",
 			"DELETE FROM system_logs WHERE occurred_at < now() - interval '30 days'"},
+		// Long enough to answer "it never arrived" about last quarter's
+		// approval; the record holds subjects and addresses, so it is not
+		// kept for as long as the audit trail. Ahead of the audit trail
+		// because a test stalls the last statement to prove nothing is
+		// reported as skipped after it.
+		{"mail deliveries past retention",
+			"DELETE FROM mail_deliveries WHERE created_at < now() - interval '90 days'"},
 		{"audit events past retention",
 			"DELETE FROM audit_events WHERE occurred_at < now() - interval '365 days'"},
 	}

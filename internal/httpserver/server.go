@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/hkjang/ReSSO/internal/mail"
 	"github.com/hkjang/ReSSO/internal/observability"
 	"github.com/hkjang/ReSSO/internal/oidc"
 	"github.com/hkjang/ReSSO/internal/ratelimit"
@@ -53,6 +54,9 @@ type Server struct {
 	// tracking is the visitor tracking snippet: its configuration, read
 	// through a short cache, and the policy reports browsers sent about it.
 	tracking *trackingState
+	// mail sends the event notifications, in the background, through the
+	// relay the service administrator configured.
+	mail *mail.Service
 }
 
 // New builds the HTTP surface. Pass the registry the rest of the process
@@ -67,7 +71,8 @@ func New(data *store.Store, logger *slog.Logger, trustedProxyCIDRs []*net.IPNet,
 		clientAuthLimiter:  ratelimit.NewFailureLimiter(clientAuthMaxFailures, clientAuthWindow, clientAuthTrackedKeys),
 		addressAuthLimiter: ratelimit.NewFailureLimiter(addressAuthMaxFailures, clientAuthWindow, clientAuthTrackedKeys),
 		metrics:            metrics,
-		tracking:           newTrackingState()}
+		tracking:           newTrackingState(),
+		mail:               mail.NewService(data, logger)}
 }
 
 // Metrics exposes the registry so that background workers outside the HTTP

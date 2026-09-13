@@ -12,10 +12,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/hkjang/ReSSO/internal/backchannel"
 	"github.com/hkjang/ReSSO/internal/config"
 	"github.com/hkjang/ReSSO/internal/cryptoutil"
+	"github.com/hkjang/ReSSO/internal/domain"
 	"github.com/hkjang/ReSSO/internal/httpserver"
+	"github.com/hkjang/ReSSO/internal/mail"
 	"github.com/hkjang/ReSSO/internal/observability"
 	"github.com/hkjang/ReSSO/internal/oidc"
 	"github.com/hkjang/ReSSO/internal/store"
@@ -132,8 +136,8 @@ func main() {
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
-	go maintenance(runCtx, data, logger)
-	go federationMaintenance(runCtx, data, logger, app.Metrics())
+	go maintenance(runCtx, data, logger, app.Mail())
+	go federationMaintenance(runCtx, data, logger, app.Metrics(), app.Mail())
 	go func() {
 		<-runCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -142,6 +146,7 @@ func main() {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
 		logoutNotifier.Wait(10 * time.Second)
+		app.Mail().Wait(10 * time.Second)
 		// Write out the buffered log records before the process exits, so the
 		// administration log does not lose the last seconds before a restart.
 		logMirror.Close(5 * time.Second)
@@ -187,7 +192,7 @@ func newSealer(cfg config.Config) (*cryptoutil.Sealer, error) {
 	return cryptoutil.NewKeyring(dataKeys, digestKeys)
 }
 
-func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.Logger, metrics *observability.Registry) {
+func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.Logger, metrics *observability.Registry, mailer *mail.Service) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
@@ -203,6 +208,13 @@ func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.
 				continue
 			}
 			for _, id := range ids {
+				// Read before the run so the failure mail below can tell a
+				// sync that just broke from one that has been broken for
+				// hours; only the first is news.
+				var previous domain.LDAPFederation
+				if federation, err := data.LDAPFederationByID(ctx, id); err == nil {
+					previous = federation
+				}
 				syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Minute)
 				summary, syncErr := data.SyncLDAPFederation(syncCtx, id)
 				syncCancel()
@@ -225,6 +237,7 @@ func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.
 					metrics.Add(httpserver.MetricFederationSync, 1, "failure")
 					logger.Error("scheduled LDAP federation sync failed", "federation_id", id,
 						"read", summary.Read, "failed", summary.Failed, "error", syncErr)
+					notifyFederationFailure(ctx, data, logger, mailer, previous, syncErr)
 					continue
 				}
 				metrics.Add(httpserver.MetricFederationSync, 1, "success")
@@ -235,13 +248,55 @@ func federationMaintenance(ctx context.Context, data *store.Store, logger *slog.
 	}
 }
 
-func maintenance(ctx context.Context, data *store.Store, logger *slog.Logger) {
+// notifyFederationFailure mails the service administrators when a scheduled
+// sync that used to succeed has failed. A provider that was already failing
+// sends nothing: the first failure is the news, and a mail every interval
+// until somebody fixes the directory is the noise that gets the whole
+// channel filtered.
+func notifyFederationFailure(ctx context.Context, data *store.Store, logger *slog.Logger, mailer *mail.Service,
+	previous domain.LDAPFederation, cause error) {
+	if previous.ID == uuid.Nil || previous.LastSyncStatus == "FAILURE" {
+		return
+	}
+	admins, err := data.PlatformAdministrators(ctx)
+	if err != nil {
+		logger.Warn("service administrators could not be listed for the sync failure mail", "error", err)
+		return
+	}
+	realm := previous.RealmID.String()
+	if named, err := data.RealmByID(ctx, previous.RealmID); err == nil {
+		realm = named.DisplayName
+	}
+	mailer.Notify(ctx, mail.FederationSyncFailed(realm, previous.Name, cause.Error(), previous.ID.String()), uuid.Nil, admins)
+}
+
+// warnExpiringAPIKeys mails each owner whose personal API keys expire within
+// the week, once per key, all of one person's keys in one mail. It asks the
+// settings first so that a service with mail off never marks a key as
+// warned — turning mail on later still warns about it.
+func warnExpiringAPIKeys(ctx context.Context, data *store.Store, logger *slog.Logger, mailer *mail.Service) {
+	config, err := mailer.Config(ctx)
+	if err != nil || !config.Enabled || !config.Allows(mail.EventAPIKeyExpiring) {
+		return
+	}
+	owners, err := data.ClaimExpiringAPIKeys(ctx)
+	if err != nil {
+		logger.Warn("expiring API keys could not be listed for the warning mail", "error", err)
+		return
+	}
+	for _, owner := range owners {
+		mailer.Notify(ctx, mail.APIKeysExpiring(owner.Keys), uuid.Nil, []uuid.UUID{owner.UserID})
+	}
+}
+
+func maintenance(ctx context.Context, data *store.Store, logger *slog.Logger, mailer *mail.Service) {
 	prune := func() {
 		cleanupCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		if err := data.PruneOperationalData(cleanupCtx); err != nil {
 			logger.Warn("operational data retention cleanup failed", "error", err)
 		}
+		warnExpiringAPIKeys(cleanupCtx, data, logger, mailer)
 	}
 	// Run once shortly after startup. Waiting a full day for the first pass
 	// meant a service that restarts daily never collected expired
