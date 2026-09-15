@@ -191,6 +191,7 @@ scrape_configs:
 | `resso_client_auth_failures_total` | Realm별 OIDC Client 인증 실패 수 |
 | `resso_introspection_errors_total` | 판정하지 못한 Introspection 수(실패한 조회 단계별). 죽은 Token으로 판정한 경우와 달리 서비스가 답을 낼 수 없었던 경우입니다 |
 | `resso_authorization_errors_total` | 처리하지 못한 인가 요청 수(실패한 단계별). 대부분 302로 나가므로 성공한 인가와 HTTP 상태가 같습니다 |
+| `resso_silent_authentications_total` | `prompt=none` 인가 요청 수(답변별 — `code`·`login_required`). 거절을 다시 시도하는 RP의 무한 루프가 여기서만 드러납니다 |
 | `resso_backchannel_logout_total` | Back-Channel Logout 전달 결과 |
 | `resso_federation_sync_total` | 주기 LDAP 동기화 성공·실패 수 |
 | `resso_system_log_records_total` | 서버 로그의 데이터베이스 기록·유실·실패 수 |

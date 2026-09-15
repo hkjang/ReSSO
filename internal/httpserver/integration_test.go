@@ -9788,6 +9788,143 @@ func TestIntegrationAuthorizationCountsTheRequestsItCouldNotServe(t *testing.T) 
 	}
 }
 
+// prompt=none draws no screen: a browser with a session gets a code and one
+// without gets error=login_required, and both leave as a 302 to the relying
+// party. login_required is the ordinary answer, and a relying party is expected
+// to show its own login screen and stop. One that retries it instead bounces
+// the browser between the two hosts at redirect speed — the person sees a
+// flicker — and in the request counter that loop is a busy, healthy endpoint.
+// This pins the series that shows it, and that a fault answered server_error
+// is not counted as a refusal.
+func TestIntegrationSilentAuthenticationsAreCountedByTheirAnswer(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+		ClientID: "silent-sso-rp", Name: "Silent SSO RP", Type: "confidential",
+		RedirectURIs:  []string{"https://rp.example.test/cb"},
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		DefaultScopes: []string{"openid", "profile"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, bootstrap.RealmID, bootstrap.AdminUserID, time.Hour,
+		"127.0.0.1", "silent-sso-metrics-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	metrics := observability.NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+	client := server.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	authorize := func(cookie, extra string) (int, *url.URL) {
+		t.Helper()
+		target := server.URL + "/realms/master/protocol/openid-connect/auth" +
+			"?response_type=code&scope=openid&client_id=" + url.QueryEscape(created.Client.ClientID) +
+			"&redirect_uri=" + url.QueryEscape("https://rp.example.test/cb") + "&state=s1" + extra
+		request, reqErr := http.NewRequest(http.MethodGet, target, nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		if cookie != "" {
+			request.AddCookie(&http.Cookie{Name: "resso_session", Value: cookie})
+		}
+		response, doErr := client.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer func() { _ = response.Body.Close() }()
+		_, _ = io.Copy(io.Discard, response.Body)
+		location, parseErr := url.Parse(response.Header.Get("Location"))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		return response.StatusCode, location
+	}
+	exported := func() string {
+		t.Helper()
+		var out strings.Builder
+		metrics.WritePrometheus(&out)
+		return out.String()
+	}
+	counted := func(result string, want int) {
+		t.Helper()
+		line := `resso_silent_authentications_total{result="` + result + `"} ` + strconv.Itoa(want)
+		if !strings.Contains(exported(), line) {
+			t.Errorf("silent authentications answered %s were not counted as such: no %q\n%s", result, line, exported())
+		}
+	}
+
+	// The ordinary interactive requests are not silent, whatever they are
+	// answered with, so the series must not move for them.
+	if status, location := authorize("", ""); status != http.StatusFound || !strings.HasPrefix(location.Path, "/login") {
+		t.Fatalf("a signed-out authorization answered %d to %q, want 302 to the login page", status, location)
+	}
+	if status, location := authorize(session.Token, ""); status != http.StatusFound || location.Query().Get("code") == "" {
+		t.Fatalf("a signed-in authorization answered %d to %q, want 302 carrying a code", status, location)
+	}
+	if strings.Contains(exported(), "resso_silent_authentications_total{") {
+		t.Errorf("interactive authorizations were counted as silent:\n%s", exported())
+	}
+
+	// Nobody signed in: the ordinary refusal, carrying the state so the relying
+	// party can match it, and counted as the answer it is.
+	status, location := authorize("", "&prompt=none")
+	if status != http.StatusFound || location.Query().Get("error") != "login_required" || location.Query().Get("state") != "s1" {
+		t.Fatalf("a signed-out prompt=none answered %d to %q, want 302 carrying error=login_required and the state", status, location)
+	}
+	counted("login_required", 1)
+	if strings.Contains(exported(), `resso_silent_authentications_total{result="code"}`) {
+		t.Error("a refused silent authentication was counted as a code")
+	}
+
+	// Signed in: the code, without a screen, counted on the other side.
+	if status, location := authorize(session.Token, "&prompt=none"); status != http.StatusFound || location.Query().Get("code") == "" {
+		t.Fatalf("a signed-in prompt=none answered %d to %q, want 302 carrying a code", status, location)
+	}
+	counted("code", 1)
+	counted("login_required", 1)
+
+	// A session lookup that cannot run is answered server_error, which the
+	// unserved-authorization series already counts. It is not a refusal — a
+	// relying party reads login_required as the person having signed out —
+	// so it must not be counted as one here either.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE sso_sessions RENAME TO sso_sessions_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	status, location = authorize(session.Token, "&prompt=none")
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE sso_sessions_hidden RENAME TO sso_sessions"); err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusFound || location.Query().Get("error") != "server_error" {
+		t.Fatalf("prompt=none with the session table unreadable answered %d to %q, want 302 carrying error=server_error", status, location)
+	}
+	counted("code", 1)
+	counted("login_required", 1)
+	if !strings.Contains(exported(), `resso_authorization_errors_total{stage="sso_session"} 1`) {
+		t.Errorf("the unreadable session was not counted as an unserved authorization:\n%s", exported())
+	}
+
+	// The same browser asking again after a refusal is what a loop looks like;
+	// each pass is one more refusal here and nothing else.
+	for range 3 {
+		if status, location := authorize("", "&prompt=none"); status != http.StatusFound || location.Query().Get("error") != "login_required" {
+			t.Fatalf("a repeated signed-out prompt=none answered %d to %q", status, location)
+		}
+	}
+	counted("login_required", 4)
+}
+
 // A console session is a bearer credential: whoever holds the cookie is the
 // administrator until it expires. That is an acceptable trade for reading a
 // dashboard and a poor one for handing out access — resetting a password,

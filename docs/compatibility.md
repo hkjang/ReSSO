@@ -51,6 +51,16 @@ Access Token의 `aud`는 발급 Client 자신입니다. 별도 Resource Server�
 
 ReSSO의 목표는 Keycloak 전체 복제가 아니라 issuer 변경만으로 일반 OIDC Client가 연동되는 핵심 L3~L4 호환 서버입니다. 기존 애플리케이션이 Keycloak Admin API, SAML 또는 고유 SPI를 사용한다면 별도의 Migration 분석이 필요합니다.
 
+## RP가 silent SSO를 구현할 때
+
+이미 ReSSO에 로그인한 사람이 다른 서비스를 열 때 로그인 화면 없이 바로 들어가게 하는 것(silent SSO)은 RP가 인가 요청에 `prompt=none`을 붙여 시작합니다. ReSSO는 제공자로서 다음만 합니다.
+
+- **화면을 그리지 않습니다.** 재사용할 SSO Session이 있으면(그리고 `id_token_hint`·`max_age`를 충족하면) 302로 인가 코드를, 없으면 302로 `error=login_required`를 `state`와 함께 `redirect_uri`로 돌려보냅니다.
+- **`login_required`는 실패가 아니라 평범한 답입니다.** "이 브라우저에는 세션이 없다"는 뜻이며, RP는 자기 로그인 화면을 보여 주고 **거기서 멈춰야** 합니다. 그 답에 다시 `prompt=none`을 보내면 브라우저가 두 호스트 사이를 끝없이 오가고 사용자는 깜빡임만 봅니다. 제공자는 그 루프를 막을 수 없고 셀 수만 있습니다 — `resso_silent_authentications_total{result="login_required"}`와 서버 로그의 `client_id`(`docs/operations.md`).
+- **세션을 읽지 못한 것은 `login_required`가 아니라 `server_error`입니다.** RP는 `login_required`를 "로그아웃했다"로 읽고 자기 세션도 끝내므로, 이쪽 장애를 그렇게 알리면 전 RP 로그아웃이 됩니다. `server_error`는 재시도할 수 있는 이쪽 문제입니다.
+
+루프를 막는 장치와 켜고 끄는 설정은 **RP 쪽**에 둡니다 — 한 탭 세션에 한 번만 시도(`sessionStorage`), 스스로 로그아웃한 뒤에는 억제, 콜백이 거절을 받으면 `/login?sso=none`처럼 주소에 표시를 남기고 그 주소에서는 다시 시도하지 않기, 브라우저 저장소를 읽지 못하면 "이미 시도했다"로 치기, RP의 `auto_login` 설정(기본 꺼짐)이 꺼져 있으면 `prompt=none`을 보내지 않기. ReSSO에는 그에 해당하는 설정이 없습니다 — 제공자가 `prompt=none`을 무시하면 사양(OIDC Core 3.1.2.1)을 어기는 것이고, 그 설정이 있어야 할 자리는 요청을 만드는 쪽입니다. 숨은 iframe이 아니라 최상위 이동을 쓰면 서드파티 쿠키가 막힌 브라우저에서도 동작하며, ReSSO는 프레임에 실리는 것을 허용하지 않습니다(CSP `frame-ancestors 'none'`).
+
 ## 검증 권장사항
 
 - Spring Security Resource Server의 `issuer-uri` 변경 테스트
