@@ -33,9 +33,17 @@ const (
 	// authorization leaves with — so in the request counter and the access log
 	// an outage here is indistinguishable from a busy, healthy endpoint.
 	metricAuthorizationErrors = "resso_authorization_errors_total"
-	metricLogoutNotices       = backchannel.MetricName
-	MetricFederationSync      = "resso_federation_sync_total"
-	metricFederationSync      = MetricFederationSync
+	// metricSilentAuthentications counts the prompt=none requests by how they
+	// were answered. Both answers are a 302 to the relying party, so the
+	// request counter cannot tell a Realm full of people signing in silently
+	// from one relying party that retries login_required as though it were a
+	// failure — the browser bouncing between the two hosts at redirect speed,
+	// which the person in front of it sees only as a flicker. That loop is
+	// visible nowhere but here.
+	metricSilentAuthentications = "resso_silent_authentications_total"
+	metricLogoutNotices         = backchannel.MetricName
+	MetricFederationSync        = "resso_federation_sync_total"
+	metricFederationSync        = MetricFederationSync
 )
 
 // registerMetrics declares this package's series on a shared registry.
@@ -52,6 +60,8 @@ func registerMetrics(registry *observability.Registry) {
 		"Introspections the service could not judge, by the lookup that failed.", "stage")
 	registry.Counter(metricAuthorizationErrors,
 		"Authorization requests the service could not serve, by the step that failed.", "stage")
+	registry.Counter(metricSilentAuthentications,
+		"prompt=none authorization requests, by the answer they received.", "result")
 	registry.Counter(metricLogoutNotices, "Back-channel logout deliveries, by outcome.", "result")
 	registry.Counter(metricFederationSync, "Scheduled LDAP federation syncs, by outcome.", "result")
 }

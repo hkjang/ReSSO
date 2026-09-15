@@ -354,12 +354,24 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 					redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "server_error", "authorization code could not be created")
 					return
 				}
+				if prompts["none"] {
+					s.metrics.Add(metricSilentAuthentications, 1, "code")
+				}
 				http.Redirect(w, r, authorizationRedirect(redirectURI, code, query.Get("state"), realm.IssuerURL, authenticated.Session.ID), http.StatusFound)
 				return
 			}
 		}
 	}
 	if prompts["none"] {
+		// login_required is the ordinary answer to a silent request from a
+		// browser with nobody signed in, and a relying party is expected to
+		// show its login screen and stop. One that instead asks again comes
+		// back at redirect speed, and the series alone cannot say which one:
+		// the counter carries no client label, so the relying party is named
+		// here, where a burst from one remote_ip is the loop itself.
+		s.metrics.Add(metricSilentAuthentications, 1, "login_required")
+		s.logger.Info("a silent authentication found no session to reuse", "trace_id", traceIDFrom(r.Context()),
+			"realm", realm.Name, "client_id", client.ClientID, "remote_ip", s.clientIP(r))
 		redirectOAuthError(w, r, redirectURI, query.Get("state"), realm.IssuerURL, "login_required", "no active SSO session")
 		return
 	}
