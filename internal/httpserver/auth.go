@@ -220,6 +220,15 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			// operators are told to watch, so the failure looked like a quiet
 			// minute. The session is deliberately kept: retrying from the
 			// relying party finds it and completes without asking again.
+			//
+			// The code is not internal_error, which is what every other 500 on
+			// this route answers. Those are attempts this service did not
+			// finish, and the way out is this same form once the fault clears.
+			// This one finished — and consumed the request on the line above —
+			// so the form is the one place a retry cannot succeed: the same
+			// credential now meets 400 expired_request at the top of this
+			// handler. Sharing a code left the screen unable to tell the two
+			// opposite instructions apart.
 			s.logger.Error("authorization code could not be created after a successful login",
 				"trace_id", traceIDFrom(r.Context()), "realm", realm.Name,
 				"session_id", newSession.Session.ID, "error", err)
@@ -227,7 +236,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			s.audit(r, &realm.ID, &result.User.ID, result.User.Username, "LOGIN_SUCCESS", "PARTIAL",
 				"session", newSession.Session.ID.String(),
 				map[string]any{"authorization_code": "not_issued", "error": err.Error()})
-			writeError(w, r, http.StatusInternalServerError, "internal_error", "로그인은 되었지만 인가 코드를 생성하지 못했습니다. 애플리케이션에서 다시 시도하세요.")
+			writeError(w, r, http.StatusInternalServerError, "authorization_code_failed", "로그인은 되었지만 인가 코드를 생성하지 못했습니다. 애플리케이션에서 다시 시도하세요.")
 			return
 		}
 		response["redirect_to"] = authorizationRedirect(consumed.RedirectURI, code, consumed.State, realm.IssuerURL, newSession.Session.ID)

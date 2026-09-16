@@ -43,7 +43,9 @@ interface Challenge {
  *     was right to doubt it, and to call the help desk about an account that
  *     cannot lock.
  *   - `500` and status 0 are this service not finishing the attempt. Nothing
- *     was recorded against the account either.
+ *     was recorded against the account either. (`500 authorization_code_failed`
+ *     is the exception that proves it: the login *finished*, successfully, and
+ *     only the code after it did not.)
  *   - `429` carries a Retry-After, and the countdown below says when to try
  *     again, which is the more exact answer than the policy.
  */
@@ -125,7 +127,27 @@ export function LoginPage() {
   // with a wrong password read as "that did not work", and nothing said the
   // form in front of the person was still the way through.
   const accountMismatch = login.error instanceof APIError && login.error.code === 'account_mismatch'
-  const blocked = login.isPending || challenge.isError || rateLimited || !username.trim() || !password
+  // The answers whose way out is the relying party, not this form. Each means
+  // the request token in the address bar is spent, so nothing typed here can
+  // finish the flow; the form is disabled for the same reason a challenge that
+  // could not be read disables it.
+  //
+  //   - `500 authorization_code_failed` is a login that succeeded: the session
+  //     exists and its cookies are in the browser; only the code was not
+  //     written, and the request was consumed just before. Starting over at
+  //     the service finds that session and finishes without asking for the
+  //     password again; trying again here meets `expired_request`. It used to
+  //     share a code with the 500s that mean "this service did not finish,
+  //     try here again", so the red line could not say which of two opposite
+  //     things to do.
+  //   - `409 request_already_used` and `400 expired_request` are the request
+  //     being gone before the answer, and their messages said only that, not
+  //     where to go — the challenge's 404 already sends the person back for
+  //     the same reason, and these are the same fact learned a step later.
+  const loginError = login.error instanceof APIError ? login.error : undefined
+  const codeNotIssued = loginError?.code === 'authorization_code_failed'
+  const requestSpent = codeNotIssued || loginError?.code === 'request_already_used' || loginError?.code === 'expired_request'
+  const blocked = login.isPending || challenge.isError || rateLimited || requestSpent || !username.trim() || !password
   // A challenge that could not be read is not a login request that expired.
   // The service answers 404 only for a request token that is gone — spent,
   // expired, or never issued — and that is the one case where starting over at
@@ -174,7 +196,20 @@ export function LoginPage() {
               )}
             </Alert>
           )}
-          {errorMessage && !rateLimited && !accountMismatch && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
+          {errorMessage && !rateLimited && !accountMismatch && !requestSpent && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
+          {requestSpent && !rateLimited && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              <AlertTitle sx={{ mb: .5 }}>{errorMessage}</AlertTitle>
+              <Typography variant="body2">
+                {codeNotIssued
+                  ? '연결한 서비스로 돌아가 다시 시작하세요. 방금 로그인한 세션이 그대로 쓰이므로 비밀번호를 다시 묻지 않습니다. 이 화면에서 다시 로그인하지 마세요 — 이 요청은 이미 처리되어 여기서는 이어지지 않습니다.'
+                  : '이 요청은 이 화면에서는 더 이어지지 않습니다. 연결한 서비스로 돌아가 다시 시작하세요.'}
+              </Typography>
+              {codeNotIssued && loginError?.traceId && (
+                <Typography component="span" className="mono" sx={{ display: 'block', fontSize: 12, mt: .5 }}>trace: {loginError.traceId}</Typography>
+              )}
+            </Alert>
+          )}
           {accountMismatch && !rateLimited && (
             <Alert severity="warning" sx={{ mb: 2 }}>
               <AlertTitle sx={{ mb: .5 }}>{errorMessage}</AlertTitle>

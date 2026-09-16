@@ -138,6 +138,96 @@ test('a fault on this side is not counted toward the lockout warning either', as
   vi.unstubAllGlobals()
 })
 
+test('a login that succeeded without its code is sent back to the service, not the form', async () => {
+  const user = userEvent.setup()
+  // 500 authorization_code_failed is a login that finished: the session exists
+  // and its cookies are in the browser; only the code was not written. It
+  // shared internal_error with the 500s that mean "this service did not
+  // finish, try here again", so the page showed the same red line for two
+  // opposite instructions — and retrying here cannot work: the request was
+  // consumed, so the same credential meets expired_request.
+  const fetchMock = vi.fn(async (input: string) => {
+    if (input.startsWith('/api/v1/auth/challenge/')) {
+      return new Response(challengeBody, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    return new Response(JSON.stringify({
+      error: 'authorization_code_failed',
+      message: '로그인은 되었지만 인가 코드를 생성하지 못했습니다. 애플리케이션에서 다시 시도하세요.',
+      trace_id: 'trace-99',
+    }), { status: 500, headers: { 'Content-Type': 'application/json' } })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+
+  renderLogin('/login?request=live-token')
+  await screen.findByText(/사내 포털에서 마스터 계정 인증을 요청했습니다/)
+  await user.type(screen.getByRole('textbox', { name: '아이디' }), 'admin')
+  await user.type(screen.getByLabelText(/비밀번호/, { selector: 'input' }), 'correct horse battery staple')
+  await user.click(screen.getByRole('button', { name: /로그인/ }))
+
+  const notice = await screen.findByText(/연결한 서비스로 돌아가 다시 시작하세요/)
+  expect(notice.textContent).toContain('비밀번호를 다시 묻지 않습니다')
+  expect(notice.textContent).toContain('이 화면에서 다시 로그인하지 마세요')
+  expect(screen.getByText(/trace-99/)).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /로그인/ })).toBeDisabled()
+  expect(screen.queryByText(/반복 실패하면 계정이 일정 시간 잠기며/)).not.toBeInTheDocument()
+  vi.unstubAllGlobals()
+})
+
+test.each([
+  { status: 409, error: 'request_already_used', message: '로그인 요청이 이미 처리되었습니다.' },
+  { status: 400, error: 'expired_request', message: '로그인 요청이 만료되었거나 이미 사용되었습니다.' },
+])('a spent login request ($status $error) says where to go instead of only that it was spent', async ({ status, error, message }) => {
+  const user = userEvent.setup()
+  // Both said the request was gone and nothing more, and left the form
+  // enabled — so the person tried the same form again and met the same
+  // answer. The challenge's 404 already sends them back for this reason.
+  const fetchMock = vi.fn(async (input: string) => {
+    if (input.startsWith('/api/v1/auth/challenge/')) {
+      return new Response(challengeBody, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    return new Response(JSON.stringify({ error, message }), { status, headers: { 'Content-Type': 'application/json' } })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+
+  renderLogin('/login?request=live-token')
+  await screen.findByText(/사내 포털에서 마스터 계정 인증을 요청했습니다/)
+  await user.type(screen.getByRole('textbox', { name: '아이디' }), 'admin')
+  await user.type(screen.getByLabelText(/비밀번호/, { selector: 'input' }), 'correct horse battery staple')
+  await user.click(screen.getByRole('button', { name: /로그인/ }))
+
+  expect(await screen.findByText(/연결한 서비스로 돌아가 다시 시작하세요/)).toBeInTheDocument()
+  expect(screen.getByText(message)).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /로그인/ })).toBeDisabled()
+  vi.unstubAllGlobals()
+})
+
+test('a fault this service did not finish keeps the form as the way to try again', async () => {
+  const user = userEvent.setup()
+  // The other 500 on this route — internal_error — is an attempt that did not
+  // finish, and the way out is this form once the fault clears. The
+  // distinction above must not sweep it up.
+  const fetchMock = vi.fn(async (input: string) => {
+    if (input.startsWith('/api/v1/auth/challenge/')) {
+      return new Response(challengeBody, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    return new Response(JSON.stringify({ error: 'internal_error', message: '로그인을 처리하지 못했습니다.', trace_id: 'trace-7' }), {
+      status: 500, headers: { 'Content-Type': 'application/json' },
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+
+  renderLogin('/login?request=live-token')
+  await screen.findByText(/사내 포털에서 마스터 계정 인증을 요청했습니다/)
+  await user.type(screen.getByRole('textbox', { name: '아이디' }), 'admin')
+  await user.type(screen.getByLabelText(/비밀번호/, { selector: 'input' }), 'correct horse battery staple')
+  await user.click(screen.getByRole('button', { name: /로그인/ }))
+
+  await screen.findByText('로그인을 처리하지 못했습니다.')
+  expect(screen.queryByText(/연결한 서비스로 돌아가 다시 시작하세요/)).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /로그인/ })).toBeEnabled()
+  vi.unstubAllGlobals()
+})
+
 test('a locked account is told it is locked, not that its password is wrong', async () => {
   const user = userEvent.setup()
   // The server answers 401 here, not 429, so the countdown that already

@@ -256,7 +256,7 @@ func openAPIErrorSchema() map[string]any {
 					"authentication_required", "invalid_credentials", "account_locked", "account_disabled",
 					"browser_session_required", "invalid_csrf", "insufficient_permission",
 					"invalid_input", "invalid_manager", "not_found", "conflict",
-					"rate_limited", "internal_error",
+					"rate_limited", "internal_error", "authorization_code_failed", "request_already_used",
 				},
 			},
 			"message":  map[string]any{"type": "string", "description": "사용자에게 보여줄 수 있는 설명."},
