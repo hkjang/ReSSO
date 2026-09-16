@@ -3430,9 +3430,42 @@ func TestIntegrationALoginThatCannotMintItsCodeIsStillRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var answer map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&answer); err != nil {
+		t.Fatal(err)
+	}
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusInternalServerError)
+	}
+	// Every other 500 on this route is internal_error: an attempt this service
+	// did not finish, to be retried from the same form once the fault clears.
+	// This one finished and consumed the request, so the form is the one place
+	// a retry cannot succeed — the answer below shows what it meets — and the
+	// screen needs a code of its own to send the person the other way.
+	if answer["error"] != "authorization_code_failed" {
+		t.Errorf("error = %v, want authorization_code_failed: the screen cannot tell this from a fault it should retry here", answer["error"])
+	}
+
+	// Retrying from the form meets the consumed request before anything is
+	// checked, so nothing typed there can finish the flow; the relying party
+	// is the way out, and the screen needs the code above to say so.
+	retry, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/auth/login", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry.Header.Set("Content-Type", "application/json")
+	response, err = server.Client().Do(retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer = map[string]any{}
+	if err := json.NewDecoder(response.Body).Decode(&answer); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest || answer["error"] != "expired_request" {
+		t.Errorf("a retry from the form answered %d %v, want 400 expired_request", response.StatusCode, answer["error"])
 	}
 
 	// The session really was handed out — which is why the silence mattered.
