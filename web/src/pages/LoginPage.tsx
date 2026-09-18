@@ -147,7 +147,22 @@ export function LoginPage() {
   const loginError = login.error instanceof APIError ? login.error : undefined
   const codeNotIssued = loginError?.code === 'authorization_code_failed'
   const requestSpent = codeNotIssued || loginError?.code === 'request_already_used' || loginError?.code === 'expired_request'
-  const blocked = login.isPending || challenge.isError || rateLimited || requestSpent || !username.trim() || !password
+  // The answers whose way out is this form, once the fault clears. Any other
+  // 5xx is this service not finishing the attempt — the store or the directory
+  // did not answer, or a proxy in front answered for it — and status 0 is a
+  // restart or an unreachable host; in every case nothing was recorded against
+  // the account and the request in the address bar was not consumed. These
+  // shared the red line with a wrong password, which read as "that did not
+  // work" and said nothing about when or where to try again — so the person
+  // either retyped a password that was never checked or went back to the
+  // relying party for a fresh request token that met the same fault here. The
+  // 500 also carries a Trace ID the page threw away: the guide says "tell an
+  // administrator if it keeps happening", and this was the one login answer
+  // with nothing to tell. 429 has its own countdown and is excluded by being
+  // below 500; `authorization_code_failed` is excluded above because it is the
+  // opposite instruction.
+  const attemptUnfinished = loginError !== undefined && !requestSpent && (loginError.status === 0 || loginError.status >= 500)
+  const blocked =login.isPending || challenge.isError || rateLimited || requestSpent || !username.trim() || !password
   // A challenge that could not be read is not a login request that expired.
   // The service answers 404 only for a request token that is gone — spent,
   // expired, or never issued — and that is the one case where starting over at
@@ -196,7 +211,20 @@ export function LoginPage() {
               )}
             </Alert>
           )}
-          {errorMessage && !rateLimited && !accountMismatch && !requestSpent && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
+          {errorMessage && !rateLimited && !accountMismatch && !requestSpent && !attemptUnfinished && <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>}
+          {attemptUnfinished && !rateLimited && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              <AlertTitle sx={{ mb: .5 }}>{errorMessage}</AlertTitle>
+              <Typography variant="body2">
+                {requestToken
+                  ? 'ReSSO 쪽 문제로 로그인 시도를 끝내지 못했습니다. 계정에는 아무것도 기록되지 않았고 로그인 요청도 그대로 남아 있으니, 연결한 서비스에서 다시 시작하지 말고 잠시 후 이 화면에서 다시 시도하세요.'
+                  : 'ReSSO 쪽 문제로 로그인 시도를 끝내지 못했습니다. 계정에는 아무것도 기록되지 않았으니 잠시 후 이 화면에서 다시 시도하세요.'}
+              </Typography>
+              {loginError?.traceId && (
+                <Typography component="span" className="mono" sx={{ display: 'block', fontSize: 12, mt: .5 }}>trace: {loginError.traceId}</Typography>
+              )}
+            </Alert>
+          )}
           {requestSpent && !rateLimited && (
             <Alert severity="warning" sx={{ mb: 2 }}>
               <AlertTitle sx={{ mb: .5 }}>{errorMessage}</AlertTitle>

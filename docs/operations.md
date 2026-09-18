@@ -238,11 +238,11 @@ RP에서 넘어온 로그인 화면은 폼을 그리기 전에 `GET /api/v1/auth
 
 | 답 | 뜻 | 사용자가 할 일 |
 |---|---|---|
-| `500 internal_error` 「로그인을 처리하지 못했습니다.」 | 이쪽이 시도를 끝내지 못했습니다(저장소·디렉터리 장애). 요청은 소진되지 않았습니다 | 잠시 후 **이 화면에서** 다시 시도 |
+| `500 internal_error` 「로그인을 처리하지 못했습니다.」 · 연결 실패(status 0) 「서버에 연결하지 못했습니다.」 | 이쪽이 시도를 끝내지 못했습니다(저장소·디렉터리 장애, 또는 재시작 중이라 연결되지 않음). 요청은 소진되지 않았고 계정에는 아무것도 기록되지 않았습니다 | 잠시 후 **이 화면에서** 다시 시도 |
 | `500 authorization_code_failed` 「로그인은 되었지만 인가 코드를 생성하지 못했습니다.」 | 로그인은 **성공했고** 세션과 쿠키가 있으며(감사 `LOGIN_SUCCESS` `result=PARTIAL`, 상세 `authorization_code=not_issued`), 인가 요청은 그 직전에 소진되었습니다. 이 화면에서 다시 제출하면 `400 expired_request`만 만납니다 | **RP로 돌아가** 다시 시작 — 방금 만든 세션이 그대로 쓰여 비밀번호를 다시 묻지 않습니다 |
 | `409 request_already_used` · `400 expired_request` | request token이 소진·만료된 것을 제출 뒤에 알게 된 경우(위 표의 `404`와 같은 사실) | RP로 돌아가 다시 시작 |
 
-로그인 화면은 표의 둘째·셋째 행(세 답)에 「연결한 서비스로 돌아가 다시 시작하세요」를 띄우고 폼을 잠급니다 — 그 request token으로는 여기서 무엇을 입력해도 이어지지 않기 때문입니다. `authorization_code_failed`는 Trace ID를 함께 보이므로 서버 로그의 `authorization code could not be created after a successful login`과 대조하세요.
+로그인 화면은 표의 둘째·셋째 행(세 답)에 「연결한 서비스로 돌아가 다시 시작하세요」를 띄우고 폼을 잠급니다 — 그 request token으로는 여기서 무엇을 입력해도 이어지지 않기 때문입니다. `authorization_code_failed`는 Trace ID를 함께 보이므로 서버 로그의 `authorization code could not be created after a successful login`과 대조하세요. 첫째 행(그 외의 5xx와 status 0)에는 「연결한 서비스에서 다시 시작하지 말고 잠시 후 이 화면에서 다시 시도하세요」를 띄우고 폼은 그대로 둡니다 — 5xx는 Trace ID를 함께 보이므로 사용자가 전해 온 값으로 서버 로그를 찾고, status 0은 이쪽에 닿지 않은 요청이라 Trace ID도 로그도 없습니다(재시작·리버스 프록시·네트워크를 보세요).
 
 ## 관리자 권한
 

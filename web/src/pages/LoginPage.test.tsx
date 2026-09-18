@@ -228,6 +228,76 @@ test('a fault this service did not finish keeps the form as the way to try again
   vi.unstubAllGlobals()
 })
 
+test.each([
+  {
+    label: '500 internal_error',
+    entry: '/login?request=live-token',
+    answer: () => new Response(JSON.stringify({ error: 'internal_error', message: '로그인을 처리하지 못했습니다.', trace_id: 'trace-7' }), {
+      status: 500, headers: { 'Content-Type': 'application/json' },
+    }),
+    message: '로그인을 처리하지 못했습니다.',
+    trace: 'trace-7',
+  },
+  {
+    label: 'status 0',
+    entry: '/login?request=live-token',
+    answer: () => { throw new TypeError('Failed to fetch') },
+    message: '서버에 연결하지 못했습니다. 네트워크와 ReSSO 서비스 상태를 확인한 뒤 다시 시도하세요.',
+    trace: undefined,
+  },
+  {
+    label: '500 internal_error on the console login',
+    entry: '/login',
+    answer: () => new Response(JSON.stringify({ error: 'internal_error', message: '로그인을 처리하지 못했습니다.', trace_id: 'trace-8' }), {
+      status: 500, headers: { 'Content-Type': 'application/json' },
+    }),
+    message: '로그인을 처리하지 못했습니다.',
+    trace: 'trace-8',
+  },
+])('a fault this service did not finish ($label) says to try here again and shows its trace', async ({ entry, answer, message, trace }) => {
+  const user = userEvent.setup()
+  // These answers shared the red line with a wrong password, which read as
+  // "that did not work" and said nothing about when or where to try again —
+  // and the 500 carried a Trace ID the page dropped, so the guide's "tell an
+  // administrator" had nothing to pass on. The request was not consumed and
+  // nothing was recorded, so the form stays the way through.
+  const fetchMock = vi.fn(async (input: string) => {
+    if (input.startsWith('/api/v1/auth/challenge/')) {
+      return new Response(challengeBody, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    return answer()
+  })
+  vi.stubGlobal('fetch', fetchMock)
+
+  renderLogin(entry)
+  if (entry.includes('request=')) await screen.findByText(/사내 포털에서 마스터 계정 인증을 요청했습니다/)
+  await user.type(screen.getByRole('textbox', { name: '아이디' }), 'admin')
+  await user.type(screen.getByLabelText(/비밀번호/, { selector: 'input' }), 'correct horse battery staple')
+  await user.click(screen.getByRole('button', { name: /로그인/ }))
+
+  const notice = await screen.findByText(/잠시 후 이 화면에서 다시 시도하세요/)
+  expect(notice.textContent).toContain('계정에는 아무것도 기록되지 않았')
+  // Only a request that came from a relying party has somewhere else the
+  // person might wrongly go; the console login has no such place to warn about.
+  if (entry.includes('request=')) {
+    expect(notice.textContent).toContain('연결한 서비스에서 다시 시작하지 말고')
+  } else {
+    expect(notice.textContent).not.toContain('연결한 서비스')
+  }
+  // The service's own message is shown once, as the notice's title, not again
+  // as a red line.
+  expect(screen.getAllByText(message)).toHaveLength(1)
+  if (trace) {
+    expect(screen.getByText(`trace: ${trace}`)).toBeInTheDocument()
+  } else {
+    expect(screen.queryByText(/^trace:/)).not.toBeInTheDocument()
+  }
+  expect(screen.queryByText(/연결한 서비스로 돌아가 다시 시작하세요/)).not.toBeInTheDocument()
+  expect(screen.queryByText(/반복 실패하면 계정이 일정 시간 잠기며/)).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /로그인/ })).toBeEnabled()
+  vi.unstubAllGlobals()
+})
+
 test('a locked account is told it is locked, not that its password is wrong', async () => {
   const user = userEvent.setup()
   // The server answers 401 here, not 429, so the countdown that already
