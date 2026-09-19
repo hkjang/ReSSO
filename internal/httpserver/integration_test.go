@@ -9209,6 +9209,135 @@ func TestIntegrationUserInfoRefusesWhenRolesCannotBeRead(t *testing.T) {
 	}
 }
 
+// POST userinfo is registered beside GET, but the token was read from the
+// Authorization header alone, so a relying party sending it in the form body —
+// the second of the three ways RFC 6750 allows, and the one some SDKs use — got
+// 401 invalid_token for a token that was perfectly good. That answer says the
+// credential is dead, so the relying party refreshes and tries again, and gets
+// the same answer for the new one.
+//
+// The three cases below are one test because they are one rule with two edges:
+// the body is read only on POST, and a request that names the token twice is a
+// malformed request (RFC 6750 §2, "MUST NOT use more than one method") rather
+// than a bad token — so it is 400 invalid_request, not the 401 that tells the
+// relying party to throw the token away.
+func TestIntegrationUserInfoReadsTheTokenFromAPostBody(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "body-poster", Name: "Body Poster", Type: "confidential",
+		RedirectURIs:  []string{"https://poster.example.test/cb"},
+		GrantTypes:    []string{"authorization_code"},
+		DefaultScopes: []string{"openid", "profile"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "body-holder", Password: "body-holder-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "body-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	issued, err := service.IssueUserTokens(ctx, realm, created.Client, user, session.Session.ID,
+		[]string{"openid", "profile"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	const endpoint = "/realms/master/protocol/openid-connect/userinfo"
+	userInfo := func(method, query, header, body string) (int, http.Header, map[string]any) {
+		t.Helper()
+		var reader io.Reader
+		if body != "" {
+			reader = strings.NewReader(body)
+		}
+		request, requestErr := http.NewRequest(method, server.URL+endpoint+query, reader)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		if body != "" {
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		if header != "" {
+			request.Header.Set("Authorization", "Bearer "+header)
+		}
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer response.Body.Close()
+		var decoded map[string]any
+		if decodeErr := json.NewDecoder(response.Body).Decode(&decoded); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		return response.StatusCode, response.Header, decoded
+	}
+
+	// The header form first, so that the body form below is measured against
+	// what this token is known to yield rather than against nothing.
+	status, _, viaHeader := userInfo(http.MethodGet, "", issued.AccessToken, "")
+	if status != http.StatusOK || viaHeader["sub"] != user.ID.String() {
+		t.Fatalf("userinfo answered %d %v for a freshly issued token in the header", status, viaHeader)
+	}
+
+	status, _, viaBody := userInfo(http.MethodPost, "", "", "access_token="+url.QueryEscape(issued.AccessToken))
+	if status != http.StatusOK {
+		t.Fatalf("POST userinfo answered %d %v for the same token in the form body — RFC 6750 §2.2 — so a "+
+			"relying party that sends it there is told its working token has expired", status, viaBody)
+	}
+	if viaBody["sub"] != viaHeader["sub"] || viaBody["preferred_username"] != viaHeader["preferred_username"] {
+		t.Errorf("the body form answered %v where the header form answered %v", viaBody, viaHeader)
+	}
+
+	// Naming the token twice is a malformed request, even when both copies are
+	// the same string: invalid_token would tell the relying party to discard a
+	// credential that is fine.
+	status, headers, body := userInfo(http.MethodPost, "", issued.AccessToken,
+		"access_token="+url.QueryEscape(issued.AccessToken))
+	if status != http.StatusBadRequest || body["error"] != "invalid_request" {
+		t.Errorf("a token in both the header and the body answered %d %v, want 400 invalid_request", status, body)
+	}
+	if got := headers.Get("WWW-Authenticate"); got != `Bearer error="invalid_request"` {
+		t.Errorf("a token in both the header and the body answered WWW-Authenticate %q", got)
+	}
+
+	// A bad token in the body is still a bad token.
+	if status, _, body := userInfo(http.MethodPost, "", "", "access_token=garbage"); status != http.StatusUnauthorized ||
+		body["error"] != "invalid_token" {
+		t.Errorf("garbage in the body answered %d %v, want 401 invalid_token", status, body)
+	}
+
+	// The query-string form (RFC 6750 §2.3) is deliberately not one of the ways
+	// in: it leaves the token in every access log between the relying party and
+	// here. And GET reads no body at all, so a token there is no token.
+	status, _, body = userInfo(http.MethodGet, "?access_token="+url.QueryEscape(issued.AccessToken), "", "")
+	if status != http.StatusUnauthorized || body["error"] != "invalid_token" {
+		t.Errorf("GET with the token in the query string answered %d %v, want 401 invalid_token", status, body)
+	}
+	status, _, body = userInfo(http.MethodPost, "?access_token="+url.QueryEscape(issued.AccessToken), "", "")
+	if status != http.StatusUnauthorized || body["error"] != "invalid_token" {
+		t.Errorf("POST with the token in the query string answered %d %v, want 401 invalid_token", status, body)
+	}
+}
+
 // A userinfo request fails for two unrelated reasons, and only one of them is
 // about the token. The endpoint has to answer them differently: 401
 // invalid_token is an instruction to the relying party to discard the

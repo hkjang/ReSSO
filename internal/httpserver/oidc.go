@@ -728,6 +728,31 @@ func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	raw := bearerToken(r)
+	// RFC 6750 §2.2: a POST may carry the token as the form field access_token
+	// instead of the header, and some SDKs do. The route accepted POST already;
+	// the token was read from the header alone, so a relying party using the
+	// body was told its working token had expired. Only PostForm is consulted —
+	// r.FormValue would also read the query string, and §2.3 is deliberately not
+	// offered here (a token in the URL lands in every access log on the way).
+	// GET reads no body at all.
+	if r.Method == http.MethodPost {
+		if err := r.ParseForm(); err != nil {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid form body")
+			return
+		}
+		if fromBody := strings.TrimSpace(r.PostForm.Get("access_token")); fromBody != "" {
+			// Naming the token twice is a malformed request (§2, "MUST NOT use
+			// more than one method"), not a bad token — so it is 400, not the
+			// 401 that tells the relying party to throw the credential away.
+			if raw != "" {
+				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_request"`)
+				writeOAuthError(w, http.StatusBadRequest, "invalid_request",
+					"the access token was sent in both the Authorization header and the request body")
+				return
+			}
+			raw = fromBody
+		}
+	}
 	verified, err := s.oidc.Verify(r.Context(), realm, raw, "")
 	// A token whose revocation state could not be read is unjudged, not bad:
 	// the signature and the claims already checked out and only the "has this
