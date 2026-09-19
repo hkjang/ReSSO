@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.9.87
+
+**UserInfo가 POST 본문의 토큰을 읽지 않아, 유효한 토큰에도 "토큰을 버려라"라고 답하고 있었습니다.** `POST /realms/{realm}/protocol/openid-connect/userinfo`는 라우트로 등록되어 있었지만 토큰은 `Authorization` 헤더에서만 읽었습니다. RFC 6750 §2.2대로 form-encoded 본문에 `access_token=…`을 싣는 RP·SDK는 방금 받은 멀쩡한 토큰으로도 **401 `invalid_token`**을 받았고, 그 답은 "이 토큰은 만료됐거나 위조됐으니 버리고 다시 받아라"라는 뜻이라 RP는 재발급을 반복하거나 사용자를 다시 로그인시키게 됩니다 — 토큰에는 아무 문제가 없었는데도요.
+
+### 수정
+
+- **POST UserInfo는 본문 `access_token`도 받습니다.** POST일 때만 `r.ParseForm()` 후 `r.PostForm.Get("access_token")`을 읽어 헤더 값과 합칩니다. GET은 본문을 읽지 않습니다.
+- **헤더와 본문에 둘 다 오면(값이 같아도) 400 `invalid_request`입니다** — §2 "한 가지 방법만 써야 한다"대로 `WWW-Authenticate: Bearer error="invalid_request"`를 붙여 끝냅니다. 토큰이 나쁜 게 아니라 요청이 잘못된 것이므로, 401 `invalid_token`으로 토큰을 버리게 하지 않습니다. 이 판정은 토큰 검증 **앞**이라 헤더의 토큰이 만료·위조여도 400입니다.
+- **쿼리 파라미터(§2.3)는 일부러 받지 않습니다** — URL의 토큰은 지나는 모든 접근 로그에 남습니다. GET·POST 어느 쪽이든 `?access_token=`만 보낸 요청은 전과 같이 401 `invalid_token`입니다.
+- `bearerToken` 헬퍼는 MCP·미들웨어도 쓰므로 시그니처를 바꾸지 않고 `userInfo` 안에서만 합쳤습니다. `writeUserInfoUnavailable`(500) 분기와 realm 조회 순서는 그대로입니다.
+- `docs/compatibility.md`의 UserInfo 행에 POST 본문·둘 다·쿼리에 무엇을 답하는지 적었습니다.
+
+### 확인
+
+- 새 연동 테스트 `TestIntegrationUserInfoReadsTheTokenFromAPostBody` — 헤더 GET 200 기준값 → 본문만 POST 200 + `sub`·`preferred_username` 일치 → 헤더+본문 400 `invalid_request` + `WWW-Authenticate` → 본문 garbage 401 `invalid_token` → GET 쿼리 401 → POST 쿼리 401. 토큰은 프로덕션 발급 경로(`IssueUserTokens`, 실제 저장소·서명 키)로 만들었고, **수정 전 핸들러에서 첫 단언(본문만 → 200)이 실제로 401 `invalid_token`으로 실패하는 것을 확인**했습니다.
+- 정지된 realm이 모든 프로토콜 Endpoint를 거절하는 라우트 워커 테스트(빈 본문 POST userinfo는 realm 조회에서 먼저 끊겨 401 그대로)와 CSRF·API 키 라우트 테스트도 통과합니다.
+
+### Upgrade notes
+
+달라지는 곳은 UserInfo Endpoint 하나입니다: POST 본문의 `access_token`을 받고, 헤더와 본문에 둘 다 온 요청에는 401 대신 **400 `invalid_request`**로 답합니다. 헤더로만 보내던 RP는 전과 똑같이 동작하고, 응답 본문·저장되는 데이터·설정은 전과 같으며 **마이그레이션도 설정 변경도 없습니다.** 되돌릴 때 이전 이미지도 그대로 동작합니다 — 본문 방식 RP만 다시 401을 받게 됩니다.
+
 ## v0.9.86
 
 **로그인 화면이 "이쪽이 끝내지 못한 시도"를 틀린 비밀번호와 같은 붉은 줄로 보이고 있었습니다.** `POST /api/v1/auth/login`의 평범한 `500 internal_error`(저장소나 디렉터리가 답하지 않음)와 연결 실패(status 0 — 재시작 중이거나 호스트에 닿지 않음)는 이 서비스가 시도를 **끝내지 못한** 것입니다: 계정에는 아무것도 기록되지 않았고, 주소창의 request token도 소진되지 않았습니다. 그런데 화면은 이 둘을 틀린 비밀번호와 같은 붉은 줄 한 줄로 보였습니다 — "안 됐다"로만 읽히고 언제·어디서 다시 할지 말하지 않아, 검사된 적도 없는 비밀번호를 다시 치거나 RP로 돌아가 새 request token을 받아 와서는 같은 장애를 다시 만나게 했습니다. 500이 실어 보낸 Trace ID도 버리고 있었습니다: 가이드는 "계속되면 관리자에게 알리세요"라고 하는데, 전할 값이 없는 유일한 로그인 답이었습니다. v0.9.85가 두 500을 code로 갈라 놓았으니 이번에는 남은 쪽에 제 지시를 줍니다.
