@@ -736,6 +736,7 @@ func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 	// offered here (a token in the URL lands in every access log on the way).
 	// GET reads no body at all.
 	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := r.ParseForm(); err != nil {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid form body")
 			return

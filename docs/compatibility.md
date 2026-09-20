@@ -17,7 +17,7 @@
 | ID Token / JWT Access Token | RS256 구현 |
 | Refresh Token | 회전·재사용 탐지 구현 |
 | Client Credentials | Confidential Client 구현 |
-| UserInfo / JWKS | 구현. UserInfo는 GET·POST 모두 받으며, POST는 `Authorization` 헤더 대신 본문 `access_token`(RFC 6750 §2.2)도 받습니다. 헤더와 본문에 함께 오면(값이 같아도) 400 `invalid_request`입니다 — 토큰이 나쁜 것이 아니라 요청이 잘못된 것이므로 401 `invalid_token`으로 토큰을 버리게 하지 않습니다. 쿼리 파라미터(§2.3)는 받지 않습니다(토큰이 접근 로그에 남습니다) |
+| UserInfo / JWKS | 구현. UserInfo는 GET·POST 모두 받으며, POST는 `Authorization` 헤더 대신 본문 `access_token`(RFC 6750 §2.2)도 받습니다. 헤더와 본문에 함께 오면(값이 같아도) 400 `invalid_request`입니다 — 토큰이 나쁜 것이 아니라 요청이 잘못된 것이므로 401 `invalid_token`으로 토큰을 버리게 하지 않습니다. POST 폼 본문은 인코딩된 크기 1MiB까지 받으며 초과하면 400 `invalid_request`입니다. 쿼리 파라미터(§2.3)는 받지 않습니다(토큰이 접근 로그에 남습니다) |
 | Introspection / Revocation | 구현. Access Token은 같은 Realm의 모든 Confidential Client가 조회 가능 |
 | RP-Initiated Logout | 구현. `id_token_hint` 또는 `client_id`. `id_token_hint`는 만료된 ID Token도 받습니다(RP가 로그아웃 시점에 들고 있는 것이 보통 만료된 토큰입니다). Access Token은 hint가 아닙니다. 어느 쪽으로 지목하든 Client를 **조회하지 못하면** `post_logout_redirect_uri`는 쓰지 않습니다(등록 목록을 읽지 못한 목적지를 허용할 수는 없습니다). 로그아웃 자체는 그대로 수행하고 브라우저는 이 서비스의 페이지로 돌아오며, 그 이유는 `the client named at logout could not be looked up` 로그로만 드러납니다 |
 | Back-Channel Logout | 구현. Session 참여 Client에 서명된 `logout_token` 전송 |

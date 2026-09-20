@@ -9209,6 +9209,97 @@ func TestIntegrationUserInfoRefusesWhenRolesCannotBeRead(t *testing.T) {
 	}
 }
 
+func TestIntegrationUserInfoLimitsPostBody(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "body-poster", Name: "Body Poster", Type: "confidential",
+		RedirectURIs:  []string{"https://poster.example.test/cb"},
+		GrantTypes:    []string{"authorization_code"},
+		DefaultScopes: []string{"openid", "profile"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "body-holder", Password: "body-holder-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "body-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	issued, err := service.IssueUserTokens(ctx, realm, created.Client, user, session.Session.ID,
+		[]string{"openid", "profile"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	const limit = 1 << 20
+	for _, headerToken := range []bool{false, true} {
+		for _, chunked := range []bool{false, true} {
+			for _, size := range []int{limit, limit + 1} {
+				t.Run(fmt.Sprintf("header=%t/chunked=%t/bytes=%d", headerToken, chunked, size), func(t *testing.T) {
+					prefix := "padding="
+					if !headerToken {
+						prefix = "access_token=" + url.QueryEscape(issued.AccessToken) + "&padding="
+					}
+					body := prefix + strings.Repeat("x", size-len(prefix))
+					request, err := http.NewRequest(http.MethodPost,
+						server.URL+"/realms/master/protocol/openid-connect/userinfo", strings.NewReader(body))
+					if err != nil {
+						t.Fatal(err)
+					}
+					request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+					if headerToken {
+						request.Header.Set("Authorization", "Bearer "+issued.AccessToken)
+					}
+					if chunked {
+						request.ContentLength = -1
+						request.TransferEncoding = []string{"chunked"}
+					}
+					response, err := server.Client().Do(request)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer response.Body.Close()
+					var decoded map[string]any
+					if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+						t.Fatal(err)
+					}
+					if size > limit {
+						if response.StatusCode != http.StatusBadRequest || decoded["error"] != "invalid_request" {
+							t.Errorf("oversized form answered %d, error=%v; want 400 invalid_request", response.StatusCode, decoded["error"])
+						}
+						if got := response.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+							t.Errorf("Content-Type = %q, want application/json", got)
+						}
+						return
+					}
+					if response.StatusCode != http.StatusOK || decoded["sub"] != user.ID.String() || decoded["preferred_username"] != user.Username {
+						t.Errorf("limit-sized form answered %d; expected 200 and the issued token's user claims", response.StatusCode)
+					}
+				})
+			}
+		}
+	}
+}
+
 // POST userinfo is registered beside GET, but the token was read from the
 // Authorization header alone, so a relying party sending it in the form body —
 // the second of the three ways RFC 6750 allows, and the one some SDKs use — got
