@@ -199,19 +199,22 @@ scrape_configs:
 
 ## 개발 및 검증
 
-```bash
-make lint    # golangci-lint, govulncheck, ESLint
-make test    # go test -race, go vet, 프론트엔드 테스트와 빌드
-```
+저장소 루트에서 Docker를 실행할 수 있어야 하며, `go.mod`에 지정된 Go 도구 체인과 Node.js/npm(CI는 Node.js 22.23.0), Bash, Make, OpenSSL을 준비하세요. 프론트엔드 의존성은 Make가 설치하며, 린트 도구가 없으면 `make lint`가 출력하는 설치 안내를 따르세요.
 
-통합 테스트는 실제 PostgreSQL을 사용합니다. `RESSO_TEST_POSTGRES_DSN`이 없으면 건너뜁니다.
+통합 테스트에는 실제 PostgreSQL·LDAP·LDAPS가 필요합니다. CI의 `verify` 작업과 같은 준비 스크립트로 세 서비스를 기동하고 환경변수를 설정한 뒤, **같은 셸에서** 린트와 테스트를 실행하세요. 아래 명령은 준비에 실패하면 검증을 진행하지 않습니다.
 
 ```bash
-docker run -d --name resso-test-pg -e POSTGRES_USER=resso -e POSTGRES_PASSWORD=testpw \
-  -e POSTGRES_DB=resso -p 55432:5432 postgres:17-alpine
-docker exec resso-test-pg psql -U resso -d resso -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
-RESSO_TEST_POSTGRES_DSN='postgres://resso:testpw@127.0.0.1:55432/resso?sslmode=disable' go test -race ./...
+test_env="$(scripts/test-services.sh)" &&
+  eval "$test_env" &&
+  make lint &&
+  make test    # go test -race, go vet, 프론트엔드 테스트와 빌드
 ```
+
+스크립트는 기존 테스트 컨테이너를 재사용하고 실제 매핑된 포트로 접속 환경을 설정합니다. 환경변수가 빠지면 해당 연동 테스트는 `SKIP`이어도 성공 종료할 수 있습니다. `make test`의 SKIP 요약(`integration test(s) did not run`)을 확인하고, 통합 검증에서는 건너뛴 테스트가 없어야 합니다(0건이면 요약을 출력하지 않습니다). 자세한 내용은 [개발 중 디렉터리 연동 테스트](docs/user-federation.md#개발-중-디렉터리-연동-테스트)를 참고하세요.
+
+이전 README의 수동 절차로 `resso-test-pg`를 만들었다면 비밀번호가 달라 인증에 실패할 수 있습니다. **기존 테스트 데이터를 삭제해도 되는 경우에만** `scripts/test-services.sh --stop`으로 정리한 뒤 위 준비·검증 명령을 다시 실행하세요. 이 명령은 PostgreSQL·LDAP·LDAPS 테스트 컨테이너를 제거하고 테스트 인증서를 정리합니다. 검증 후 더 이상 필요 없을 때도 같은 명령으로 정리할 수 있습니다.
+
+기존 LDAPS 컨테이너에 별도 인증서 디렉터리를 사용했다면 `docker inspect resso-test-ldaps`의 `Mounts`에서 인증서 마운트 원본 경로를 확인하고, 준비와 정리 모두 같은 `RESSO_TEST_CERT_DIR`를 지정하세요. 인증서 검증을 끄지 마세요.
 
 실제 PostgreSQL과 실행 중인 ReSSO를 대상으로 OIDC, Refresh, UserInfo, 개인 API Key와 MCP까지 확인:
 
