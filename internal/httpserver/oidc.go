@@ -1087,6 +1087,10 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 		values = r.Form
 	}
 	var client *domain.Client
+	// Why the Client could not be resolved, kept until it is known whether a
+	// redirect was even asked for: a logout that named no target has nothing
+	// dropped and nothing to report.
+	clientReason := ""
 	if hint := values.Get("id_token_hint"); hint != "" {
 		// Enabled is tested in both branches. It was tested only in the one
 		// below, so naming a switched-off Client by client_id was refused
@@ -1099,22 +1103,54 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 		// client nil, which dropped post_logout_redirect_uri without a word and
 		// stranded the browser on this service's login page.
 		if verified, verifyErr := s.oidc.IDTokenHint(r.Context(), realm, hint); verifyErr == nil {
-			client = s.logoutClient(r, realm, verified.Extra.AuthorizedParty)
+			client, clientReason = s.logoutClient(r, realm, verified.Extra.AuthorizedParty)
+		} else {
+			// A hint this Realm's keys do not vouch for names nobody, which is
+			// the same position as an unknown client_id.
+			clientReason = logoutRedirectClientUnknown
 		}
 	} else if identifier := values.Get("client_id"); identifier != "" {
 		// RP-Initiated Logout 1.0 allows client_id in place of an
 		// id_token_hint. The redirect target is still checked against the
 		// client's registered list, so this cannot become an open redirect.
-		client = s.logoutClient(r, realm, identifier)
+		client, clientReason = s.logoutClient(r, realm, identifier)
+	} else {
+		clientReason = logoutRedirectClientNotNamed
 	}
-	redirectTo := ""
-	if requested := values.Get("post_logout_redirect_uri"); requested != "" && client != nil && store.PostLogoutURIAllowed(*client, requested) {
-		redirectTo = requested
+	// The three conditions that have to hold are spelled out rather than
+	// and-ed together, because which of them failed is the answer to the
+	// support question this endpoint produces: the logout worked, and the
+	// browser never came back to the relying party. Nothing is refused over
+	// it — the address is dropped exactly as before and the reason is written
+	// down instead.
+	redirectTo, droppedReason := "", ""
+	if requested := values.Get("post_logout_redirect_uri"); requested != "" {
+		switch {
+		case client == nil:
+			droppedReason = clientReason
+		case !store.PostLogoutURIAllowed(*client, requested):
+			droppedReason = logoutRedirectURINotRegistered
+		default:
+			redirectTo = requested
+		}
+	}
+	if droppedReason != "" {
+		// Warn rather than Error: a relying party naming an address it has not
+		// registered is its configuration, not this service failing, and the
+		// one reason here that is a failure — client_unavailable — already has
+		// its Error line from the lookup. The address itself is left out for
+		// the same reason it is left out of the trail.
+		s.logger.Warn("logout dropped the post-logout redirect it was asked for",
+			"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "reason", droppedReason,
+			"client_id", logoutClientID(client), "remote_ip", s.clientIP(r))
 	}
 	session, sessionErr := s.store.SessionByToken(r.Context(), sessionCookie(r))
 	switch {
 	case sessionErr == nil && session.Session.RealmID == realm.ID:
 		ended, detail := s.endSession(r, session.Session.ID)
+		if droppedReason != "" {
+			detail = noteDroppedLogoutRedirect(detail, droppedReason, logoutClientID(client))
+		}
 		s.audit(r, &realm.ID, &session.User.ID, session.User.Username, "LOGOUT",
 			partialIfNot(ended), "session", session.Session.ID.String(), detail)
 	case sessionErr != nil && !errors.Is(sessionErr, store.ErrNotFound):
@@ -1134,8 +1170,11 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 		// trail already being watched for result=PARTIAL finds this too.
 		s.logger.Error("logout could not read the session it was asked to end",
 			"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "error", sessionErr)
-		s.audit(r, &realm.ID, nil, "", "LOGOUT", "PARTIAL", "session", "",
-			map[string]any{"session_revoked": false, "error": "look the session up: " + sessionErr.Error()})
+		detail := map[string]any{"session_revoked": false, "error": "look the session up: " + sessionErr.Error()}
+		if droppedReason != "" {
+			detail = noteDroppedLogoutRedirect(detail, droppedReason, logoutClientID(client))
+		}
+		s.audit(r, &realm.ID, nil, "", "LOGOUT", "PARTIAL", "session", "", detail)
 	}
 	s.clearBrowserCookies(w, r)
 	if redirectTo != "" {
@@ -1155,9 +1194,34 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login?logged_out=1", http.StatusFound)
 }
 
+// The reasons a logout was handed a post_logout_redirect_uri and did not use
+// it. They are written to the audit entry and to one log line, and they are the
+// whole of what is written: which of these it was decides what an operator does
+// next, and the requested address itself is an unbounded string the caller
+// chose, which the trail stores and hands back out again.
+const (
+	// The request asked to be sent somewhere but named no Client at all —
+	// neither id_token_hint nor client_id. RP-Initiated Logout 1.0 requires
+	// one of them for exactly this reason: without it there is no registered
+	// list to check the address against.
+	logoutRedirectClientNotNamed = "client_not_named"
+	// A Client was named and there is no live one by that name: an unknown or
+	// switched-off client_id, or an id_token_hint this Realm's keys do not
+	// vouch for.
+	logoutRedirectClientUnknown = "client_unknown"
+	// The clients table did not answer. Unlike the two above this is this
+	// service's failure, not the relying party's configuration, and it is the
+	// one the Error line beside it belongs to.
+	logoutRedirectClientUnavailable = "client_unavailable"
+	// The Client is live and the address is not on its registered list.
+	// PostLogoutURIAllowed matches exactly, so a trailing slash or a changed
+	// port is this and not a lookup failure.
+	logoutRedirectURINotRegistered = "uri_not_registered"
+)
+
 // logoutClient resolves the Client whose registered list decides whether a
-// post-logout redirect target may be used, and reports nil when there is none
-// to be had.
+// post-logout redirect target may be used, and reports nil plus the reason code
+// to record when there is none to be had.
 //
 // A lookup that did not complete is not a Client that is absent, and both used
 // to be the same silent nil. Unlike the authorization endpoint this one cannot
@@ -1168,21 +1232,50 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 // answering looks the same as a relying party naming a target it does not own:
 // the browser is stranded on this service's page at the end of a logout that
 // otherwise worked.
-func (s *Server) logoutClient(r *http.Request, realm domain.Realm, identifier string) *domain.Client {
+func (s *Server) logoutClient(r *http.Request, realm domain.Realm, identifier string) (*domain.Client, string) {
 	found, err := s.store.ClientByIdentifier(r.Context(), realm.ID, identifier)
 	if err != nil {
 		if !errors.Is(err, store.ErrNotFound) {
 			s.logger.Error("the client named at logout could not be looked up",
 				"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "error", err)
+			return nil, logoutRedirectClientUnavailable
 		}
-		return nil
+		return nil, logoutRedirectClientUnknown
 	}
 	// A switched-off Client decides nothing, so its registered targets are not
 	// honoured either.
 	if !found.Enabled {
-		return nil
+		return nil, logoutRedirectClientUnknown
 	}
-	return &found
+	return &found, ""
+}
+
+// noteDroppedLogoutRedirect adds the reason a post-logout redirect was dropped
+// to an audit detail, making the map when there is none — endSession hands back
+// a nil one when the revocation went through, which is the ordinary case here.
+//
+// The Client is named only once it has been resolved, so what goes in is the
+// identifier this service stores rather than the string the caller sent.
+func noteDroppedLogoutRedirect(detail map[string]any, reason, clientID string) map[string]any {
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	detail["post_logout_redirect_uri"] = "dropped"
+	detail["reason"] = reason
+	if clientID != "" {
+		detail["client_id"] = clientID
+	}
+	return detail
+}
+
+// logoutClientID names a resolved Client and nothing otherwise. An identifier
+// that resolved to no Client is the caller's own string, which is why the
+// reason code carries that case instead.
+func logoutClientID(client *domain.Client) string {
+	if client == nil {
+		return ""
+	}
+	return client.ClientID
 }
 
 func bearerToken(r *http.Request) string {
