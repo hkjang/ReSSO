@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -6894,6 +6895,267 @@ func TestIntegrationLogoutTakesTheHintARelyingPartyActuallyHolds(t *testing.T) {
 	}
 	if where := logoutTo(tokens.AccessToken); strings.HasPrefix(where, "https://hint.test/bye") {
 		t.Error("an access token was accepted as an id_token_hint")
+	}
+}
+
+// lockedBuffer collects log lines while the server is still running. The
+// requests below finish before anything is read, but the race detector cannot
+// know that of a handler's own goroutines.
+type lockedBuffer struct {
+	mu   sync.Mutex
+	text strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.text.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.text.String()
+}
+
+// A logout that dropped post_logout_redirect_uri left no sign of having done
+// so. Three conditions have to hold for the address to be used — it has to be
+// asked for, a Client has to be resolved, and the address has to be on that
+// Client's registered list — and any of them failing produced the same logout:
+// 302 to this service's own login page, or 204, with a LOGOUT entry
+// indistinguishable from a logout that asked for nothing. The relying party's
+// operator sees people sign out and never come back, and the trail has nothing
+// to say about it.
+//
+// Measured before the change: the entries for every case below carried an
+// empty detail, so nothing separated an unknown client_id from an address that
+// was simply not registered — the two commonest relying-party mistakes — and
+// the log said nothing at all.
+//
+// The requested address stays out of the trail. It is an unbounded string the
+// caller chose, and the trail stores it and hands it back out; the reason code
+// and the Client identifier this service already stores are what an operator
+// acts on.
+func TestIntegrationLogoutSaysWhyItDroppedTheRedirect(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmID := bootstrap.RealmID
+	if err := data.EnsureActiveSigningKey(ctx, realmID); err != nil {
+		t.Fatal(err)
+	}
+	const registered = "https://bye.test/bye"
+	const elsewhere = "https://bye.test/elsewhere"
+	if _, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "bye-rp", Name: "Bye RP", Type: "confidential",
+		RedirectURIs:           []string{"https://bye.test/cb"},
+		PostLogoutRedirectURIs: []string{registered},
+		GrantTypes:             []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	off, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "off-rp", Name: "Off RP", Type: "confidential",
+		RedirectURIs:           []string{"https://bye.test/cb"},
+		PostLogoutRedirectURIs: []string{registered},
+		GrantTypes:             []string{"authorization_code"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.UpdateClient(ctx, off.Client.ID, store.UpdateClientInput{
+		Name: "Off RP", RedirectURIs: []string{"https://bye.test/cb"},
+		PostLogoutRedirectURIs: []string{registered},
+		GrantTypes:             []string{"authorization_code"}, DefaultScopes: []string{"openid"},
+		Enabled:                false,
+		AccessTokenTTLSeconds:  off.Client.AccessTokenTTLSeconds,
+		RefreshTokenTTLSeconds: off.Client.RefreshTokenTTLSeconds}); err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "leaving", Password: "leaving-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	noRedirect := server.Client()
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	endpoint := server.URL + "/realms/master/protocol/openid-connect/logout"
+	// Each case signs a browser in again: the logout before it ended the
+	// session, and without one there is no LOGOUT entry to read.
+	send := func(method string, params url.Values, withSession bool) (*http.Response, string) {
+		t.Helper()
+		var request *http.Request
+		var buildErr error
+		if method == http.MethodPost {
+			request, buildErr = http.NewRequest(method, endpoint, strings.NewReader(params.Encode()))
+			if buildErr == nil {
+				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			}
+		} else {
+			request, buildErr = http.NewRequest(method, endpoint+"?"+params.Encode(), nil)
+		}
+		if buildErr != nil {
+			t.Fatal(buildErr)
+		}
+		sessionID := ""
+		if withSession {
+			session, sessionErr := data.CreateSession(ctx, realmID, user.ID, time.Hour, "127.0.0.1", "bye-test", "password")
+			if sessionErr != nil {
+				t.Fatal(sessionErr)
+			}
+			sessionID = session.Session.ID.String()
+			request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		}
+		response, doErr := noRedirect.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response, sessionID
+	}
+	// The entry is found by the session it names, so a case cannot pass by
+	// reading the one the case before it wrote.
+	logoutEntry := func(sessionID string) (string, map[string]any, string) {
+		t.Helper()
+		page, auditErr := data.ListAudit(ctx, store.AuditFilter{EventType: "LOGOUT", Limit: 1})
+		if auditErr != nil {
+			t.Fatal(auditErr)
+		}
+		if len(page.Items) == 0 {
+			t.Fatal("the logout was not audited at all")
+		}
+		if page.Items[0].TargetID != sessionID {
+			t.Fatalf("the newest LOGOUT entry names session %q, want %q", page.Items[0].TargetID, sessionID)
+		}
+		var detail map[string]any
+		_ = json.Unmarshal(page.Items[0].Detail, &detail)
+		return page.Items[0].Result, detail, string(page.Items[0].Detail)
+	}
+
+	// A logout that used the address it was given answers exactly as before
+	// and adds nothing to its entry: there is nothing to explain.
+	response, sessionID := send(http.MethodGet, url.Values{
+		"client_id": {"bye-rp"}, "post_logout_redirect_uri": {registered}, "state": {"ok-1"}}, true)
+	if response.StatusCode != http.StatusFound || response.Header.Get("Location") != registered+"?state=ok-1" {
+		t.Fatalf("a registered post-logout address answered %d to %q; the cases below would prove nothing",
+			response.StatusCode, response.Header.Get("Location"))
+	}
+	if result, detail, _ := logoutEntry(sessionID); result != "SUCCESS" || len(detail) != 0 {
+		t.Errorf("a logout that redirected as asked audited as %s %v, want SUCCESS with nothing added", result, detail)
+	}
+	// Nor does a logout that asked for nothing.
+	response, sessionID = send(http.MethodPost, url.Values{}, true)
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("a POST logout with no parameters answered %d, want 204", response.StatusCode)
+	}
+	if result, detail, _ := logoutEntry(sessionID); result != "SUCCESS" || len(detail) != 0 {
+		t.Errorf("a logout that asked for no redirect audited as %s %v, want SUCCESS with nothing added", result, detail)
+	}
+
+	for _, dropped := range []struct {
+		what     string
+		method   string
+		params   url.Values
+		status   int
+		location string
+		reason   string
+		clientID string
+	}{
+		{what: "an unknown client_id", method: http.MethodGet,
+			params:   url.Values{"client_id": {"nobody-rp"}, "post_logout_redirect_uri": {registered}},
+			status:   http.StatusFound,
+			location: "/login?logged_out=1", reason: "client_unknown"},
+		{what: "a switched-off client_id", method: http.MethodGet,
+			params:   url.Values{"client_id": {"off-rp"}, "post_logout_redirect_uri": {registered}},
+			status:   http.StatusFound,
+			location: "/login?logged_out=1", reason: "client_unknown"},
+		{what: "an id_token_hint this realm did not sign", method: http.MethodGet,
+			params:   url.Values{"id_token_hint": {"not.a.token"}, "post_logout_redirect_uri": {registered}},
+			status:   http.StatusFound,
+			location: "/login?logged_out=1", reason: "client_unknown"},
+		{what: "neither id_token_hint nor client_id", method: http.MethodGet,
+			params:   url.Values{"post_logout_redirect_uri": {registered}},
+			status:   http.StatusFound,
+			location: "/login?logged_out=1", reason: "client_not_named"},
+		{what: "an address the client has not registered", method: http.MethodGet,
+			params:   url.Values{"client_id": {"bye-rp"}, "post_logout_redirect_uri": {elsewhere}},
+			status:   http.StatusFound,
+			location: "/login?logged_out=1", reason: "uri_not_registered", clientID: "bye-rp"},
+		{what: "an unregistered address over POST", method: http.MethodPost,
+			params: url.Values{"client_id": {"bye-rp"}, "post_logout_redirect_uri": {elsewhere}},
+			status: http.StatusNoContent, reason: "uri_not_registered", clientID: "bye-rp"},
+	} {
+		response, sessionID := send(dropped.method, dropped.params, true)
+		if response.StatusCode != dropped.status {
+			t.Errorf("%s answered %d, want %d: the address is dropped, not refused",
+				dropped.what, response.StatusCode, dropped.status)
+		}
+		if where := response.Header.Get("Location"); where != dropped.location {
+			t.Errorf("%s redirected to %q, want %q", dropped.what, where, dropped.location)
+		}
+		result, detail, raw := logoutEntry(sessionID)
+		if result != "SUCCESS" {
+			t.Errorf("%s audited as %s, want SUCCESS: the logout itself worked", dropped.what, result)
+		}
+		if detail["post_logout_redirect_uri"] != "dropped" || detail["reason"] != dropped.reason {
+			t.Errorf("%s audited %v, want the address marked dropped with reason %q",
+				dropped.what, detail, dropped.reason)
+		}
+		if clientID, _ := detail["client_id"].(string); clientID != dropped.clientID {
+			t.Errorf("%s named client_id %q in the trail, want %q", dropped.what, clientID, dropped.clientID)
+		}
+		// The address the caller sent is the one thing that must not be
+		// stored: the trail hands back what it keeps.
+		for _, sent := range dropped.params["post_logout_redirect_uri"] {
+			if strings.Contains(raw, sent) {
+				t.Errorf("%s put the requested address in the audit detail: %s", dropped.what, raw)
+			}
+		}
+	}
+
+	// A browser with no session cookie is the case the trail cannot cover:
+	// SessionByToken reports ErrNotFound, no entry is written, and the log
+	// line is the only place the dropped address is recorded.
+	before := logs.String()
+	response, _ = send(http.MethodGet, url.Values{
+		"client_id": {"bye-rp"}, "post_logout_redirect_uri": {elsewhere}}, false)
+	if response.StatusCode != http.StatusFound {
+		t.Errorf("a logout without a session answered %d, want 302", response.StatusCode)
+	}
+	written := strings.TrimPrefix(logs.String(), before)
+	if !strings.Contains(written, "uri_not_registered") || !strings.Contains(written, "bye-rp") {
+		t.Errorf("a logout that dropped its redirect with no session to audit logged:\n%s", written)
+	}
+	if strings.Contains(written, elsewhere) {
+		t.Errorf("the log repeated the requested address:\n%s", written)
+	}
+
+	// A clients table that stopped answering is the reason this distinction
+	// exists: it looks exactly like a relying party naming an address it does
+	// not own, and the two send an operator to different places.
+	if _, err := data.Pool.Exec(ctx, `ALTER TABLE clients RENAME TO clients_hidden`); err != nil {
+		t.Fatal(err)
+	}
+	response, sessionID = send(http.MethodGet, url.Values{
+		"client_id": {"bye-rp"}, "post_logout_redirect_uri": {registered}}, true)
+	if _, err := data.Pool.Exec(ctx, `ALTER TABLE clients_hidden RENAME TO clients`); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusFound || response.Header.Get("Location") != "/login?logged_out=1" {
+		t.Errorf("a logout that could not read the clients table answered %d to %q, want 302 to the login page",
+			response.StatusCode, response.Header.Get("Location"))
+	}
+	if _, detail, _ := logoutEntry(sessionID); detail["reason"] != "client_unavailable" {
+		t.Errorf("a logout that could not read the clients table audited %v, want reason client_unavailable: "+
+			"this one is this service's failure, not the relying party's configuration", detail)
 	}
 }
 
