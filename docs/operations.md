@@ -39,7 +39,7 @@ PostgreSQL에는 사용자, Client, Session, Refresh Token의 HMAC digest, 감�
 
 ### 로그아웃 뒤 RP로 돌아가지 못할 때
 
-"로그아웃은 되는데 애플리케이션으로 돌아오지 않고 로그인 화면(`/login?logged_out=1`)에 멈춘다"는 문의는 `post_logout_redirect_uri`가 쓰이지 않고 버려졌다는 뜻입니다. 로그아웃 자체는 정상 수행되므로(이 서비스는 이 상황에서 로그아웃을 거절하지 않습니다) 상태 코드로는 구분할 수 없습니다. 대신 해당 `LOGOUT` 감사 항목의 상세에 `post_logout_redirect_uri: dropped`와 `reason`이 붙고, 같은 내용이 서버 로그 `logout dropped the post-logout redirect it was asked for`(level `WARN`)에도 한 줄 남습니다 — 쿠키 세션이 없는 요청은 감사 항목 자체가 생기지 않으므로 그때는 이 로그가 유일한 기록입니다.
+"로그아웃은 되는데 애플리케이션으로 돌아오지 않고 로그인 화면(`/login?logged_out=1`)에 멈춘다"는 문의는 `post_logout_redirect_uri`가 쓰이지 않고 버려졌다는 뜻입니다. 로그아웃 자체는 정상 수행되므로(이 서비스는 이 상황에서 로그아웃을 거절하지 않습니다) 상태 코드로는 구분할 수 없습니다. 대신 해당 `LOGOUT` 감사 항목의 상세에 `post_logout_redirect_uri: dropped`와 `reason`이 붙고, 같은 내용이 서버 로그 `logout dropped the post-logout redirect it was asked for`(`reason`이 `form_unreadable`일 때는 `logout could not read the form it was posted, so anything the body asked for is lost`, 둘 다 level `WARN`이고 한 요청에 한 줄만 남습니다)에도 남습니다 — 쿠키 세션이 없는 요청은 감사 항목 자체가 생기지 않으므로 그때는 이 로그가 유일한 기록입니다.
 
 | `reason` | 뜻 | 할 일 |
 |---|---|---|
@@ -47,6 +47,7 @@ PostgreSQL에는 사용자, Client, Session, Refresh Token의 HMAC digest, 감�
 | `client_unknown` | 지정한 Client가 없거나 꺼져 있습니다(`id_token_hint`가 이 Realm의 키로 검증되지 않는 경우 포함) | 관리 → Client에서 `client_id`와 활성 여부를, hint를 쓴다면 토큰을 발급한 Realm을 확인하세요 |
 | `client_unavailable` | `clients` 조회가 실패했습니다 | RP 설정 문제가 아니라 이쪽 장애입니다. 위 표의 `the client named at logout could not be looked up` Error 로그와 데이터베이스를 확인하세요 |
 | `uri_not_registered` | Client는 찾았지만 요청한 주소가 등록 목록에 없습니다 | 감사 항목의 `client_id`로 관리 → Client → `post_logout_redirect_uris`를 열고 RP가 보내는 주소와 **문자 그대로** 비교하세요. 대조는 정확 일치라 후행 슬래시·포트·대소문자 차이도 불일치입니다 |
+| `form_unreadable` | POST 본문을 읽지 못했습니다(본문 1MiB 초과, 깨진 퍼센트 인코딩, 폼이 아닌 `Content-Type`). 본문에 실려 있던 `id_token_hint`·`client_id`·`post_logout_redirect_uri`·`state`가 통째로 사라진 것이라 `client_id`도 대개 붙지 않습니다 | RP 쪽에서 로그아웃 요청 본문의 크기(상한 1MiB)와 인코딩·`Content-Type: application/x-www-form-urlencoded`를 확인하세요. 어느 쪽이었는지는 서버 로그 `logout could not read the form it was posted…` 줄의 `error` 값에 있습니다. 쿼리스트링만으로 리다이렉트가 성립한 요청에는 이 `reason`이 붙지 않습니다 |
 
 요청된 주소 원문은 감사 상세에도 로그에도 남기지 않습니다(호출자가 임의로 정하는 값이라 트레일에 저장·재출력하지 않습니다). 비교할 값은 RP 쪽 설정에서 확인하세요.
 

@@ -1065,9 +1065,16 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
+	// Kept rather than discarded. A body that could not be read takes every
+	// parameter of an RP-initiated logout with it at once — id_token_hint,
+	// client_id, post_logout_redirect_uri and state are all in there — and what
+	// is left afterwards is indistinguishable from a logout that asked for
+	// nothing: the reasons below are all reached from a target having been
+	// named, and this is the case where the target itself went missing.
+	var formErr error
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		_ = r.ParseForm()
+		formErr = r.ParseForm()
 	}
 	realm, err := s.realmFromPath(r)
 	if err != nil {
@@ -1134,7 +1141,27 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 			redirectTo = requested
 		}
 	}
-	if droppedReason != "" {
+	// A body that did not parse outranks whatever the four above concluded,
+	// because they concluded it from half a request: the query survived and the
+	// body did not, so an address read out of the query may not be the one that
+	// was sent, and telling an operator the address is unregistered when this
+	// service could not read the request sends them after a relying party that
+	// may have done nothing wrong. A redirect that did come together is left
+	// alone — there the query carried everything needed and the unreadable body
+	// cost the caller nothing worth reporting.
+	if formErr != nil && redirectTo == "" {
+		droppedReason = logoutRedirectFormUnreadable
+	}
+	switch {
+	case droppedReason == logoutRedirectFormUnreadable:
+		// The only reason recorded without knowing an address was asked for,
+		// and the only one carrying the underlying error: which of the three
+		// ways a body fails it was is not something the reason code can say,
+		// and it is what an operator needs to take to the relying party.
+		s.logger.Warn("logout could not read the form it was posted, so anything the body asked for is lost",
+			"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "reason", droppedReason,
+			"client_id", logoutClientID(client), "remote_ip", s.clientIP(r), "error", formErr)
+	case droppedReason != "":
 		// Warn rather than Error: a relying party naming an address it has not
 		// registered is its configuration, not this service failing, and the
 		// one reason here that is a failure — client_unavailable — already has
@@ -1217,6 +1244,15 @@ const (
 	// PostLogoutURIAllowed matches exactly, so a trailing slash or a changed
 	// port is this and not a lookup failure.
 	logoutRedirectURINotRegistered = "uri_not_registered"
+	// The POST body did not parse — over the 1MiB this endpoint reads, a broken
+	// percent-escape, a Content-Type that is not a form — so the parameters it
+	// carried are gone. This is the one reason recorded without an address
+	// having been asked for, because with the body unread the two cannot be
+	// told apart: a logout that named no target and a logout whose target was
+	// in the part that was lost look the same from here. Recording it only when
+	// a redirect did not come together keeps that from being said of a request
+	// whose query carried everything anyway.
+	logoutRedirectFormUnreadable = "form_unreadable"
 )
 
 // logoutClient resolves the Client whose registered list decides whether a
