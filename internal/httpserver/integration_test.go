@@ -7212,7 +7212,7 @@ func TestIntegrationLogoutRecordsAFormItCouldNotRead(t *testing.T) {
 	// is under test is a body those cannot produce. Each case signs a browser
 	// in again: the logout before it ended the session, and without one there
 	// is no LOGOUT entry to read.
-	post := func(query, body string) (*http.Response, string) {
+	postAs := func(contentType, query, body string) (*http.Response, string) {
 		t.Helper()
 		target := endpoint
 		if query != "" {
@@ -7222,7 +7222,7 @@ func TestIntegrationLogoutRecordsAFormItCouldNotRead(t *testing.T) {
 		if buildErr != nil {
 			t.Fatal(buildErr)
 		}
-		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.Header.Set("Content-Type", contentType)
 		session, sessionErr := data.CreateSession(ctx, realmID, user.ID, time.Hour, "127.0.0.1", "torn-test", "password")
 		if sessionErr != nil {
 			t.Fatal(sessionErr)
@@ -7235,6 +7235,10 @@ func TestIntegrationLogoutRecordsAFormItCouldNotRead(t *testing.T) {
 		_, _ = io.Copy(io.Discard, response.Body)
 		_ = response.Body.Close()
 		return response, session.Session.ID.String()
+	}
+	post := func(query, body string) (*http.Response, string) {
+		t.Helper()
+		return postAs("application/x-www-form-urlencoded", query, body)
 	}
 	logoutDetail := func(sessionID string) map[string]any {
 		t.Helper()
@@ -7319,6 +7323,67 @@ func TestIntegrationLogoutRecordsAFormItCouldNotRead(t *testing.T) {
 	if detail := logoutDetail(sessionID); len(detail) != 0 {
 		t.Errorf("a POST that redirected from its query audited %v, want nothing added: "+
 			"the unreadable body cost it nothing", detail)
+	}
+
+	// ParseForm returns one error for two parses it does not keep apart — the
+	// body and the URL query — and it also errors on a Content-Type whose
+	// media parameters are malformed while reading that body in full. Taking
+	// its error as the body's replaced a correctly decided uri_not_registered
+	// with form_unreadable, and sent an operator to look at the size and
+	// encoding of a body that had arrived intact. Both cases name a live
+	// client_id and an unregistered address in the body, so the reason below
+	// can only be reached by having read that body.
+	const unregistered = "https://torn.test/somewhere-else"
+	intactBody := url.Values{"client_id": {"torn-rp"}, "post_logout_redirect_uri": {unregistered}}.Encode()
+	for _, intact := range []struct {
+		what        string
+		contentType string
+		query       string
+	}{
+		// A broken percent-escape in the query of a POST. The body is a
+		// separate parse and survived it whole.
+		{what: "a POST whose query has a broken percent-escape",
+			contentType: "application/x-www-form-urlencoded", query: "ui_locales=100%"},
+		// Malformed media parameters: mime.ParseMediaType rejects the
+		// unterminated quoted string but still returns the base type, so the
+		// body is read and parsed exactly as a form.
+		{what: "a POST whose Content-Type has a malformed media parameter",
+			contentType: `application/x-www-form-urlencoded; charset="UTF-8`},
+	} {
+		before := logs.String()
+		response, sessionID := postAs(intact.contentType, intact.query, intactBody)
+		if response.StatusCode != http.StatusNoContent {
+			t.Errorf("%s answered %d, want 204", intact.what, response.StatusCode)
+		}
+		detail := logoutDetail(sessionID)
+		if detail["post_logout_redirect_uri"] != "dropped" || detail["reason"] != "uri_not_registered" {
+			t.Errorf("%s audited %v, want reason uri_not_registered: its body arrived whole, "+
+				"and the address in it is the one not on the registered list", intact.what, detail)
+		}
+		if written := strings.TrimPrefix(logs.String(), before); strings.Contains(written, "form_unreadable") {
+			t.Errorf("%s was logged as a body this service could not read:\n%s", intact.what, written)
+		}
+	}
+
+	// The gap this reason does not close, pinned so it is not mistaken for one
+	// that is covered: a body that is not a form is never read by net/http and
+	// produces no error, so the parameters are gone and the request cannot be
+	// told apart from a logout that asked for nothing. Calling that
+	// form_unreadable would be a guess, and docs/operations.md says instead
+	// that no reason is recorded at all. If this ever starts recording one,
+	// that entry has to change with it.
+	before := logs.String()
+	response, sessionID = postAs("application/json", "",
+		`{"client_id":"torn-rp","post_logout_redirect_uri":"`+unregistered+`"}`)
+	if response.StatusCode != http.StatusNoContent {
+		t.Errorf("a logout posted as JSON answered %d, want 204", response.StatusCode)
+	}
+	if detail := logoutDetail(sessionID); len(detail) != 0 {
+		t.Errorf("a logout posted as JSON audited %v, want nothing: the parameters were never read, "+
+			"and docs/operations.md tells operators no reason is recorded for this", detail)
+	}
+	if written := strings.TrimPrefix(logs.String(), before); strings.Contains(written, "reason=") {
+		t.Errorf("a logout posted as JSON recorded a reason for a body nothing here ever read:\n%s", written)
 	}
 }
 

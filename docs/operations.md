@@ -47,9 +47,11 @@ PostgreSQL에는 사용자, Client, Session, Refresh Token의 HMAC digest, 감�
 | `client_unknown` | 지정한 Client가 없거나 꺼져 있습니다(`id_token_hint`가 이 Realm의 키로 검증되지 않는 경우 포함) | 관리 → Client에서 `client_id`와 활성 여부를, hint를 쓴다면 토큰을 발급한 Realm을 확인하세요 |
 | `client_unavailable` | `clients` 조회가 실패했습니다 | RP 설정 문제가 아니라 이쪽 장애입니다. 위 표의 `the client named at logout could not be looked up` Error 로그와 데이터베이스를 확인하세요 |
 | `uri_not_registered` | Client는 찾았지만 요청한 주소가 등록 목록에 없습니다 | 감사 항목의 `client_id`로 관리 → Client → `post_logout_redirect_uris`를 열고 RP가 보내는 주소와 **문자 그대로** 비교하세요. 대조는 정확 일치라 후행 슬래시·포트·대소문자 차이도 불일치입니다 |
-| `form_unreadable` | POST 본문을 읽지 못했습니다(본문 1MiB 초과, 깨진 퍼센트 인코딩, 폼이 아닌 `Content-Type`). 본문에 실려 있던 `id_token_hint`·`client_id`·`post_logout_redirect_uri`·`state`가 통째로 사라진 것이라 `client_id`도 대개 붙지 않습니다 | RP 쪽에서 로그아웃 요청 본문의 크기(상한 1MiB)와 인코딩·`Content-Type: application/x-www-form-urlencoded`를 확인하세요. 어느 쪽이었는지는 서버 로그 `logout could not read the form it was posted…` 줄의 `error` 값에 있습니다. 쿼리스트링만으로 리다이렉트가 성립한 요청에는 이 `reason`이 붙지 않습니다 |
+| `form_unreadable` | POST 본문을 읽지 못했습니다(본문 1MiB 초과, 본문의 깨진 퍼센트 인코딩, 읽다 끊긴 본문). 본문에 실려 있던 `id_token_hint`·`client_id`·`post_logout_redirect_uri`·`state`가 통째로 사라진 것이라 `client_id`도 대개 붙지 않습니다 | RP 쪽에서 로그아웃 요청 **본문**의 크기(상한 1MiB)와 퍼센트 인코딩을 확인하세요. 어느 쪽이었는지는 서버 로그 `logout could not read the form it was posted…` 줄의 `error` 값에 있습니다. 쿼리스트링만으로 리다이렉트가 성립한 요청에는 이 `reason`이 붙지 않습니다 |
 
 요청된 주소 원문은 감사 상세에도 로그에도 남기지 않습니다(호출자가 임의로 정하는 값이라 트레일에 저장·재출력하지 않습니다). 비교할 값은 RP 쪽 설정에서 확인하세요.
+
+이 표가 **덮지 않는** 경우가 하나 있습니다. 로그아웃 POST의 `Content-Type`이 폼이 아니면(`application/json`, `multipart/form-data`, `text/plain`, 헤더 누락) 본문은 애초에 읽히지 않고 오류도 나지 않습니다 — 파라미터만 조용히 사라지고, 요청은 "아무것도 요청하지 않은 로그아웃"과 구별되지 않아 `reason`이 **전혀 남지 않습니다**(`form_unreadable`도 아닙니다). RP가 `post_logout_redirect_uri`를 분명히 보냈다는데 감사 항목에도 로그에도 아무 흔적이 없다면 먼저 RP가 `Content-Type: application/x-www-form-urlencoded`로 보내고 있는지 확인하세요. 쿼리스트링과 `Content-Type`은 `form_unreadable` 판정에 영향을 주지 않습니다.
 
 ## Health Check
 
