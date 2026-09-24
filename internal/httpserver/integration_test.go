@@ -7159,6 +7159,234 @@ func TestIntegrationLogoutSaysWhyItDroppedTheRedirect(t *testing.T) {
 	}
 }
 
+// A POST logout whose body could not be read lost every parameter the relying
+// party sent — id_token_hint, client_id, post_logout_redirect_uri and state are
+// all in that body — and then went on as though none had been sent. The reason
+// codes the case above writes are all reached from `requested != ""`, so this
+// one fell through every one of them: the address was not dropped, it was never
+// seen.
+//
+// Measured before the change: a POST over the 1MiB limit and a POST with a
+// broken percent-escape both answered 204 with an empty LOGOUT detail and not a
+// word in the log, which is byte for byte what a logout that asked for no
+// redirect looks like. The relying party's operator sees people sign out and
+// stay on this service's page, and there is nowhere to look.
+//
+// The form error's own text goes to the log line only. The audit detail carries
+// the reason code and nothing else, for the same reason the requested address
+// stays out of it.
+func TestIntegrationLogoutRecordsAFormItCouldNotRead(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmID := bootstrap.RealmID
+	if err := data.EnsureActiveSigningKey(ctx, realmID); err != nil {
+		t.Fatal(err)
+	}
+	const registered = "https://torn.test/bye"
+	if _, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "torn-rp", Name: "Torn RP", Type: "confidential",
+		RedirectURIs:           []string{"https://torn.test/cb"},
+		PostLogoutRedirectURIs: []string{registered},
+		GrantTypes:             []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "torn", Password: "torn-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+	noRedirect := server.Client()
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	endpoint := server.URL + "/realms/master/protocol/openid-connect/logout"
+	// The body is sent verbatim rather than through url.Values, because what
+	// is under test is a body those cannot produce. Each case signs a browser
+	// in again: the logout before it ended the session, and without one there
+	// is no LOGOUT entry to read.
+	postAs := func(contentType, query, body string) (*http.Response, string) {
+		t.Helper()
+		target := endpoint
+		if query != "" {
+			target += "?" + query
+		}
+		request, buildErr := http.NewRequest(http.MethodPost, target, strings.NewReader(body))
+		if buildErr != nil {
+			t.Fatal(buildErr)
+		}
+		request.Header.Set("Content-Type", contentType)
+		session, sessionErr := data.CreateSession(ctx, realmID, user.ID, time.Hour, "127.0.0.1", "torn-test", "password")
+		if sessionErr != nil {
+			t.Fatal(sessionErr)
+		}
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		response, doErr := noRedirect.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response, session.Session.ID.String()
+	}
+	post := func(query, body string) (*http.Response, string) {
+		t.Helper()
+		return postAs("application/x-www-form-urlencoded", query, body)
+	}
+	logoutDetail := func(sessionID string) map[string]any {
+		t.Helper()
+		page, auditErr := data.ListAudit(ctx, store.AuditFilter{EventType: "LOGOUT", Limit: 1})
+		if auditErr != nil {
+			t.Fatal(auditErr)
+		}
+		if len(page.Items) == 0 {
+			t.Fatal("the logout was not audited at all")
+		}
+		if page.Items[0].TargetID != sessionID {
+			t.Fatalf("the newest LOGOUT entry names session %q, want %q", page.Items[0].TargetID, sessionID)
+		}
+		var detail map[string]any
+		_ = json.Unmarshal(page.Items[0].Detail, &detail)
+		return detail
+	}
+
+	// A body this handler can read still answers exactly as before, so the
+	// cases below cannot pass on a handler that stopped redirecting at all.
+	response, sessionID := post("", url.Values{
+		"client_id": {"torn-rp"}, "post_logout_redirect_uri": {registered}, "state": {"ok-1"}}.Encode())
+	if response.StatusCode != http.StatusFound || response.Header.Get("Location") != registered+"?state=ok-1" {
+		t.Fatalf("a readable POST form answered %d to %q; the cases below would prove nothing",
+			response.StatusCode, response.Header.Get("Location"))
+	}
+	if detail := logoutDetail(sessionID); len(detail) != 0 {
+		t.Errorf("a logout that redirected as asked audited %v, want nothing added", detail)
+	}
+
+	for _, unreadable := range []struct {
+		what string
+		body string
+	}{
+		// Over the 1MiB limit the handler puts on this body: the read fails
+		// part way and nothing at all is parsed.
+		{what: "a body over the 1MiB limit", body: "state=" + strings.Repeat("a", 1<<20)},
+		// A broken percent-escape: the pair it appears in is skipped, so the
+		// address is missing exactly as though it had not been sent.
+		{what: "a body with a broken percent-escape",
+			body: "client_id=torn-rp&post_logout_redirect_uri=%zz"},
+	} {
+		before := logs.String()
+		response, sessionID := post("", unreadable.body)
+		// Not refused: this endpoint ends the session whatever else went
+		// wrong, and the answer is the ordinary POST one.
+		if response.StatusCode != http.StatusNoContent {
+			t.Errorf("%s answered %d, want 204: the form is recorded, not refused",
+				unreadable.what, response.StatusCode)
+		}
+		detail := logoutDetail(sessionID)
+		if detail["post_logout_redirect_uri"] != "dropped" || detail["reason"] != "form_unreadable" {
+			t.Errorf("%s audited %v, want the address marked dropped with reason form_unreadable",
+				unreadable.what, detail)
+		}
+		// The form error's text belongs to the log line, not to the trail.
+		if _, ok := detail["error"]; ok {
+			t.Errorf("%s put the form error in the audit detail: %v", unreadable.what, detail)
+		}
+		written := strings.TrimPrefix(logs.String(), before)
+		if !strings.Contains(written, "form_unreadable") {
+			t.Errorf("%s logged nothing about the form it could not read:\n%s", unreadable.what, written)
+		}
+		// One request, one line: the reason is recorded once, not by every
+		// branch that noticed it.
+		if count := strings.Count(written, "form_unreadable"); count != 1 {
+			t.Errorf("%s logged the reason %d times, want 1:\n%s", unreadable.what, count, written)
+		}
+	}
+
+	// ParseForm fills r.Form from the URL query even when the body failed, so
+	// a request that named everything in its query is still a redirect this
+	// handler can stand behind — and claiming form_unreadable there would send
+	// an operator after a relying party that did nothing wrong.
+	response, sessionID = post(url.Values{
+		"client_id": {"torn-rp"}, "post_logout_redirect_uri": {registered}, "state": {"ok-2"}}.Encode(),
+		"post_logout_redirect_uri=%zz")
+	if response.StatusCode != http.StatusFound || response.Header.Get("Location") != registered+"?state=ok-2" {
+		t.Errorf("a POST whose query named a registered address answered %d to %q, want 302 to that address",
+			response.StatusCode, response.Header.Get("Location"))
+	}
+	if detail := logoutDetail(sessionID); len(detail) != 0 {
+		t.Errorf("a POST that redirected from its query audited %v, want nothing added: "+
+			"the unreadable body cost it nothing", detail)
+	}
+
+	// ParseForm returns one error for two parses it does not keep apart — the
+	// body and the URL query — and it also errors on a Content-Type whose
+	// media parameters are malformed while reading that body in full. Taking
+	// its error as the body's replaced a correctly decided uri_not_registered
+	// with form_unreadable, and sent an operator to look at the size and
+	// encoding of a body that had arrived intact. Both cases name a live
+	// client_id and an unregistered address in the body, so the reason below
+	// can only be reached by having read that body.
+	const unregistered = "https://torn.test/somewhere-else"
+	intactBody := url.Values{"client_id": {"torn-rp"}, "post_logout_redirect_uri": {unregistered}}.Encode()
+	for _, intact := range []struct {
+		what        string
+		contentType string
+		query       string
+	}{
+		// A broken percent-escape in the query of a POST. The body is a
+		// separate parse and survived it whole.
+		{what: "a POST whose query has a broken percent-escape",
+			contentType: "application/x-www-form-urlencoded", query: "ui_locales=100%"},
+		// Malformed media parameters: mime.ParseMediaType rejects the
+		// unterminated quoted string but still returns the base type, so the
+		// body is read and parsed exactly as a form.
+		{what: "a POST whose Content-Type has a malformed media parameter",
+			contentType: `application/x-www-form-urlencoded; charset="UTF-8`},
+	} {
+		before := logs.String()
+		response, sessionID := postAs(intact.contentType, intact.query, intactBody)
+		if response.StatusCode != http.StatusNoContent {
+			t.Errorf("%s answered %d, want 204", intact.what, response.StatusCode)
+		}
+		detail := logoutDetail(sessionID)
+		if detail["post_logout_redirect_uri"] != "dropped" || detail["reason"] != "uri_not_registered" {
+			t.Errorf("%s audited %v, want reason uri_not_registered: its body arrived whole, "+
+				"and the address in it is the one not on the registered list", intact.what, detail)
+		}
+		if written := strings.TrimPrefix(logs.String(), before); strings.Contains(written, "form_unreadable") {
+			t.Errorf("%s was logged as a body this service could not read:\n%s", intact.what, written)
+		}
+	}
+
+	// The gap this reason does not close, pinned so it is not mistaken for one
+	// that is covered: a body that is not a form is never read by net/http and
+	// produces no error, so the parameters are gone and the request cannot be
+	// told apart from a logout that asked for nothing. Calling that
+	// form_unreadable would be a guess, and docs/operations.md says instead
+	// that no reason is recorded at all. If this ever starts recording one,
+	// that entry has to change with it.
+	before := logs.String()
+	response, sessionID = postAs("application/json", "",
+		`{"client_id":"torn-rp","post_logout_redirect_uri":"`+unregistered+`"}`)
+	if response.StatusCode != http.StatusNoContent {
+		t.Errorf("a logout posted as JSON answered %d, want 204", response.StatusCode)
+	}
+	if detail := logoutDetail(sessionID); len(detail) != 0 {
+		t.Errorf("a logout posted as JSON audited %v, want nothing: the parameters were never read, "+
+			"and docs/operations.md tells operators no reason is recorded for this", detail)
+	}
+	if written := strings.TrimPrefix(logs.String(), before); strings.Contains(written, "reason=") {
+		t.Errorf("a logout posted as JSON recorded a reason for a body nothing here ever read:\n%s", written)
+	}
+}
+
 // A refresh token presented after it was rotated is the strongest sign this
 // service has that one was taken, and revoking the family is the whole of the
 // response: it takes the working token away from whoever is holding it. The

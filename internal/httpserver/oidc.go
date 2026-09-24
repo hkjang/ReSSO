@@ -3,7 +3,9 @@ package httpserver
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"math"
+	"mime"
 	"net/http"
 	"net/url"
 	"slices"
@@ -1064,9 +1066,88 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// readLogoutPostForm reads the POST body an RP-initiated logout carries its
+// parameters in, and reports the error that lost them — that error and no
+// other.
+//
+// net/http's ParseForm cannot be asked that question, and asking it anyway
+// produced a non-nil error twice over a body this service had read in full.
+// ParseForm parses the URL query as well as the body and folds the two into one
+// error, so `POST …/logout?ui_locales=100%` comes back as `invalid URL escape
+// "%"` with every body parameter sitting in r.Form. And mime.ParseMediaType
+// rejects a Content-Type whose parameters are malformed —
+// `application/x-www-form-urlencoded; charset="UTF-8` — while still returning
+// the base type, so net/http reads and parses that body and hands the media
+// error back beside it. Either one turned a correctly decided
+// uri_not_registered into form_unreadable and told an operator to go looking at
+// the body of a request whose body was fine.
+//
+// The caller passes the result to ParseForm as r.PostForm, which is what makes
+// ParseForm skip its own read and do only the merge with the query.
+//
+// What this deliberately does not report is the other half of the same problem.
+// A body sent as application/json, as multipart/form-data, as text/plain, or
+// with no Content-Type at all is not read by net/http and produces no error
+// either: the parameters are gone and the request is indistinguishable from a
+// logout that asked for nothing. Inventing a reason for it here would mean this
+// endpoint deciding which Content-Types a relying party may use, which is a
+// refusal, and this file refuses no logout. It is left uncovered, and said so
+// beside logoutRedirectFormUnreadable rather than claimed as handled.
+func readLogoutPostForm(r *http.Request) (url.Values, error) {
+	if r.Body == nil {
+		return url.Values{}, nil
+	}
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		// RFC 7231 3.1.1.5 — an absent type may be read as octet-stream, and
+		// that is what net/http compares against, so there is no form either
+		// way. Spelled out rather than left to the comparison below, because
+		// the empty string is the one value that would otherwise have to be
+		// reasoned about twice.
+		contentType = "application/octet-stream"
+	}
+	// The error is dropped on purpose: ParseMediaType still returns the base
+	// type when only the parameters are malformed, and the base type is the
+	// whole of what decides whether there is a form here to read.
+	mediaType, _, _ := mime.ParseMediaType(contentType)
+	if mediaType != "application/x-www-form-urlencoded" {
+		return url.Values{}, nil
+	}
+	// r.Body is the MaxBytesReader the caller installed, so a body over the
+	// limit ends this read with its error instead of being quietly truncated.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return url.Values{}, err
+	}
+	// ParseQuery returns what it managed to read alongside the error, and that
+	// prefix is kept: a broken escape late in the body still leaves the
+	// parameters before it usable, exactly as net/http would have left them.
+	values, err := url.ParseQuery(string(body))
+	if values == nil {
+		values = url.Values{}
+	}
+	return values, err
+}
+
 func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
+	// Kept rather than discarded. A body that could not be read takes every
+	// parameter of an RP-initiated logout with it at once — id_token_hint,
+	// client_id, post_logout_redirect_uri and state are all in there — and what
+	// is left afterwards is indistinguishable from a logout that asked for
+	// nothing: the reasons below are all reached from a target having been
+	// named, and this is the case where the target itself went missing.
+	var formErr error
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		// Read by readLogoutPostForm rather than by ParseForm, so that formErr
+		// is the body's alone — ParseForm has two ways of reporting an error
+		// over a body it read in full, and both of them used to replace a
+		// reason the checks below had already decided correctly. Setting
+		// r.PostForm first is what makes ParseForm skip its own read: what is
+		// left of it is the merge with the URL query that r.Form is, and the
+		// error it returns from that can only be the query's, which says
+		// nothing about what the body carried.
+		r.PostForm, formErr = readLogoutPostForm(r)
 		_ = r.ParseForm()
 	}
 	realm, err := s.realmFromPath(r)
@@ -1134,7 +1215,30 @@ func (s *Server) oidcLogout(w http.ResponseWriter, r *http.Request) {
 			redirectTo = requested
 		}
 	}
-	if droppedReason != "" {
+	// A body that did not parse outranks whatever the four above concluded,
+	// because they concluded it from half a request. formErr is the body's own
+	// error and nothing else — readLogoutPostForm exists to keep it that way —
+	// so reaching here means the query survived and the body did not, and an
+	// address read out of what is left may not be the one that was sent.
+	// Telling an operator the address is unregistered when this service could
+	// not read the request sends them after a relying party that may have done
+	// nothing wrong. A redirect that did come together is left alone — there
+	// the query carried everything needed and the unreadable body cost the
+	// caller nothing worth reporting.
+	if formErr != nil && redirectTo == "" {
+		droppedReason = logoutRedirectFormUnreadable
+	}
+	switch {
+	case droppedReason == logoutRedirectFormUnreadable:
+		// The only reason recorded without knowing an address was asked for,
+		// and the only one carrying the underlying error: whether the body went
+		// over the 1MiB limit, broke on a percent-escape, or stopped arriving
+		// part way is not something the reason code can say, and it is what an
+		// operator needs to take to the relying party.
+		s.logger.Warn("logout could not read the form it was posted, so anything the body asked for is lost",
+			"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "reason", droppedReason,
+			"client_id", logoutClientID(client), "remote_ip", s.clientIP(r), "error", formErr)
+	case droppedReason != "":
 		// Warn rather than Error: a relying party naming an address it has not
 		// registered is its configuration, not this service failing, and the
 		// one reason here that is a failure — client_unavailable — already has
@@ -1217,6 +1321,22 @@ const (
 	// PostLogoutURIAllowed matches exactly, so a trailing slash or a changed
 	// port is this and not a lookup failure.
 	logoutRedirectURINotRegistered = "uri_not_registered"
+	// The POST body did not parse — over the 1MiB this endpoint reads, a broken
+	// percent-escape, a read that stopped part way — so the parameters it
+	// carried are gone. This is the one reason recorded without an address
+	// having been asked for, because with the body unread the two cannot be
+	// told apart: a logout that named no target and a logout whose target was
+	// in the part that was lost look the same from here. Recording it only when
+	// a redirect did not come together keeps that from being said of a request
+	// whose query carried everything anyway.
+	//
+	// It is not recorded for a body that was never read as a form at all —
+	// application/json, multipart/form-data, text/plain, no Content-Type.
+	// net/http reports no error for those and neither does readLogoutPostForm,
+	// so the parameters vanish with nothing to record and the request arrives
+	// here looking like a logout that asked for nothing. That gap is real and
+	// still open; it is not what this reason means.
+	logoutRedirectFormUnreadable = "form_unreadable"
 )
 
 // logoutClient resolves the Client whose registered list decides whether a
