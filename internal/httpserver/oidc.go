@@ -427,6 +427,27 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	}
 	realm, err := s.realmFromPath(r)
 	if err != nil {
+		// The same argument the signing-key branch below makes, one check
+		// earlier: invalid_grant is read as "the code or refresh token you hold
+		// is spent", and the ordinary response is to discard it and send the
+		// person through login again. A realms table this server cannot read is
+		// not that — the grant was never looked at — so answering invalid_grant
+		// would throw away every session that the end of the outage could have
+		// kept. The fault is reported through the same realmLookupFailed as the
+		// other endpoints on this route, which is what puts endpoint=token in
+		// the log; until now this was the one caller that did not.
+		//
+		// No metric is added. resso_token_errors_total's only label is
+		// grant_type, and the form has not been read for one yet, so there is no
+		// honest value to count this under; the 500 is already visible in
+		// resso_http_requests_total{route,status}.
+		if s.realmLookupFailed(r, "token", err) {
+			writeOAuthError(w, http.StatusInternalServerError, "server_error",
+				"the realm could not be read; the token is still valid, retry after a short delay")
+			return
+		}
+		// A Realm that is genuinely absent or switched off keeps the answer it
+		// has always had, which deliberately does not distinguish the two.
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "realm is unavailable")
 		return
 	}
