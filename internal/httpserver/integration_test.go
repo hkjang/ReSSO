@@ -946,6 +946,171 @@ func TestIntegrationTokenEndpointDoesNotBlameTheGrantForAMissingSigningKey(t *te
 	}
 }
 
+// The Token endpoint already refuses to blame the grant for a missing signing
+// key (above), but one check sat in front of that one: the Realm lookup. A
+// realms table that cannot be read answered 400 invalid_grant "realm is
+// unavailable" — the same answer as a Realm that does not exist — and the
+// standard response to invalid_grant is to discard the code or refresh token
+// and send the person back through login, so an outage that ends took every
+// session with it. It also left no line in the log: token was the only
+// realmFromPath caller that did not report the fault through
+// realmLookupFailed, so there was no endpoint=token to find.
+//
+// What must not change is the answer for a Realm that is genuinely absent or
+// switched off. Both reach this handler as store.ErrNotFound, and this service
+// deliberately does not let the endpoint be used to ask what exists.
+func TestIntegrationTokenSaysWhenItCouldNotReadTheRealm(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmID := bootstrap.RealmID
+	if err := data.EnsureActiveSigningKey(ctx, realmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "outage-rp", Name: "Outage RP", Type: "public", RedirectURIs: []string{"https://outage.test/cb"},
+		GrantTypes: []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "outage-user", Password: "outage-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realmID, user.ID, time.Hour, "127.0.0.1", "outage-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The production issuance path, so the refresh token below is the real
+	// thing a relying party would be holding when the outage starts. Every
+	// lookup this needs happens before the table is taken away.
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, rp.Client, user, session.Session.ID,
+		[]string{"openid"}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	exchange := func(realmName, token string) (int, string) {
+		t.Helper()
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/"+realmName+"/protocol/openid-connect/token",
+			url.Values{"grant_type": {"refresh_token"}, "refresh_token": {token},
+				"client_id": {"outage-rp"}})
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+	lookupFailures := func() int {
+		return strings.Count(logs.String(), "the Realm named in the route could not be looked up")
+	}
+	tokenEndpointFailures := func() int {
+		count := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, "the Realm named in the route could not be looked up") &&
+				strings.Contains(line, "endpoint=token") {
+				count++
+			}
+		}
+		return count
+	}
+
+	// (a) The realms table cannot be read. The Realm, the Client, the account
+	// and the refresh token are all still there — only this one lookup fails.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE realms RENAME TO realms_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE realms_hidden RENAME TO realms"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every other path on this server reads realms, so leaving it hidden would
+	// break each test that follows in the same container.
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "ALTER TABLE realms_hidden RENAME TO realms")
+	})
+
+	status, body := exchange("master", tokens.RefreshToken)
+	if strings.Contains(body, "invalid_grant") {
+		restore()
+		t.Fatalf("a realms table that could not be read was reported as a bad grant: the relying "+
+			"party discards a refresh token that is still good (%d %s)", status, body)
+	}
+	if status != http.StatusInternalServerError || !strings.Contains(body, `"error":"server_error"`) {
+		restore()
+		t.Fatalf("with realms unreadable the token endpoint answered %d %s, want 500 server_error", status, body)
+	}
+	if !strings.Contains(body, "retry") {
+		t.Errorf("the description does not say the outage passes and the token survives it: %s", body)
+	}
+	if got := tokenEndpointFailures(); got != 1 {
+		restore()
+		t.Fatalf("the fault left %d endpoint=token lookup-failure line(s), want 1; the log was:\n%s",
+			got, logs.String())
+	}
+
+	// (b) The same refresh token, once the table is back. The outage answer was
+	// the only thing wrong: nothing was spent, so the session did not have to be
+	// thrown away.
+	restore()
+	if status, body := exchange("master", tokens.RefreshToken); status != http.StatusOK {
+		t.Fatalf("after the outage the same refresh token answered %d (%s): the 400 had been telling "+
+			"the truth and the session really was lost", status, body)
+	}
+
+	// (c) A Realm that does not exist keeps the answer it had, and leaves no
+	// lookup-failure line at all — this endpoint is not a way to ask what exists.
+	before, beforeToken := lookupFailures(), tokenEndpointFailures()
+	status, body = exchange("no-such-realm", tokens.RefreshToken)
+	if status != http.StatusBadRequest || !strings.Contains(body, `"error":"invalid_grant"`) ||
+		!strings.Contains(body, "realm is unavailable") {
+		t.Errorf("an unknown Realm answered %d %s, want 400 invalid_grant \"realm is unavailable\"", status, body)
+	}
+	if lookupFailures() != before || tokenEndpointFailures() != beforeToken {
+		t.Errorf("asking for a Realm that does not exist logged a lookup failure:\n%s", logs.String())
+	}
+
+	// (d) And a suspended Realm, which reaches this handler as the same
+	// store.ErrNotFound. The suspension contract asserts only that every
+	// protocol endpoint refuses, so the exact answer is pinned here.
+	if _, err := data.Pool.Exec(ctx, "UPDATE realms SET enabled=false WHERE id=$1", realmID); err != nil {
+		t.Fatal(err)
+	}
+	status, body = exchange("master", tokens.RefreshToken)
+	if _, err := data.Pool.Exec(ctx, "UPDATE realms SET enabled=true WHERE id=$1", realmID); err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusBadRequest || !strings.Contains(body, `"error":"invalid_grant"`) ||
+		!strings.Contains(body, "realm is unavailable") {
+		t.Errorf("a suspended Realm answered %d %s, want 400 invalid_grant \"realm is unavailable\"", status, body)
+	}
+	if lookupFailures() != before || tokenEndpointFailures() != beforeToken {
+		t.Errorf("a suspended Realm logged a lookup failure:\n%s", logs.String())
+	}
+}
+
 func TestIntegrationRefreshTokenReuseNamesTheAccount(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()
