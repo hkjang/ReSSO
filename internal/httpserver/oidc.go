@@ -66,6 +66,37 @@ func (s *Server) realmLookupFailed(r *http.Request, endpoint string, err error) 
 	return true
 }
 
+// userLookupFailed reports whether the account a token grant is being exchanged
+// for could not be read, as opposed to it being gone or switched off.
+//
+// Both grants that belong to a person read the account with store.UserByID and
+// answered 400 invalid_grant "user is unavailable" for every error it can
+// return. That is the same argument realmLookupFailed makes a lookup earlier and
+// the signing-key branches make a lookup later: invalid_grant tells the relying
+// party the code or refresh token it holds is spent, and the ordinary response
+// is to discard it and send the person through login again. A users table this
+// server cannot read has not looked at the grant at all — the refresh grant has
+// not even rotated the token yet — so the answer threw away sessions that the
+// end of the outage would have kept, and discarded the store error where it
+// happened, leaving nothing for an operator to find. userinfo already separates
+// the two for this very call (writeUserInfoUnavailable, stage "user"); this is
+// the same judgement, at the endpoint where the cost of getting it wrong is a
+// session rather than a request.
+//
+// An account that is genuinely absent is a real answer, so store.ErrNotFound
+// stays with the switched-off account on the 400. The grant type is known by
+// here, which is why this can be counted under resso_token_errors_total's only
+// label where the Realm lookup in front of it could not be.
+func (s *Server) userLookupFailed(r *http.Request, realmName, grant string, err error) bool {
+	if err == nil || errors.Is(err, store.ErrNotFound) {
+		return false
+	}
+	s.metrics.Add(metricTokenErrors, 1, grant)
+	s.logger.Error("the account named in the grant could not be looked up", "trace_id", traceIDFrom(r.Context()),
+		"realm", realmName, "grant_type", grant, "error", err)
+	return true
+}
+
 func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 	realm, err := s.realmFromPath(r)
 	if err != nil {
@@ -500,6 +531,16 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		return
 	}
 	user, err := s.store.UserByID(r.Context(), code.UserID)
+	if s.userLookupFailed(r, realm.Name, "authorization_code", err) {
+		// The code has already been spent by the redemption above, so nothing
+		// here can be retried with it; what changes is that the relying party
+		// is told whose fault this was. invalid_grant on a code exchange means
+		// the code was bad, which a library reports as a failed login and some
+		// answer by starting the flow over — straight back into the same fault.
+		writeOAuthError(w, http.StatusInternalServerError, "server_error",
+			"the account could not be read; the authorization code was accepted, retry the sign-in after a short delay")
+		return
+	}
 	if err != nil || !user.Enabled {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "user is unavailable")
 		return
@@ -553,6 +594,14 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 	// likeliest reason for this exchange to fail, and rotating first would
 	// spend the caller's token to reject it.
 	user, err := s.store.UserByID(r.Context(), *inspected.UserID)
+	if s.userLookupFailed(r, realm.Name, "refresh_token", err) {
+		// Nothing has been rotated yet, exactly as the comment above intends,
+		// so the token the caller is holding is still the live one: it survives
+		// the outage if the answer does not tell the caller to throw it away.
+		writeOAuthError(w, http.StatusInternalServerError, "server_error",
+			"the account could not be read; the refresh token is still valid, retry after a short delay")
+		return
+	}
 	if err != nil || !user.Enabled {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "user is unavailable")
 		return
