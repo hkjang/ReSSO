@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.9.93
+
+**Token Endpoint가 Realm을 읽지 못한 장애를 `invalid_grant`로 답해 멀쩡한 Session까지 버리게 하던 것을, 500 `server_error`로 바로잡습니다.** `token`은 `realmFromPath`의 오류를 종류와 상관없이 전부 400 `invalid_grant` "realm is unavailable"로 바꿨습니다. 그래서 **이 서버가 `realms` 테이블을 읽지 못하는 상태와 애초에 없는 Realm이 같은 답**을 받았습니다. `invalid_grant`는 RP에게 "네가 들고 있는 code 또는 refresh token은 이미 소진됐다"는 뜻이고, 표준적인 대응은 그것을 버리고 사용자를 다시 로그인시키는 것입니다 — 즉 **grant를 들여다보지도 못한 장애가, 끝나기만 하면 그대로 살아났을 Session을 전부 데려갔습니다.** 같은 논지는 바로 몇 줄 아래에 이미 적혀 있었습니다(Signing Key를 열 수 없으면 grant를 탓하지 않고 500 `server_error`로 답합니다). Realm 조회만 그 앞에 남아 있었습니다. 기록도 없었습니다 — `realmFromPath`를 부르는 일곱 곳 가운데 **`realmLookupFailed`를 쓰지 않는 유일한 호출자**여서, 장애를 찾아 들어갈 `endpoint=token` 한 줄이 로그에 존재하지 않았습니다.
+
+### 수정
+
+- **Realm 조회가 `store.ErrNotFound`가 아닌 오류를 내면** 500 `server_error`와 `the realm could not be read; the token is still valid, retry after a short delay`로 답합니다. RP가 code나 refresh token을 버릴 이유가 없다는 것을 본문이 직접 말하고, 잠시 뒤 재시도하면 같은 grant가 그대로 통합니다.
+- **같은 실패를 Discovery · JWKS · 인가 · Revocation · 로그아웃 · CORS가 이미 쓰는 `realmLookupFailed`로 넘깁니다**(`endpoint=token`). 이 Endpoint에서 나던 무음이 사라져, 운영자가 `the Realm named in the route could not be looked up`을 `endpoint`로 갈라 볼 때 token도 함께 보입니다.
+- **실제로 없는 Realm과 꺼진 Realm은 한 글자도 바뀌지 않습니다.** 둘 다 `store.ErrNotFound`로 도착하며 400 `invalid_grant` "realm is unavailable"과 **로그 한 줄 없는 침묵**을 그대로 유지합니다 — 이 Endpoint는 무엇이 존재하는지 물어보는 수단이 아니어야 하고, 그 구별하지 않음은 의도이며 테스트가 단언합니다.
+- **지표는 더하지 않았습니다.** `resso_token_errors_total`의 유일한 라벨은 `grant_type`인데 이 실패는 Form에서 그 값을 읽기 전에 일어나므로 정직하게 셀 수 있는 값이 없습니다. 500은 `resso_http_requests_total{route,status}`에 이미 보입니다. 이 판단은 코드 주석으로 남겼습니다.
+- `docs/operations.md`의 `resso_token_errors_total` 경보 항목에 한 문장을 더해, 이 계열이 Realm 조회 실패를 세지 않는다는 것과 그 장애는 500·`endpoint=token`으로 찾는다는 것을 적었습니다.
+
+### 확인
+
+- 새 연동 테스트 `TestIntegrationTokenSaysWhenItCouldNotReadTheRealm` — 실제 PostgreSQL과 프로덕션 Handler로 네 경우를 봅니다. Token은 `ressooidc.Service.IssueUserTokens`로 발급한 진짜 refresh token이고, 장애는 `ALTER TABLE realms RENAME TO realms_hidden`으로 만든 뒤 `t.Cleanup`에서 되돌립니다. (a) `realms`를 숨긴 동안 500 `server_error`가 나오고 본문에 `invalid_grant`가 없으며 `endpoint=token` 줄이 정확히 하나 남습니다 (b) **테이블을 되돌리면 같은 refresh token이 그대로 200을 받습니다** — 버려지지 않았다는 것이 이 릴리즈의 요점이므로 직접 확인합니다 (c) 없는 Realm은 400 `invalid_grant`이고 새 로그 줄이 0입니다 (d) 꺼진 Realm도 마찬가지입니다.
+- **수정 전 `oidc.go`에서 먼저 실패**함을 확인했습니다: `a realms table that could not be read was reported as a bad grant: the relying party discards a refresh token that is still good (400 {"error":"invalid_grant","error_description":"realm is unavailable"})`.
+- 릴리즈 준비에서 `make lint`, `make test`(Go `-race` 전 패키지 · 연동 SKIP 0 · `go vet` · 콘솔 테스트 · 빌드), `make build VERSION=v0.9.93`, `git diff --check`가 통과했습니다.
+
+### Upgrade notes
+
+**정상 동작에서는 아무것도 달라지지 않습니다.** 성공하는 Token 교환, 잘못된 grant에 대한 400 `invalid_grant`, 없는 Realm과 꺼진 Realm에 대한 400 `invalid_grant`가 모두 이전과 같습니다. 마이그레이션도 설정 변경도 없고 이전 `v0.9.92` 이미지로 롤백할 수 있습니다(되돌리면 Realm 조회 장애가 다시 `invalid_grant`로 나갈 뿐입니다).
+
+**RP 쪽에서 달라지는 것은 장애 중 한 가지뿐입니다.** 이 서버가 `realms`를 읽지 못하는 동안 `/token`은 400이 아니라 **500**을 답합니다. 400 `invalid_grant`만 보고 refresh token을 버리도록 되어 있는 클라이언트라면, 이제 그 상황에서 토큰을 버리지 않고 재시도하게 됩니다 — 그것이 의도입니다. 5xx를 재시도하지 않는 클라이언트는 사용자에게 오류를 보이겠지만, 장애가 끝난 뒤 같은 refresh token으로 회복합니다. **HTTP 상태만 보고 경보하는 대시보드에서는 이 장애가 4xx가 아닌 5xx로 옮겨 갑니다.**
+
+로그를 기계로 읽는다면 기존 메시지 `the Realm named in the route could not be looked up`에 **`endpoint=token`이 새로 나타날 수 있습니다.** 정상 운영에서는 나오지 않는 줄이고, 요청 하나에 최대 한 줄입니다.
+
 ## v0.9.92
 
 **CORS 검사가 조회 실패 때문에 Header를 빼고 통과시킨 것을, 이제 서버 로그에 남깁니다.** 프로토콜 Endpoint 앞단의 `oidcCORS`는 Realm 조회와 Origin 등록 여부 조회 두 가지를 하는데, 어느 쪽이 오류를 내든 그 오류를 그대로 버렸습니다. 그래서 **저장소가 답하지 못한 경우와 아무도 등록하지 않은 Origin이 바이트 단위로 같은 결과**였습니다 — CORS Header 없이 다음 Handler로 넘어가고, 그 Handler는 200을 답합니다. RP 쪽에는 원인이 드러나지 않는 CORS 실패만 보이므로 운영자는 멀쩡한 자기 설정을 다시 읽고, 이쪽에는 읽을 것이 없으며 접근 로그마저 200으로 건강해 보였습니다. `realmFromPath`를 부르는 다른 자리들은 실패를 저마다 기록하거나(Discovery · JWKS · 인가 · Revocation · 로그아웃의 `realmLookupFailed`, UserInfo와 Introspection의 전용 경로) 적어도 호출자에게 다른 답을 돌려주는데, 이 미들웨어만 **기록도 하지 않고 응답도 구별되지 않았습니다.**
