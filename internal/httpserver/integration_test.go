@@ -1111,6 +1111,224 @@ func TestIntegrationTokenSaysWhenItCouldNotReadTheRealm(t *testing.T) {
 	}
 }
 
+// The same conflation one lookup further in, and the last one left in this
+// handler: the account. Both grants that belong to a person read it with
+// store.UserByID and then answered 400 invalid_grant "user is unavailable" for
+// every error that call can return, so a users table this server could not read
+// was reported to the relying party as a spent grant — and the ordinary response
+// to invalid_grant is to discard the grant and send the person back through
+// login. The refresh grant reads the account before it rotates anything, so the
+// token the relying party was holding stayed good for the whole outage; it was
+// thrown away on the strength of an answer that had looked at nothing. Nothing
+// was written to the log either, so an operator watching a Realm full of
+// sessions drop had no line to find.
+//
+// userinfo already separates the two for this very call (writeUserInfoUnavailable
+// with stage "user"), so what is pinned here is that the token endpoint answers
+// the way the rest of the service does — and that a switched-off account, which
+// is a real answer rather than a fault, keeps the 400 it has always had.
+func TestIntegrationTokenSaysWhenItCouldNotReadTheAccount(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmID := bootstrap.RealmID
+	if err := data.EnsureActiveSigningKey(ctx, realmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "account-outage-rp", Name: "Account Outage RP", Type: "public",
+		RedirectURIs: []string{"https://account-outage.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "account-outage-user", Password: "account-outage-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realmID, user.ID, time.Hour, "127.0.0.1", "account-outage-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The production issuance path, so the refresh token below is the real thing
+	// a relying party holds when the outage starts.
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, rp.Client, user, session.Session.ID,
+		[]string{"openid"}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	// The authorization code is minted through the real browser flow, because
+	// the grant that redeems it is the second of the two paths under test and a
+	// code the store never issued would not reach it. It has to be obtained
+	// before the table goes away: authorization reads the account too.
+	verifier := strings.Repeat("account-outage-verify", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	browser := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	request, err := http.NewRequest(http.MethodGet, server.URL+
+		"/realms/master/protocol/openid-connect/auth?response_type=code&client_id=account-outage-rp"+
+		"&redirect_uri="+url.QueryEscape("https://account-outage.test/cb")+"&scope=openid&state=s"+
+		"&code_challenge="+challenge+"&code_challenge_method=S256", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+	authorized, err := browser.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = authorized.Body.Close()
+	location, err := url.Parse(authorized.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := location.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no authorization code was issued: %s", location)
+	}
+
+	post := func(form url.Values) (int, string) {
+		t.Helper()
+		form.Set("client_id", "account-outage-rp")
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token", form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+	refreshWith := func(token string) (int, string) {
+		t.Helper()
+		return post(url.Values{"grant_type": {"refresh_token"}, "refresh_token": {token}})
+	}
+	accountFailures := func(grant string) int {
+		count := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, "the account named in the grant could not be looked up") &&
+				strings.Contains(line, "grant_type="+grant) {
+				count++
+			}
+		}
+		return count
+	}
+
+	// The users table cannot be read. The Realm, the Client, the session, the
+	// account row and both grants are all still there — only this one lookup
+	// fails.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE users RENAME TO users_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE users_hidden RENAME TO users"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every other test sharing this container reads users, so it cannot be left
+	// hidden even if this one fails part way through.
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "ALTER TABLE users_hidden RENAME TO users")
+	})
+
+	// (a) The refresh grant, whose token is still unspent at this point.
+	status, body := refreshWith(tokens.RefreshToken)
+	if strings.Contains(body, "invalid_grant") {
+		restore()
+		t.Fatalf("a users table that could not be read was reported as a bad grant: the relying party "+
+			"discards a refresh token that is still good (%d %s)", status, body)
+	}
+	if status != http.StatusInternalServerError || !strings.Contains(body, `"error":"server_error"`) {
+		restore()
+		t.Fatalf("with users unreadable the refresh grant answered %d %s, want 500 server_error", status, body)
+	}
+	if !strings.Contains(body, "retry") {
+		t.Errorf("the description does not say the outage passes and the token survives it: %s", body)
+	}
+	if got := accountFailures("refresh_token"); got != 1 {
+		restore()
+		t.Fatalf("the fault left %d refresh_token account-lookup line(s), want 1; the log was:\n%s",
+			got, logs.String())
+	}
+
+	// (b) And the authorization code grant, which reads the same account with
+	// the same call. Its code is spent by the redemption above it either way, so
+	// what this fixes is the answer and the log line, not the grant.
+	status, body = post(url.Values{"grant_type": {"authorization_code"}, "code": {code},
+		"redirect_uri": {"https://account-outage.test/cb"}, "code_verifier": {verifier}})
+	if strings.Contains(body, "invalid_grant") {
+		restore()
+		t.Fatalf("the code exchange blamed the code for a users table it could not read (%d %s)", status, body)
+	}
+	if status != http.StatusInternalServerError || !strings.Contains(body, `"error":"server_error"`) {
+		restore()
+		t.Fatalf("with users unreadable the code exchange answered %d %s, want 500 server_error", status, body)
+	}
+	if got := accountFailures("authorization_code"); got != 1 {
+		restore()
+		t.Fatalf("the fault left %d authorization_code account-lookup line(s), want 1; the log was:\n%s",
+			got, logs.String())
+	}
+
+	// (c) The same refresh token, once the table is back. The outage answer was
+	// the only thing wrong: nothing had been spent, so the session did not have
+	// to be thrown away.
+	restore()
+	status, body = refreshWith(tokens.RefreshToken)
+	if status != http.StatusOK {
+		t.Fatalf("after the outage the same refresh token answered %d (%s): the 400 had been telling "+
+			"the truth and the session really was lost", status, body)
+	}
+	var refreshed struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal([]byte(body), &refreshed); err != nil || refreshed.RefreshToken == "" {
+		t.Fatalf("the successful refresh returned no successor token: %s", body)
+	}
+
+	// (d) A switched-off account is a real answer, so it keeps the 400 it has
+	// always had and leaves no fault line behind. A deleted account cannot be
+	// reached this way — the refresh token is removed with it by the foreign key
+	// — so this is the store.ErrNotFound side of the same judgement as the
+	// endpoint can be asked it.
+	beforeRefresh, beforeCode := accountFailures("refresh_token"), accountFailures("authorization_code")
+	if _, err := data.Pool.Exec(ctx, "UPDATE users SET enabled=false WHERE id=$1", user.ID); err != nil {
+		t.Fatal(err)
+	}
+	status, body = refreshWith(refreshed.RefreshToken)
+	if _, err := data.Pool.Exec(ctx, "UPDATE users SET enabled=true WHERE id=$1", user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusBadRequest || !strings.Contains(body, `"error":"invalid_grant"`) ||
+		!strings.Contains(body, "user is unavailable") {
+		t.Errorf("a switched-off account answered %d %s, want 400 invalid_grant \"user is unavailable\"",
+			status, body)
+	}
+	if accountFailures("refresh_token") != beforeRefresh || accountFailures("authorization_code") != beforeCode {
+		t.Errorf("a switched-off account was recorded as a fault on this side:\n%s", logs.String())
+	}
+}
+
 func TestIntegrationRefreshTokenReuseNamesTheAccount(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()
