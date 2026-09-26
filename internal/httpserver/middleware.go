@@ -95,8 +95,48 @@ func (s *Server) oidcCORS(next http.Handler) http.Handler {
 		w.Header().Add("Vary", "Origin")
 		origin := strings.TrimRight(strings.TrimSpace(r.Header.Get("Origin")), "/")
 		if origin != "" {
-			if realm, err := s.realmFromPath(r); err == nil {
-				if allowed, allowErr := s.store.WebOriginAllowed(r.Context(), realm.ID, origin); allowErr == nil && allowed {
+			// Both lookups fail closed — the headers are left off and the request
+			// is passed on — and that part is deliberate: a store that cannot
+			// answer must not be able to widen who may read a token response.
+			// What is recorded here is only that the answer was withheld for a
+			// reason on this side. The two were written as `err == nil` and
+			// `allowErr == nil && allowed`, which made a fault here byte for byte
+			// identical to an origin nobody registered: the browser reports an
+			// opaque CORS failure, the relying party's operator re-reads their own
+			// configuration, and this side has nothing — the handler after this
+			// one still answers 200, so even the access log looks healthy.
+			realm, err := s.realmFromPath(r)
+			switch {
+			case err != nil:
+				// The same distinction discovery, JWKS, authorization, revocation
+				// and logout already make, under this middleware's own endpoint
+				// name. A Realm that is genuinely absent or switched off is not
+				// logged: the handler behind this one answers 404 or 401 for it
+				// and says so there, and every unrouted protocol request would
+				// otherwise write two lines for one fact.
+				s.realmLookupFailed(r, "cors", err)
+			default:
+				allowed, allowErr := s.store.WebOriginAllowed(r.Context(), realm.ID, origin)
+				switch {
+				case allowErr != nil:
+					// No counterpart exists for `allowErr == nil && !allowed`, and
+					// that silence is the contract rather than an omission. Origin
+					// is caller-controlled and reaches here without any
+					// authentication, on every route the protocol serves, so a
+					// line per unregistered origin is a log anyone can fill from
+					// outside by varying one header. A store that stopped
+					// answering is not reachable that way: it is this service
+					// failing, it is the same fault for every caller, and it stops
+					// when the store recovers.
+					//
+					// The origin itself is not logged for the same reason it is
+					// not audited elsewhere — it is unvalidated input, and this
+					// line is meant to name which tenant's lookups are failing.
+					// The realm comes from the route, which is how
+					// realmLookupFailed already records it.
+					s.logger.Error("a CORS origin could not be checked against the Realm's registered ones",
+						"trace_id", traceIDFrom(r.Context()), "realm", chi.URLParam(r, "realm"), "error", allowErr)
+				case allowed:
 					w.Header().Set("Access-Control-Allow-Origin", origin)
 					w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 					w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
