@@ -9439,6 +9439,167 @@ func TestIntegrationJWKSIsCacheableNoLongerThanAKeySetCanBeStale(t *testing.T) {
 	}
 }
 
+// oidcCORS withheld its headers for two quite different reasons and left no
+// trace of either. An origin nobody registered and a store that could not be
+// asked produced the same response — no Access-Control-Allow-Origin, then
+// straight on to the handler, which answers 200 — so the browser showed the
+// relying party an opaque CORS failure while this side recorded nothing at
+// all: not a log line, not an audit entry, and an access log full of healthy
+// 200s. The relying party's operator re-reads a configuration that was right.
+//
+// Every other caller of realmFromPath already tells the two apart through
+// realmLookupFailed; this middleware was the one that did not.
+//
+// Measured before the change: with the clients table renamed away, a request
+// from a registered origin answered 200 without the header and wrote nothing
+// beyond the access line — byte for byte the unregistered case below.
+//
+// The unregistered case stays silent on purpose, and that is asserted here
+// rather than left unstated: this middleware runs on every protocol route and
+// Origin is an unauthenticated header, so a line per unregistered origin is a
+// log any caller can fill from outside.
+func TestIntegrationCORSSaysWhenItCouldNotCheckAnOrigin(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, bootstrap.RealmID, store.CreateClientInput{
+		ClientID: "spa", Name: "Browser SPA", Type: "public",
+		RedirectURIs: []string{"https://spa.example.com/callback"},
+		WebOrigins:   []string{"https://spa.example.com"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	const registered = "https://spa.example.com"
+	const certs = "/realms/master/protocol/openid-connect/certs"
+	// The key set is the cheapest route under this middleware that reads
+	// neither the clients table nor a session, so renaming clients away below
+	// breaks the origin check and nothing else on the way.
+	fetch := func(path, origin string) (*http.Response, string) {
+		t.Helper()
+		before := logs.String()
+		request, requestErr := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Origin", origin)
+		response, doErr := server.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return response, strings.TrimPrefix(logs.String(), before)
+	}
+	// The access line is written for every request; what is under test is the
+	// two lines this middleware may add beside it.
+	const lookupLine = "endpoint=cors"
+	const checkLine = "a CORS origin could not be checked"
+
+	// (a) The baseline: a registered origin is answered, and quietly.
+	allowedResponse, allowedLog := fetch(certs, registered)
+	if allowedResponse.StatusCode != http.StatusOK {
+		t.Fatalf("a registered origin fetching the key set answered %d, want 200", allowedResponse.StatusCode)
+	}
+	if got := allowedResponse.Header.Get("Access-Control-Allow-Origin"); got != registered {
+		t.Errorf("a registered origin was answered Access-Control-Allow-Origin %q, want %q", got, registered)
+	}
+	for _, header := range []struct{ name, want string }{
+		{"Access-Control-Allow-Headers", "Authorization, Content-Type"},
+		{"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+		{"Access-Control-Max-Age", "600"},
+	} {
+		if got := allowedResponse.Header.Get(header.name); got != header.want {
+			t.Errorf("a registered origin was answered %s %q, want %q", header.name, got, header.want)
+		}
+	}
+	if strings.Contains(allowedLog, lookupLine) || strings.Contains(allowedLog, checkLine) {
+		t.Errorf("an origin that was allowed still wrote about the lookup:\n%s", allowedLog)
+	}
+
+	// (b) An origin nobody registered is refused the headers in silence.
+	strangerResponse, strangerLog := fetch(certs, "https://attacker.example.com")
+	if strangerResponse.StatusCode != allowedResponse.StatusCode {
+		t.Errorf("an unregistered origin answered %d, want %d: the headers are the only difference",
+			strangerResponse.StatusCode, allowedResponse.StatusCode)
+	}
+	if got := strangerResponse.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("an unregistered origin was answered Access-Control-Allow-Origin %q", got)
+	}
+	if strings.Contains(strangerLog, lookupLine) || strings.Contains(strangerLog, checkLine) {
+		t.Errorf("an unregistered origin wrote a log line, which any caller can do by varying one header:\n%s",
+			strangerLog)
+	}
+
+	// (c) The store cannot answer. Same response as (a) without the headers —
+	// fail closed — but now there is something to read.
+	if _, err := data.Pool.Exec(ctx, `ALTER TABLE clients RENAME TO clients_hidden`); err != nil {
+		t.Fatal(err)
+	}
+	brokenResponse, brokenLog := fetch(certs, registered)
+	if _, err := data.Pool.Exec(ctx, `ALTER TABLE clients_hidden RENAME TO clients`); err != nil {
+		t.Fatal(err)
+	}
+	if brokenResponse.StatusCode != allowedResponse.StatusCode {
+		t.Errorf("a registered origin whose check failed answered %d, want %d: a failed check must not change the answer",
+			brokenResponse.StatusCode, allowedResponse.StatusCode)
+	}
+	if got := brokenResponse.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("a check that failed still answered Access-Control-Allow-Origin %q, want none: this fails closed", got)
+	}
+	if !strings.Contains(brokenLog, checkLine) {
+		t.Errorf("a registered origin that could not be checked left nothing to read:\n%s", brokenLog)
+	}
+	if !strings.Contains(brokenLog, "realm=master") || !strings.Contains(brokenLog, "trace_id=") {
+		t.Errorf("the line naming a failed origin check does not say which Realm or which request:\n%s", brokenLog)
+	}
+	if strings.Contains(brokenLog, "spa.example.com") {
+		t.Errorf("the log repeated the caller's Origin, which is unvalidated input:\n%s", brokenLog)
+	}
+	// Vary is what keeps a shared cache from handing one origin's answer to
+	// another, so it has to survive the failure too.
+	if !slices.ContainsFunc(brokenResponse.Header.Values("Vary"), func(value string) bool {
+		return strings.Contains(strings.ToLower(value), "origin")
+	}) {
+		t.Errorf("a response whose origin check failed does not vary by Origin: %v", brokenResponse.Header.Values("Vary"))
+	}
+
+	// (d) A Realm that is genuinely absent is not this service failing, and
+	// the handler behind this middleware already says so in its own answer.
+	missingResponse, missingLog := fetch("/realms/ghost/protocol/openid-connect/certs", registered)
+	if missingResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("the key set of a Realm that does not exist answered %d, want 404", missingResponse.StatusCode)
+	}
+	if strings.Contains(missingLog, lookupLine) {
+		t.Errorf("a Realm that does not exist was reported as a lookup failure by the CORS middleware:\n%s", missingLog)
+	}
+
+	// (e) The other half of that distinction: the Realm lookup itself faulting
+	// is this service failing, and it is named under this middleware's own
+	// endpoint so the line can be told from the handler's.
+	if _, err := data.Pool.Exec(ctx, `ALTER TABLE realms RENAME TO realms_hidden`); err != nil {
+		t.Fatal(err)
+	}
+	_, unreadableLog := fetch(certs, registered)
+	if _, err := data.Pool.Exec(ctx, `ALTER TABLE realms_hidden RENAME TO realms`); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(unreadableLog, lookupLine) {
+		t.Errorf("a Realm that could not be looked up was not reported by the CORS middleware:\n%s", unreadableLog)
+	}
+}
+
 // RFC 9207 defends a relying party against a mix-up attack: when it talks to
 // more than one issuer, an attacker who can steer the browser can hand a code
 // minted by a hostile issuer to the callback of an honest one. The honest
