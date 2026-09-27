@@ -575,12 +575,20 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 	raw := r.Form.Get("refresh_token")
 	inspected, _, err := s.store.InspectRefreshToken(r.Context(), raw)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		// The last place in this endpoint where a fault on this side was still
-		// answered as a spent grant. invalid_grant tells the relying party the
-		// refresh token it holds is dead, and the ordinary response is to discard
-		// it and send the person through login again — so a refresh_tokens table
-		// this server cannot read took every session with it, permanently, for a
-		// fault that ended when the table came back.
+		// The earliest of the places in this endpoint that answered a fault on
+		// this side as a spent grant, and not the last of them: the code
+		// redemption above answers invalid_grant for every
+		// RedeemAuthorizationCode failure, and RotateRefreshToken below answers
+		// it for everything that is not ErrTokenReuse — which includes the store
+		// faults that call returns unchanged and the session-liveness query it
+		// reports as ErrNotFound. Those are separate changes and are still to
+		// make; this is the one made here.
+		//
+		// invalid_grant tells the relying party the refresh token it holds is
+		// dead, and the ordinary response is to discard it and send the person
+		// through login again — so a refresh_tokens table this server cannot read
+		// took every session with it, permanently, for a fault that ended when
+		// the table came back.
 		//
 		// The argument is strongest here of all: this is the grant's first store
 		// call, so RotateRefreshToken below has not run and nothing at all has
