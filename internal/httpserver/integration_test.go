@@ -1329,6 +1329,204 @@ func TestIntegrationTokenSaysWhenItCouldNotReadTheAccount(t *testing.T) {
 	}
 }
 
+func TestIntegrationTokenSaysWhenItCouldNotLookUpTheRefreshToken(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realmID := bootstrap.RealmID
+	if err := data.EnsureActiveSigningKey(ctx, realmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "refresh-outage-rp", Name: "Refresh Outage RP", Type: "public",
+		RedirectURIs: []string{"https://refresh-outage.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second relying party, so case (d) can offer a token that really was
+	// issued — to somebody else — rather than a value the store never wrote.
+	other, err := data.CreateClient(ctx, realmID, store.CreateClientInput{
+		ClientID: "refresh-outage-other", Name: "Refresh Outage Other", Type: "public",
+		RedirectURIs: []string{"https://refresh-outage-other.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realmID, store.CreateUserInput{
+		Username: "refresh-outage-user", Password: "refresh-outage-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realmID, user.ID, time.Hour, "127.0.0.1", "refresh-outage-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both tokens come out of the production issuance path and before the table
+	// goes away, so what the outage meets is the real thing a relying party is
+	// holding when it starts.
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, rp.Client, user, session.Session.ID,
+		[]string{"openid"}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherTokens, err := service.IssueUserTokens(ctx, realm, other.Client, user, session.Session.ID,
+		[]string{"openid"}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, nil))
+	metrics := observability.NewRegistry()
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	refreshWith := func(clientID, token string) (int, string) {
+		t.Helper()
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token",
+			url.Values{"grant_type": {"refresh_token"}, "refresh_token": {token}, "client_id": {clientID}})
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+	lookupFailures := func() int {
+		count := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, "the refresh token offered to the grant could not be looked up") {
+				count++
+			}
+		}
+		return count
+	}
+	counted := func() string {
+		var exported strings.Builder
+		metrics.WritePrometheus(&exported)
+		for _, line := range strings.Split(exported.String(), "\n") {
+			if strings.HasPrefix(line, `resso_token_errors_total{grant_type="refresh_token"}`) {
+				return line
+			}
+		}
+		return ""
+	}
+
+	// The refresh_tokens table cannot be read. Everything the request touches on
+	// the way to that lookup — realms, clients, rate_limits — is untouched, and
+	// the only foreign key pointing at this table is its own parent_id, so the
+	// rename takes nothing else with it.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE refresh_tokens RENAME TO refresh_tokens_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE refresh_tokens_hidden RENAME TO refresh_tokens"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every other test sharing this container issues tokens, so the table cannot
+	// be left hidden even if this one fails part way through.
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(),
+			"ALTER TABLE refresh_tokens_hidden RENAME TO refresh_tokens")
+	})
+
+	// (a) The token is still unspent — this lookup is the grant's first store
+	// call, so the rotation below it has not run — and invalid_grant would have
+	// the relying party throw it away.
+	status, body := refreshWith("refresh-outage-rp", tokens.RefreshToken)
+	if strings.Contains(body, "invalid_grant") {
+		restore()
+		t.Fatalf("a refresh_tokens table that could not be read was reported as a bad grant: the relying "+
+			"party discards a refresh token that has not been touched (%d %s)", status, body)
+	}
+	if status != http.StatusInternalServerError || !strings.Contains(body, `"error":"server_error"`) {
+		restore()
+		t.Fatalf("with refresh_tokens unreadable the refresh grant answered %d %s, want 500 server_error",
+			status, body)
+	}
+	if !strings.Contains(body, "retry") {
+		t.Errorf("the description does not say the outage passes and the token survives it: %s", body)
+	}
+	if got := lookupFailures(); got != 1 {
+		restore()
+		t.Fatalf("the fault left %d refresh-token lookup line(s), want 1; the log was:\n%s", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "grant_type=refresh_token") {
+		restore()
+		t.Errorf("the fault line does not name the grant it happened in:\n%s", logs.String())
+	}
+	// The value the caller offered is a bearer credential; it is an outage on
+	// this side, so nothing about it is worth keeping.
+	if strings.Contains(logs.String(), tokens.RefreshToken) {
+		restore()
+		t.Error("the raw refresh token was written to the log")
+	}
+	if got := counted(); got != `resso_token_errors_total{grant_type="refresh_token"} 1` {
+		restore()
+		t.Errorf("the fault was counted as %q, want the refresh_token series at 1", got)
+	}
+
+	// (b) The same raw token, once the table is back. This is the whole point:
+	// the outage did not have to cost the session.
+	restore()
+	status, body = refreshWith("refresh-outage-rp", tokens.RefreshToken)
+	if status != http.StatusOK {
+		t.Fatalf("after the outage the same refresh token answered %d (%s): the 400 had been telling "+
+			"the truth and the session really was lost", status, body)
+	}
+	var refreshed struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal([]byte(body), &refreshed); err != nil ||
+		refreshed.AccessToken == "" || refreshed.RefreshToken == "" {
+		t.Fatalf("the successful refresh returned no tokens: %s", body)
+	}
+
+	// (c) A value no refresh token ever had is a real answer, and its wording is
+	// the contract a relying party acts on.
+	status, body = refreshWith("refresh-outage-rp", "not-a-refresh-token-this-store-ever-wrote")
+	if status != http.StatusBadRequest || !strings.Contains(body, `"error":"invalid_grant"`) ||
+		!strings.Contains(body, "refresh token is invalid or expired") {
+		t.Errorf("an unknown refresh token answered %d %s, want 400 invalid_grant "+
+			"\"refresh token is invalid or expired\"", status, body)
+	}
+
+	// (d) And a token that exists but belongs to another client stays on the
+	// mismatch branch, which this change leaves exactly as it was.
+	status, body = refreshWith("refresh-outage-rp", otherTokens.RefreshToken)
+	if status != http.StatusBadRequest || !strings.Contains(body, `"error":"invalid_grant"`) ||
+		!strings.Contains(body, "refresh token is invalid or expired") {
+		t.Errorf("another client's refresh token answered %d %s, want 400 invalid_grant "+
+			"\"refresh token is invalid or expired\"", status, body)
+	}
+	// Neither is a fault on this side, so neither adds a line or a count.
+	if got := lookupFailures(); got != 1 {
+		t.Errorf("a refresh token that was read and rejected was recorded as a fault (%d line(s)):\n%s",
+			got, logs.String())
+	}
+	if got := counted(); got != `resso_token_errors_total{grant_type="refresh_token"} 1` {
+		t.Errorf("a refresh token that was read and rejected was counted as a fault: %q", got)
+	}
+}
+
 func TestIntegrationRefreshTokenReuseNamesTheAccount(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()

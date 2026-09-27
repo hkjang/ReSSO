@@ -574,6 +574,49 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, realm domain.Realm, client domain.Client) {
 	raw := r.Form.Get("refresh_token")
 	inspected, _, err := s.store.InspectRefreshToken(r.Context(), raw)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		// The earliest of the places in this endpoint that answered a fault on
+		// this side as a spent grant, and not the last of them: the code
+		// redemption above answers invalid_grant for every
+		// RedeemAuthorizationCode failure, and RotateRefreshToken below answers
+		// it for everything that is not ErrTokenReuse — which includes the store
+		// faults that call returns unchanged and the session-liveness query it
+		// reports as ErrNotFound. Those are separate changes and are still to
+		// make; this is the one made here.
+		//
+		// invalid_grant tells the relying party the refresh token it holds is
+		// dead, and the ordinary response is to discard it and send the person
+		// through login again — so a refresh_tokens table this server cannot read
+		// took every session with it, permanently, for a fault that ended when
+		// the table came back.
+		//
+		// The argument is strongest here of all: this is the grant's first store
+		// call, so RotateRefreshToken below has not run and nothing at all has
+		// been written. The token in the caller's hand is exactly as live after
+		// this answer as before it. The other two callers of
+		// InspectRefreshToken already separate the two — introspection through
+		// recordUnjudgedIntrospection, revocation through its own ErrNotFound
+		// check — and this was the one that did not.
+		//
+		// The description says only what is known. It does not claim the token
+		// was verified, because it was not read at all; what it can promise is
+		// that the token was neither rotated nor rejected, which is what tells a
+		// caller a retry is worth making.
+		//
+		// inspected is not read: the scan that would have filled it is what
+		// failed. raw is a bearer credential and goes nowhere — not the log, not
+		// the metric — so the identifiers already resolved stand in for it.
+		s.metrics.Add(metricTokenErrors, 1, "refresh_token")
+		s.logger.Error("the refresh token offered to the grant could not be looked up",
+			"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "client", client.ClientID,
+			"grant_type", "refresh_token", "error", err)
+		writeOAuthError(w, http.StatusInternalServerError, "server_error",
+			"the refresh token could not be looked up; it has not been rotated or rejected, retry after a short delay")
+		return
+	}
+	// A token that is genuinely absent, and the three mismatches below it, keep
+	// the answer they have always had — which deliberately does not distinguish
+	// an unknown value from one issued to somebody else.
 	if err != nil || inspected.RealmID != realm.ID || inspected.ClientID != client.ID || inspected.UserID == nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token is invalid or expired")
 		return
