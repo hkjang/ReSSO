@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.9.95
+
+**Refresh Token 자체를 조회하지 못한 장애를 `invalid_grant`로 답해, 손도 대지 않은 Token을 버리게 하던 것을 500 `server_error`로 바로잡습니다.** refresh grant의 첫 동작은 `store.InspectRefreshToken`으로 제시된 Token을 읽는 것인데, 그 호출이 낸 오류를 종류와 상관없이 바로 아래 한 줄이 전부 400 `invalid_grant` "refresh token is invalid or expired"로 삼켰습니다. 그래서 **이 서버가 `refresh_tokens` 테이블을 읽지 못하는 상태와, 없는 Token·만료된 Token·남의 Token이 같은 답**을 받았습니다. `invalid_grant`는 RP에게 "네가 들고 있는 refresh token은 죽었다"는 뜻이고, 표준적인 대응은 그것을 버리고 사용자를 다시 로그인시키는 것입니다 — 테이블이 돌아오면 끝났을 장애가 Session을 영구히 데려갔습니다. **논지는 이번 자리에서 가장 강합니다: 이 조회는 그 grant의 첫 저장소 호출이라 아래의 `RotateRefreshToken`은 아직 돌지 않았고 아무것도 쓰이지 않았습니다.** 즉 호출자가 쥔 Token은 이 답 뒤에도 답 앞과 정확히 같은 상태로 살아 있습니다. `InspectRefreshToken`을 부르는 나머지 두 곳은 이미 둘을 갈라 놓고 있었고(Introspection의 `recordUnjudgedIntrospection`, Revocation의 자체 `ErrNotFound` 검사) 이 자리만 남아 있었습니다.
+
+### 수정
+
+- **Refresh Token 조회가 `store.ErrNotFound`가 아닌 오류를 내면** 500 `server_error`와 `the refresh token could not be looked up; it has not been rotated or rejected, retry after a short delay`로 답합니다. **본문은 아는 것만 말합니다** — Token이 유효하다고 주장하지 않습니다(읽지도 못했으므로). 약속할 수 있는 것은 회전되지도 거절되지도 않았다는 사실이고, 재시도가 의미 있다는 것을 호출자에게 말해 주는 것은 바로 그 사실입니다.
+- **이 실패는 `resso_token_errors_total{grant_type="refresh_token"}`에 셉니다** — 이 시점에는 Form을 읽어 grant를 알고 있으므로 정직한 라벨이 있습니다. 로그는 `the refresh token offered to the grant could not be looked up` 한 줄이며 `trace_id` · `realm` · `client` · `grant_type` · `error`를 담습니다. **제시된 Token 원문은 어디에도 남기지 않습니다** — Bearer 자격증명이고, 이미 확정된 식별자들이 그 자리를 대신합니다.
+- **없는 Token과 그 아래 세 가지 불일치는 한 글자도 바뀌지 않습니다.** 알 수 없는 값, 다른 Realm의 Token, 다른 Client의 Token, 사용자에게 속하지 않은 Token은 모두 그대로 400 `invalid_grant` "refresh token is invalid or expired"이며, 모르는 값과 남에게 발급된 값을 구별하지 않는 그 침묵은 의도이고 테스트가 단언합니다.
+- **이 Endpoint에 남은 같은 종류의 자리를 코드 주석에 적어 두었습니다.** 위쪽 code 교환은 `RedeemAuthorizationCode`의 모든 실패를 `invalid_grant`로 답하고, 아래쪽 `RotateRefreshToken`은 `ErrTokenReuse`가 아닌 모든 것을 그렇게 답합니다. **이번에 고친 것은 그중 가장 앞선 자리이지 마지막 자리가 아니며**, 나머지는 별개의 변경으로 남아 있다는 것을 주석이 분명히 말합니다.
+- `docs/operations.md`의 `resso_token_errors_total` 경보 항목에, 이 계열이 Refresh Token 조회 실패도 센다는 것과 찾아볼 로그 문구를 더했습니다. 없는 Token·만료된 Token·다른 Realm이나 Client의 Token은 이쪽 장애가 아니므로 세지 않는다는 것도 함께 적었습니다.
+
+### 확인
+
+- 새 연동 테스트 `TestIntegrationTokenSaysWhenItCouldNotLookUpTheRefreshToken` — 실제 PostgreSQL과 프로덕션 Handler로 네 경우를 봅니다. 두 Refresh Token은 장애를 만들기 **전에** `ressooidc.Service.IssueUserTokens`로 발급한 진짜 Token이고(하나는 두 번째 RP 앞으로 발급해 (d)가 저장소가 쓴 적 없는 값이 아닌 "남에게 발급된 진짜 Token"을 제시하도록 했습니다), 장애는 `ALTER TABLE refresh_tokens RENAME TO refresh_tokens_hidden`으로 만든 뒤 `t.Cleanup`에서 되돌립니다. (a) 테이블을 숨긴 동안 500 `server_error`가 나오고 본문에 `invalid_grant`가 없으며, `grant_type=refresh_token`을 담은 줄이 정확히 하나 남고 그 줄에 Token 원문이 없으며 지표가 1입니다 (b) **테이블을 되돌리면 (a)에서 쓴 같은 Refresh Token이 그대로 200을 받고 새 Token 쌍을 돌려받습니다** — 버려지지 않았다는 것이 이 릴리즈의 요점이므로 직접 확인합니다 (c) 저장소가 쓴 적 없는 값은 400 `invalid_grant` "refresh token is invalid or expired"입니다 (d) 다른 Client의 Token도 같은 답이며, (c)·(d) 어느 쪽도 로그 줄과 지표를 늘리지 않습니다.
+- **수정 전 `oidc.go`에서 먼저 실패**함을 확인했습니다: `a refresh_tokens table that could not be read was reported as a bad grant: the relying party discards a refresh token that has not been touched (400 {"error":"invalid_grant","error_description":"refresh token is invalid or expired"})`.
+- 릴리즈 준비에서 `make lint`, `make test`(Go `-race` 전 패키지 · 연동 SKIP 0 · `go vet` · 콘솔 테스트 29파일 161테스트 · 빌드), `make build VERSION=v0.9.95`, `git diff --check`가 통과했습니다.
+
+### Upgrade notes
+
+**정상 동작에서는 아무것도 달라지지 않습니다.** 성공하는 refresh 교환, 없는 Token·만료된 Token·다른 Realm이나 Client의 Token에 대한 400 `invalid_grant`가 모두 이전과 같습니다. 마이그레이션도 설정 변경도 없고 이전 `v0.9.94` 이미지로 롤백할 수 있습니다(되돌리면 Refresh Token 조회 장애가 다시 `invalid_grant`로 나갈 뿐입니다).
+
+**RP 쪽에서 달라지는 것은 장애 중 한 가지뿐입니다.** 이 서버가 `refresh_tokens`를 읽지 못하는 동안 `/token`의 refresh 교환은 400이 아니라 **500**을 답합니다. 400 `invalid_grant`만 보고 Refresh Token을 버리도록 되어 있는 클라이언트라면 이제 그 상황에서 Token을 버리지 않고 재시도하게 됩니다 — 그것이 의도입니다. 5xx를 재시도하지 않는 클라이언트는 사용자에게 오류를 보이겠지만, 장애가 끝난 뒤 **같은 Refresh Token으로** 회복합니다. **HTTP 상태만 보고 경보하는 대시보드에서는 이 장애가 4xx가 아닌 5xx로 옮겨 갑니다.**
+
+**`resso_token_errors_total`에 경보를 걸어 두었다면 원인이 하나 더 늘었습니다.** 지금까지 이 계열이 움직이는 이유는 Signing Key를 열 수 없는 경우와 계정 조회 실패(v0.9.94)였는데, 이제 Refresh Token 조회 실패도 `grant_type="refresh_token"`으로 함께 올라옵니다. 셋의 구분은 서버 로그 문구입니다.
+
+로그를 기계로 읽는다면 **`the refresh token offered to the grant could not be looked up`이 새 메시지로 나타날 수 있습니다.** 정상 운영에서는 나오지 않는 줄이고, 요청 하나에 최대 한 줄입니다.
+
 ## v0.9.94
 
 **Token Endpoint가 계정을 읽지 못한 장애를 `invalid_grant`로 답해 아직 살아 있는 Refresh Token까지 버리게 하던 것을, 500 `server_error`로 바로잡습니다.** 사람에게 속한 두 grant(`authorization_code`·`refresh_token`)는 `store.UserByID`로 계정을 읽는데, 그 호출이 낼 수 있는 모든 오류를 400 `invalid_grant` "user is unavailable" 하나로 합쳤습니다. 그래서 **이 서버가 `users` 테이블을 읽지 못하는 상태와 꺼져 있는 계정이 같은 답**을 받았습니다. `invalid_grant`는 RP에게 "네가 들고 있는 code 또는 refresh token은 이미 소진됐다"는 뜻이고, 표준적인 대응은 그것을 버리고 사용자를 다시 로그인시키는 것입니다. 특히 refresh grant는 **회전하기 전에** 계정을 읽습니다(그 순서는 의도이며 코드에 주석으로 적혀 있습니다) — 즉 **호출자가 쥔 Refresh Token은 장애 내내 멀쩡히 살아 있었는데, 이쪽 답이 그것을 버리라고 말했습니다.** 장애가 걷히면 그대로 쓸 수 있었을 Session이 그렇게 사라졌습니다. 기록도 없었습니다 — 저장소 오류는 일어난 자리에서 버려져 운영자가 찾아 들어갈 줄이 로그에 존재하지 않았습니다. 같은 구별은 이미 한 조회 앞(`realmLookupFailed`, v0.9.93)과 한 조회 뒤(Signing Key를 열 수 없는 경우)에 있었고, **바로 이 계정 조회에 대해서만 UserInfo가 따로 하고 있었습니다**(`writeUserInfoUnavailable`, stage `user`). Token Endpoint의 이 두 자리만 남아 있었습니다.
