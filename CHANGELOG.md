@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.9.96
+
+**UserInfo가 판정하지 못한 요청을 `resso_userinfo_errors_total{stage}`로 셉니다 — 어느 조회가 멈췄는지가 지금까지 서버 로그 한 줄에만 있었습니다.** `/userinfo` 뒤에는 서로 무관한 조회 여섯(Realm, Token 폐기 여부, 계정, 세션, Realm Role, Client Role)이 서 있고, 그중 무엇이 실패하든 `writeUserInfoUnavailable` 한 곳을 지나 똑같은 500 `server_error`로 나갑니다. 이 답 자체는 옳습니다 — Token은 멀쩡하고 RP가 고칠 것이 없으므로 401로 답하면 RP가 쓸 수 있는 자격증명을 버리고 사람을 로그아웃시킵니다. 문제는 **그 헬퍼가 ERROR 로그 한 줄만 남기고 지표에는 아무것도 남기지 않았다**는 것입니다. 운영자가 보는 것은 `resso_http_requests_total{route,status}`의 500 하나뿐이고, 여섯 중 어느 조회가 무너졌는지는 로그를 뒤져야 알 수 있었습니다. **같은 모양의 `errors_total` 계열 넷 중 UserInfo만 빠져 있었습니다** — Introspection·인가·Token은 "로그를 읽지 않아도 조회가 멈춘 것을 안다"는 바로 그 목적으로 이미 계열을 갖고 있었고, 이 Endpoint만 그 묶음 밖에 있었습니다.
+
+### 추가
+
+- **`resso_userinfo_errors_total{stage}`가 판정하지 못한 UserInfo 요청을 실패한 조회 단계별로 셉니다.** `stage`는 코드에 이미 있던 여섯 리터럴(`realm`·`revocation_state`·`user`·`session`·`realm_roles`·`client_roles`)로 고정 카디널리티이며, **요청에서 온 값은 라벨에 넣지 않습니다.** 배선은 `writeUserInfoUnavailable` 한 곳의 로그 줄 바로 앞 한 줄이라 호출자 여섯의 시그니처도 호출부도 그대로입니다.
+- **응답은 한 글자도 바뀌지 않습니다.** 500 `server_error`와 그 본문, 기존 로그 문구 `userinfo could not judge the request it was given`, 만료·위조 Token과 꺼진 계정·없는 Realm·없는 세션의 401 `invalid_token`, Token을 헤더와 본문에 함께 보낸 요청의 400이 모두 전과 같습니다.
+- **평범한 거절은 세지 않습니다.** Bearer Token은 인증 없이 누구나 보낼 수 있으므로, 401·400을 이 계열에 세면 **외부인이 요청 하나로 이 경보를 울릴 수 있습니다.** 이 계열이 오르면 언제나 이쪽 장애입니다.
+- **`store.ErrNotFound`를 거르지 않은 이유를 코드 주석에 남겼습니다.** `recordUnjudgedIntrospection`과 달리 이 헬퍼는 필터를 두지 않습니다 — 호출자 여섯이 모두 "없다"를 Token에 대한 사실로 앞에서 판정해 401로 답하고 오므로 필터는 절대 돌지 않는 코드가 되고, 그런 구별을 하지 않는 Role 두 조회에서는 이 Endpoint가 실제로 거절하는 장애를 조용히 세지 않게 만듭니다.
+- `docs/operations.md` 경보 목록에 이 계열 항목(여섯 `stage`의 뜻, 500이 요청 카운터에 보여도 그 하나 뒤에 조회 여섯이 서 있다는 것, 찾아볼 로그 문구, 401·400을 세지 않는 이유)을, README 지표 표에 한 줄을 더했습니다.
+
+### 확인
+
+- 새 연동 테스트 `TestIntegrationUserInfoCountsTheLookupsItCouldNotMake` — 실제 PostgreSQL과 프로덕션 배선(`New(data, logger, nil, nil)`이 nil 등록기를 스스로 채우는 그대로 + `srv.Metrics().WritePrometheus`)으로, `ressooidc.Service.IssueUserTokens`가 발급한 진짜 Access Token을 씁니다. 장애는 `ALTER TABLE ... RENAME`으로 만들고 단언 전에 즉시 되돌립니다. (a) `/metrics`가 계열을 게시하고 (b) 기준선이 200이며 (c) 위조 Token·없는 Realm·꺼진 계정의 401 뒤에도 여섯 `stage`가 전부 0이고 (d) `user_roles`·`user_client_roles`·`users`를 각각 숨기면 500 `server_error`와 함께 `stage=realm_roles`·`client_roles`·`user`가 1씩 오르며 (e) 그때 무관한 `stage` 셋은 0이고 (f) **되돌린 뒤 같은 Token이 그대로 200을 받습니다.**
+- **수정 전에 실제로 실패함을 두 단계로 확인**했습니다: 계열을 등록하기 전에는 `/metrics does not publish resso_userinfo_errors_total, so an operator watching the errors_total series sees userinfo faults nowhere`, 계열만 등록하고 배선하지 않았을 때는 `with user_roles unreadable resso_userinfo_errors_total{stage="realm_roles"} was 0, want 1`(`client_roles`·`user`로 같은 줄이 셋). 이때 500 `server_error` 단언은 모두 통과했습니다 — 응답이 바뀌지 않았다는 증거입니다.
+- `stage=realm`·`revocation_state`·`session` 세 자리는 **0으로만** 단언합니다. 배선이 헬퍼 한 곳이라 여섯이 같은 경로를 지나지만, 그 셋의 장애를 재현하지는 않았습니다(`realms` RENAME은 UserInfo 이전의 미들웨어까지 무너뜨립니다).
+- 릴리즈 준비에서 `make lint`, `make test`(Go `-race` 전 패키지 · 연동 SKIP 0 · `go vet` · 콘솔 29파일 161테스트 · 빌드), `make build VERSION=v0.9.96`, `git diff --check`가 통과했습니다.
+
+### Upgrade notes
+
+**동작은 달라지지 않습니다.** 응답도, 상태 코드도, 로그 문구도, 저장되는 데이터도 전과 같고 **마이그레이션도 설정 변경도 없습니다.** 이전 `v0.9.95` 이미지로 롤백할 수 있습니다(되돌리면 계열이 사라질 뿐입니다).
+
+`/metrics`에 계열 하나(`resso_userinfo_errors_total`, 라벨 `stage` 여섯 값)가 늘어납니다. **스크랩 직후 이 계열이 0이 아니라면 새 결함이 아니라 지금까지 500 하나에 가려져 있던 조회 장애**이므로, `stage`가 가리키는 조회부터 보시면 됩니다. 경보를 새로 걸 곳이기도 합니다 — 지금까지 이 장애는 `resso_http_requests_total`의 500으로만 보였고 그 500은 어느 조회인지 말해 주지 않았습니다.
+
 ## v0.9.95
 
 **Refresh Token 자체를 조회하지 못한 장애를 `invalid_grant`로 답해, 손도 대지 않은 Token을 버리게 하던 것을 500 `server_error`로 바로잡습니다.** refresh grant의 첫 동작은 `store.InspectRefreshToken`으로 제시된 Token을 읽는 것인데, 그 호출이 낸 오류를 종류와 상관없이 바로 아래 한 줄이 전부 400 `invalid_grant` "refresh token is invalid or expired"로 삼켰습니다. 그래서 **이 서버가 `refresh_tokens` 테이블을 읽지 못하는 상태와, 없는 Token·만료된 Token·남의 Token이 같은 답**을 받았습니다. `invalid_grant`는 RP에게 "네가 들고 있는 refresh token은 죽었다"는 뜻이고, 표준적인 대응은 그것을 버리고 사용자를 다시 로그인시키는 것입니다 — 테이블이 돌아오면 끝났을 장애가 Session을 영구히 데려갔습니다. **논지는 이번 자리에서 가장 강합니다: 이 조회는 그 grant의 첫 저장소 호출이라 아래의 `RotateRefreshToken`은 아직 돌지 않았고 아무것도 쓰이지 않았습니다.** 즉 호출자가 쥔 Token은 이 답 뒤에도 답 앞과 정확히 같은 상태로 살아 있습니다. `InspectRefreshToken`을 부르는 나머지 두 곳은 이미 둘을 갈라 놓고 있었고(Introspection의 `recordUnjudgedIntrospection`, Revocation의 자체 `ErrNotFound` 검사) 이 자리만 남아 있었습니다.
