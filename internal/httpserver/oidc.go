@@ -966,6 +966,13 @@ func (s *Server) userInfo(w http.ResponseWriter, r *http.Request) {
 // stage names which lookup failed, because from the outside every one of them
 // produces the same response and only this line says which.
 func (s *Server) writeUserInfoUnavailable(w http.ResponseWriter, r *http.Request, stage string, err error) {
+	// Unlike recordUnjudgedIntrospection this does not filter out ErrNotFound:
+	// every caller has already decided that a thing which is simply not there
+	// is a fact about the token and answered 401 before reaching here, so a
+	// filter would be code that never runs — and for the two Role lookups,
+	// which draw no such distinction, it would quietly stop counting a fault
+	// this endpoint does refuse.
+	s.metrics.Add(metricUserInfoErrors, 1, stage)
 	s.logger.Error("userinfo could not judge the request it was given", "trace_id", traceIDFrom(r.Context()),
 		"realm", chi.URLParam(r, "realm"), "stage", stage, "error", err)
 	writeOAuthError(w, http.StatusInternalServerError, "server_error", "the request could not be completed")

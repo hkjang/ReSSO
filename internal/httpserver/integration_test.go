@@ -10441,6 +10441,196 @@ func TestIntegrationUserInfoRefusesWhenRolesCannotBeRead(t *testing.T) {
 	}
 }
 
+// The refusal above is right, and until now it was written down nowhere an
+// operator watches. Every one of the six lookups behind this endpoint refuses
+// with the same 500 server_error, so resso_http_requests_total says only that
+// userinfo is failing and the one line naming the lookup lives in the server
+// log — which is where the other three errors_total series exist precisely so
+// nobody has to go. This test pins the series down at both ends: it rises for
+// the faults, and it does not rise for the refusals anyone can provoke without
+// a working credential.
+func TestIntegrationUserInfoCountsTheLookupsItCouldNotMake(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, bootstrap.RealmID); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "userinfo-counter", Name: "UserInfo Counter", Type: "confidential",
+		RedirectURIs:  []string{"https://counter.example.test/cb"},
+		GrantTypes:    []string{"authorization_code"},
+		DefaultScopes: []string{"openid", "roles"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "counted-holder", Password: "counted-holder-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1", "counter-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := ressooidc.Service{Store: data}
+	issued, err := service.IssueUserTokens(ctx, realm, created.Client, user, session.Session.ID,
+		[]string{"openid", "roles"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// New builds its own registry when it is handed none and Metrics() gives it
+	// back, so the server under test is wired the way the process wires it
+	// rather than through a registry this test assembled itself.
+	server := New(data, logger, nil, nil)
+	front := httptest.NewServer(server.Handler())
+	t.Cleanup(front.Close)
+	userInfo := func(realmName, token string) (int, map[string]any) {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodGet,
+			front.URL+"/realms/"+realmName+"/protocol/openid-connect/userinfo", nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+		response, doErr := front.Client().Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer response.Body.Close()
+		var decoded map[string]any
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		return response.StatusCode, decoded
+	}
+	exported := func() string {
+		t.Helper()
+		var out strings.Builder
+		server.Metrics().WritePrometheus(&out)
+		return out.String()
+	}
+	// The registry accumulates for the life of the server, so every assertion
+	// below reads the total for one stage rather than a difference, and the
+	// order of the requests is what makes those totals meaningful.
+	stageCount := func(stage string) int64 {
+		t.Helper()
+		prefix := `resso_userinfo_errors_total{stage="` + stage + `"} `
+		for _, line := range strings.Split(exported(), "\n") {
+			if strings.HasPrefix(line, prefix) {
+				value, parseErr := strconv.ParseInt(strings.TrimPrefix(line, prefix), 10, 64)
+				if parseErr != nil {
+					t.Fatalf("unreadable counter line %q: %v", line, parseErr)
+				}
+				return value
+			}
+		}
+		return 0
+	}
+
+	// A series nobody declared is silently discarded by Add, so the scrape has
+	// to carry the name before any count below can mean anything.
+	if !strings.Contains(exported(), "# TYPE resso_userinfo_errors_total counter") {
+		t.Fatalf("/metrics does not publish resso_userinfo_errors_total, so an operator watching the "+
+			"errors_total series sees userinfo faults nowhere:\n%s", exported())
+	}
+
+	// The healthy answer first, so that a refusal below is about the fault and
+	// not about a token that never worked.
+	if status, claims := userInfo("master", issued.AccessToken); status != http.StatusOK {
+		t.Fatalf("userinfo answered %d for a freshly issued token: %v", status, claims)
+	}
+
+	// The refusals anyone can provoke. A Bearer token needs no credential to
+	// send, so if these counted, someone outside could raise this alert about a
+	// service that is answering every question put to it correctly.
+	if status, _ := userInfo("master", "not-a-token-at-all"); status != http.StatusUnauthorized {
+		t.Fatalf("a forged token answered %d, want 401", status)
+	}
+	if status, _ := userInfo("no-such-realm", issued.AccessToken); status != http.StatusUnauthorized {
+		t.Fatalf("a Realm nobody created answered %d, want 401", status)
+	}
+	// A second account carries the switched-off case, because disabling one ends
+	// its sessions and re-enabling it does not bring them back — doing this to
+	// the account above would retire the token the rest of the test needs.
+	switched, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "switched-off", Password: "switched-off-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	switchedSession, err := data.CreateSession(ctx, realm.ID, switched.ID, time.Hour, "127.0.0.1", "counter-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	switchedTokens, err := service.IssueUserTokens(ctx, realm, created.Client, switched, switchedSession.Session.ID,
+		[]string{"openid", "roles"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.UpdateUser(ctx, switched.ID, store.UpdateUserInput{Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := userInfo("master", switchedTokens.AccessToken); status != http.StatusUnauthorized {
+		t.Fatalf("a token for a switched-off account answered %d, want 401", status)
+	}
+	for _, stage := range []string{"realm", "revocation_state", "user", "session", "realm_roles", "client_roles"} {
+		if count := stageCount(stage); count != 0 {
+			t.Errorf("stage %q counted %d after nothing but ordinary refusals; an unauthenticated caller "+
+				"must not be able to raise this alert", stage, count)
+		}
+	}
+
+	// Each fault in turn, with the table put back before anything is asserted
+	// so a failing assertion cannot take the rest of the package with it. The
+	// stage names are the lookups the handler makes, not anything the request
+	// carried.
+	for _, fault := range []struct {
+		table string
+		stage string
+	}{
+		{table: "user_roles", stage: "realm_roles"},
+		{table: "user_client_roles", stage: "client_roles"},
+		{table: "users", stage: "user"},
+	} {
+		if _, err := data.Pool.Exec(ctx, "ALTER TABLE "+fault.table+" RENAME TO "+fault.table+"_hidden"); err != nil {
+			t.Fatal(err)
+		}
+		status, body := userInfo("master", issued.AccessToken)
+		count := stageCount(fault.stage)
+		if _, err := data.Pool.Exec(ctx, "ALTER TABLE "+fault.table+"_hidden RENAME TO "+fault.table); err != nil {
+			t.Fatal(err)
+		}
+		if status != http.StatusInternalServerError || body["error"] != "server_error" {
+			t.Errorf("with %s unreadable userinfo answered %d %v, want 500 server_error", fault.table, status, body)
+		}
+		if count != 1 {
+			t.Errorf("with %s unreadable resso_userinfo_errors_total{stage=%q} was %d, want 1 — the 500 is in "+
+				"the request counter but which lookup broke is only in the log", fault.table, fault.stage, count)
+		}
+	}
+
+	// The stages that did not break stay at zero: one series per lookup is the
+	// whole point, and a counter that rises for all six says no more than the
+	// request counter already did.
+	for _, stage := range []string{"realm", "revocation_state", "session"} {
+		if count := stageCount(stage); count != 0 {
+			t.Errorf("stage %q counted %d although only the Role and account lookups were taken away", stage, count)
+		}
+	}
+
+	// And it recovers, with the same token: the refusals were about the fault.
+	if status, claims := userInfo("master", issued.AccessToken); status != http.StatusOK {
+		t.Fatalf("userinfo answered %d once every table was readable again: %v", status, claims)
+	}
+}
+
 func TestIntegrationUserInfoLimitsPostBody(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()

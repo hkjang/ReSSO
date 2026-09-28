@@ -27,6 +27,15 @@ const (
 	// active=false, so without this series the two are the same call in every
 	// signal the service publishes.
 	metricIntrospectionErrors = "resso_introspection_errors_total"
+	// metricUserInfoErrors counts the userinfo requests the service could not
+	// judge, by the lookup that did not complete. These leave as 500
+	// server_error, so unlike an unjudged introspection they are at least
+	// visible in the request counter — but six unrelated lookups stand behind
+	// that one status, and which of them broke is the thing an operator needs
+	// and the only place it was written down was a server log line. The other
+	// three errors_total series exist so that nobody has to read the log to
+	// find out a lookup is down; userinfo was the one endpoint left out.
+	metricUserInfoErrors = "resso_userinfo_errors_total"
 	// metricAuthorizationErrors counts the authorization requests the service
 	// could not serve. Most of them leave as a 302 carrying error=server_error
 	// to the relying party's redirect_uri, which is the same status a granted
@@ -58,6 +67,8 @@ func registerMetrics(registry *observability.Registry) {
 	registry.Counter(metricClientAuth, "Failed OIDC client authentications.", "realm")
 	registry.Counter(metricIntrospectionErrors,
 		"Introspections the service could not judge, by the lookup that failed.", "stage")
+	registry.Counter(metricUserInfoErrors,
+		"userinfo requests the service could not judge, by the lookup that failed.", "stage")
 	registry.Counter(metricAuthorizationErrors,
 		"Authorization requests the service could not serve, by the step that failed.", "stage")
 	registry.Counter(metricSilentAuthentications,
