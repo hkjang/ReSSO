@@ -4,12 +4,12 @@
   "version": "0.9.96",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "preview": "vite preview",
-    "lint": "eslint . --max-warnings 0"
+    "dev": "PATH=\"${npm_node_execpath%/*}:$PATH\" vite",
+    "build": "PATH=\"${npm_node_execpath%/*}:$PATH\" sh -c 'tsc --noEmit && vite build'",
+    "test": "PATH=\"${npm_node_execpath%/*}:$PATH\" vitest run",
+    "test:watch": "PATH=\"${npm_node_execpath%/*}:$PATH\" vitest",
+    "preview": "PATH=\"${npm_node_execpath%/*}:$PATH\" vite preview",
+    "lint": "PATH=\"${npm_node_execpath%/*}:$PATH\" eslint . --max-warnings 0"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",
