@@ -1737,6 +1737,48 @@ func TestIntegrationClientAuthSaysWhenItCouldNotDecide(t *testing.T) {
 	if got := undecidedLines(); got != attempts {
 		t.Errorf("an unregistered client_id was logged as a fault (%d line(s) for %d)", got, attempts)
 	}
+
+	// (g) And an identifier this database could not be holding is that same
+	// decided answer. client_id is text, so neither of these can be any Client's
+	// identifier, but asking PostgreSQL about them is not a question it answers
+	// with "no such row" — it refuses the parameter (SQLSTATE 22021, invalid byte
+	// sequence for encoding "UTF8"), which is the store error the clients table
+	// returns when it has stopped answering. So the bytes below used to reach the
+	// fault path: each one added to resso_client_auth_errors_total{stage="client"}
+	// and logged an outage that was not happening, while spending nothing from
+	// either limiter — an unauthenticated caller ringing this service's own alarm
+	// with one form field, as often as it liked, against a database that was fine.
+	// That is the auth_time incident over again, and the bound both limiters exist
+	// for has to cover a caller cycling these as much as printable ones.
+	for i, unstorable := range []string{"bad-\xff\xfe-utf8", "bad-\x00-nul"} {
+		response, postErr := server.Client().PostForm(server.URL+"/realms/master/protocol/openid-connect/token",
+			url.Values{"grant_type": {"client_credentials"}, "client_id": {unstorable},
+				"client_secret": {"irrelevant"}})
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		unstorableBody, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusUnauthorized ||
+			!strings.Contains(string(unstorableBody), `"error":"invalid_client"`) {
+			t.Errorf("client_id=%q answered %d %s, want 401 invalid_client",
+				unstorable, response.StatusCode, unstorableBody)
+		}
+		if got := counted("resso_client_auth_failures_total"); got !=
+			`resso_client_auth_failures_total{realm="master"} `+strconv.Itoa(attempts+2+i) {
+			t.Errorf("client_id=%q was not counted as a failed client authentication, so it spent "+
+				"nothing from either limiter: %q", unstorable, got)
+		}
+		if got := counted(`resso_client_auth_errors_total{stage="client"}`); got !=
+			`resso_client_auth_errors_total{stage="client"} `+strconv.Itoa(attempts) {
+			t.Errorf("client_id=%q raised the undecided-authentication alarm against a healthy "+
+				"database: %q", unstorable, got)
+		}
+		if got := undecidedLines(); got != attempts {
+			t.Errorf("client_id=%q was logged as a fault on this side (%d line(s) for %d)",
+				unstorable, got, attempts)
+		}
+	}
 }
 
 func TestIntegrationRefreshTokenReuseNamesTheAccount(t *testing.T) {

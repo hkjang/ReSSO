@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -35,7 +36,34 @@ func scanClient(row pgx.Row) (domain.Client, error) {
 	return client, err
 }
 
+// storableIdentifier reports whether an identifier is one this database could
+// be holding. client_id is text, so a value that is not valid UTF-8, or that
+// carries a NUL, is not stored under any row — and asking anyway is not a
+// question PostgreSQL answers with "no such row": it refuses the parameter
+// before the query runs, with `invalid byte sequence for encoding "UTF8"`
+// (SQLSTATE 22021). That refusal is indistinguishable, at every caller, from
+// the clients table having stopped answering.
+//
+// Which matters because the identifier arrives straight off the wire on
+// requests that carry no credential at all — client_id=bad-%ff on a token
+// request, the same bytes through a Basic header, ?client_id= on an
+// authorization request — so an unauthenticated caller could pick the bytes
+// that make a healthy database look broken, on demand and as often as it
+// liked: the undecided-authentication alarm, the dropped post-logout redirect
+// reason reserved for an unreadable table, and (because the callers treat a
+// fault as nothing the caller chose) attempts that no failure limiter bounds.
+// It is the auth_time incident from docs/operations.md again, where a caller
+// rang this service's own outage alarm with one query parameter, and the
+// answer is the same one: settle the value here, where it is known that no row
+// can match, rather than asking a question whose refusal reads as an outage.
+func storableIdentifier(identifier string) bool {
+	return utf8.ValidString(identifier) && !strings.ContainsRune(identifier, 0)
+}
+
 func (s *Store) ClientByIdentifier(ctx context.Context, realmID uuid.UUID, identifier string) (domain.Client, error) {
+	if !storableIdentifier(identifier) {
+		return domain.Client{}, ErrNotFound
+	}
 	return scanClient(s.Pool.QueryRow(ctx, "SELECT "+clientColumns+" FROM clients WHERE realm_id=$1 AND client_id=$2", realmID, identifier))
 }
 

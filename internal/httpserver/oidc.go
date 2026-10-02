@@ -833,13 +833,21 @@ func (s *Server) verifyOIDCClient(r *http.Request, realm domain.Realm, clientID,
 //
 // store.ErrNotFound stays with the wrong secret on the counted path: an
 // identifier nobody registered is a real answer, and it is the answer somebody
-// cycling identifiers gets, which is the bound both limiters exist for. The
-// bound is not weakened by what is excluded here either, because nothing
-// excluded here can be reached on demand: the errors left are a store that
-// will not answer and a stored digest that will not decode, neither of which a
-// caller chooses. A request abandoned mid-verification is the one a caller can
-// cause, and it buys nothing — the answer it would have learned from is never
-// sent, so no attempt is spent and no attempt is made.
+// cycling identifiers gets, which is the bound both limiters exist for.
+//
+// That bound only holds while nothing excluded here can be reached on demand,
+// and one thing could: a client_id that is not valid UTF-8, or that carries a
+// NUL, is refused by PostgreSQL as a parameter rather than answered as a
+// missing row (SQLSTATE 22021), so client_id=bad-%ff arrived here as a store
+// error — counted as an outage, logged as one, and bounded by neither limiter,
+// from an unauthenticated request, as often as the caller liked. Such an
+// identifier is now settled as store.ErrNotFound before the query, in
+// ClientByIdentifier, where the fact that no row can hold those bytes belongs;
+// the comment there has the rest. What is left is a store that will not answer
+// and a stored digest that will not decode, neither of which a caller chooses.
+// A request abandoned mid-verification is the one a caller can still cause, and
+// it buys nothing — the answer it would have learned from is never sent, so no
+// attempt is spent and no attempt is made.
 //
 // The response is deliberately not changed. These three endpoints answer a
 // failed client authentication identically today and their contracts for a
