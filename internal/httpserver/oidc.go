@@ -765,7 +765,10 @@ func (s *Server) authenticateOIDCClient(r *http.Request, realm domain.Realm) (do
 			return domain.Client{}, false, &rateLimitedError{retryAfter: retryAfter}
 		}
 	}
-	client, authenticated, err := s.verifyOIDCClient(r, realm, clientID, secret)
+	client, authenticated, stage, err := s.verifyOIDCClient(r, realm, clientID, secret)
+	if s.clientAuthUndecided(r, realm.Name, stage, err) {
+		return client, false, err
+	}
 	if err != nil || !authenticated {
 		for _, bucket := range buckets {
 			bucket.limiter.Fail(bucket.key)
@@ -790,16 +793,112 @@ func (s *Server) authenticateOIDCClient(r *http.Request, realm domain.Realm) (do
 	return client, true, nil
 }
 
-func (s *Server) verifyOIDCClient(r *http.Request, realm domain.Realm, clientID, secret string) (domain.Client, bool, error) {
+// verifyOIDCClient resolves and checks the credential, naming the step it got
+// to. The step is what clientAuthUndecided records: the two lookups fail for
+// unrelated reasons — the clients table could not be read, or the row was read
+// and its stored digest will not decode — and which of them it was decides
+// whether an operator looks at the database or at one Client's record.
+func (s *Server) verifyOIDCClient(r *http.Request, realm domain.Realm, clientID, secret string) (domain.Client, bool, string, error) {
 	client, err := s.store.ClientByIdentifier(r.Context(), realm.ID, clientID)
 	if err != nil {
-		return domain.Client{}, false, err
+		return domain.Client{}, false, "client", err
 	}
 	if client.Type == "public" {
-		return client, secret == "", nil
+		return client, secret == "", "", nil
 	}
 	ok, err := s.store.VerifyClientSecret(r.Context(), client.ID, secret)
-	return client, ok, err
+	return client, ok, "secret", err
+}
+
+// clientAuthUndecided reports whether a client authentication could not be
+// decided, as opposed to being decided against.
+//
+// Every error the two lookups above can return was treated as a wrong
+// credential, and that has three consequences, of which the response is the
+// least of them. The first is the one that outlasts the fault: the attempt is
+// counted against both failure limiters, so a clients table that stopped
+// answering spends a relying party's twenty-attempt budget in the seconds it
+// takes that party to retry a refresh — and the window is fixed from its first
+// failure and cleared only by a success, so the Client stays locked out with
+// 429 for the rest of the five minutes *after* the table comes back. The
+// outage ends and the relying party is still down, for a secret that was
+// always right. A busy Realm does the same to the source address, taking every
+// other Client sharing it. The second is resso_client_auth_failures_total,
+// which the operations guide reads as a misconfigured secret or somebody
+// guessing one: a store fault raised a credential incident that never
+// happened, in the series that question is answered from. The third is that
+// the store error went nowhere at all — the three callers hand it to
+// writeClientAuthError, which looks only for the rate-limit case — so the
+// fault that did all of the above left no line anywhere.
+//
+// store.ErrNotFound stays with the wrong secret on the counted path: an
+// identifier nobody registered is a real answer, and it is the answer somebody
+// cycling identifiers gets, which is the bound both limiters exist for.
+//
+// That bound only holds while nothing excluded here can be reached on demand,
+// and two things could. The first was a client_id that is not valid UTF-8, or
+// that carries a NUL: PostgreSQL refuses it as a parameter rather than
+// answering it as a missing row (SQLSTATE 22021), so client_id=bad-%ff arrived
+// here as a store error — counted as an outage, logged as one, and bounded by
+// neither limiter, from an unauthenticated request, as often as the caller
+// liked. Such an identifier is now settled as store.ErrNotFound before the
+// query, in ClientByIdentifier, where the fact that no row can hold those bytes
+// belongs; the comment there has the rest.
+//
+// The second is a caller that hangs up while its credential is being verified,
+// and it is what the first check below is for. Hanging up ends the request
+// context — nothing else does, because no middleware on this route puts a
+// deadline on it, and the server cancels it when the connection goes — and
+// whatever the verification was waiting on hands that cancellation straight
+// back. For a Client still holding a v0.2 Argon2 secret_hash that is the hash
+// queue: password.VerifyContext returns its caller's ctx.Err() instead of a
+// verdict once the queue is full, which an unauthenticated caller can arrange
+// by filling the queue with wrong secrets and then abandoning its next
+// requests. For the lookup it is pgx returning the same thing. Either way the
+// error arriving here is the caller's own doing, and recording it let one
+// unauthenticated caller raise resso_client_auth_errors_total and the ERROR log
+// at will against a database that was fine — the auth_time incident of
+// docs/operations.md a third time, and a claim this comment used to make from
+// reading rather than from measuring. So an attempt whose request is already
+// over is undecided without being recorded: nothing on this side failed, and
+// there is nothing to tell an operator about a question nobody is waiting for
+// an answer to. A real fault that coincides with a caller going away is dropped
+// along with it — the attempt cannot be attributed to either side, and a fault
+// that lasts is reported by the next request still there to be answered.
+//
+// Nor does an abandoned attempt spend either limiter's budget, which is worth
+// saying rather than leaving to follow from the return below. It buys the
+// caller nothing: the answer it would have learned from is written to a
+// connection that is gone, so there is no oracle to repeat. And charging it
+// would open a worse hole than the one it closes — anybody could lock any
+// Client, and any source address, out of all three of these endpoints by
+// sending twenty requests under that client_id and abandoning each one.
+//
+// What is left is a store that will not answer and a stored digest that will
+// not decode, neither of which a caller chooses and both of which are this
+// service's to report.
+//
+// The response is deliberately not changed. These three endpoints answer a
+// failed client authentication identically today and their contracts for a
+// fault on this side are not the same one — the token endpoint's 500, revoke's
+// 503 temporarily_unavailable, introspection's 200 active=false — so that is a
+// change per endpoint, not one made in the helper they share.
+//
+// clientID is not recorded. It arrives unverified on an unauthenticated
+// request and is the label that would be most useful and least bounded; the
+// Realm is the one this route resolved, and the route pattern says which of the
+// three endpoints was being called.
+func (s *Server) clientAuthUndecided(r *http.Request, realmName, stage string, err error) bool {
+	if err == nil || errors.Is(err, store.ErrNotFound) {
+		return false
+	}
+	if r.Context().Err() != nil {
+		return true
+	}
+	s.metrics.Add(metricClientAuthErrors, 1, stage)
+	s.logger.Error("a client authentication could not be decided", "trace_id", traceIDFrom(r.Context()),
+		"realm", realmName, "route", routePattern(r), "stage", stage, "error", err)
+	return true
 }
 
 // writeClientAuthError emits the shared invalid_client response, upgrading it

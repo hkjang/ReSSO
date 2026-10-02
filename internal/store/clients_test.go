@@ -20,6 +20,30 @@ func TestNormalizeWebOrigins(t *testing.T) {
 	}
 }
 
+// client_id is text, so an identifier carrying a byte that column cannot hold
+// matches no row — but PostgreSQL does not say so, it refuses the parameter
+// (SQLSTATE 22021) and that refusal is the store error an unreadable clients
+// table returns. Every caller of ClientByIdentifier takes the identifier from
+// an unauthenticated request and treats such an error as a fault on this side:
+// the token endpoint's undecided-authentication alarm, the authorization
+// endpoint's 500, logout's client_unavailable. So a caller choosing these bytes
+// could report an outage that was not happening, which is why they are settled
+// as absent before the query rather than asked about.
+func TestStorableIdentifierRejectsWhatNoRowCanHold(t *testing.T) {
+	for _, unstorable := range []string{"bad-\xff\xfe-utf8", "bad-\x00-nul", "\xc3", "\x00"} {
+		if storableIdentifier(unstorable) {
+			t.Errorf("storableIdentifier(%q) = true, but no client_id can hold those bytes", unstorable)
+		}
+	}
+	// Everything a Client can actually be registered under still reaches the
+	// table, including the non-ASCII identifiers that are perfectly storable.
+	for _, storable := range []string{"", "web-app", "클라이언트", "a.b-c_d~e+f/g", "ünïcode"} {
+		if !storableIdentifier(storable) {
+			t.Errorf("storableIdentifier(%q) = false, but that is a registrable identifier", storable)
+		}
+	}
+}
+
 func TestValidateURIsAllowsIPv6Loopback(t *testing.T) {
 	if err := validateURIs([]string{"http://[::1]:8080/callback"}, false); err != nil {
 		t.Fatalf("IPv6 loopback URI rejected: %v", err)
