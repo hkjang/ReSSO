@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.9.97
+
+**`clients` 테이블이 답하지 못한 장애를 "Secret이 틀렸다"로 읽어 RP의 Rate limit 예산을 깎던 것을 바로잡습니다 — 장애가 걷힌 뒤에도 Secret이 처음부터 맞았던 Client가 남은 창 동안 429로 막혔습니다.** OIDC Client 자격증명 조회 두 곳이 낼 수 있는 모든 오류가 "Secret 불일치"로 읽혔고, **401은 그중 가장 사소한 결과였습니다.** 그 시도는 Client당 20회·주소당 200회의 두 Failure limiter에 함께 집계되었고, 창은 첫 실패로부터 5분 고정이며 성공으로만 비워집니다 — RP가 Refresh 교환을 재시도하는 몇 초면 예산을 다 쓰므로, **테이블이 돌아온 뒤에도 그 Client는 남은 5분 동안 429**였습니다. 장애는 끝났고 Secret은 처음부터 맞았는데 RP만 계속 죽어 있는 상태입니다. 붐비는 Realm에서는 같은 일이 **출처 주소**에도 일어나 그 주소를 쓰는 다른 Client까지 함께 데려갔습니다. 같은 시도가 `resso_client_auth_failures_total`에도 세어졌는데, 운영 가이드가 그 계열을 "Secret 오설정 또는 대입 시도"로 읽으라고 말하므로 **저장소 장애가 일어나지도 않은 자격증명 사고를, 그 질문에 답하는 유일한 계열에서 울렸습니다.** 그리고 저장소 오류 자체는 아무 데도 남지 않았습니다 — 호출자 셋이 그것을 `writeClientAuthError`에 넘기고 그 함수는 Rate limit 경우만 봅니다. 위의 두 가지를 모두 한 장애가 **로그 한 줄도 남기지 않았습니다.**
+
+### 수정
+
+- **판정하지 못한 Client 인증은 두 Limiter 어느 쪽도 깎지 않습니다.** `verifyOIDCClient`가 도달한 단계를 이름으로 돌려주고, 새 `clientAuthUndecided`가 **이쪽 장애**와 **자격증명에 대한 판정**을 가릅니다. 장애는 Limiter를 건드리지 않고 `resso_client_auth_errors_total{stage}`에 세며(`client` — `client_id` 조회, `secret` — Secret 검증), ERROR 로그 `a client authentication could not be decided` 한 줄이 `trace_id` · `realm` · `route` · `stage` · `error`를 담아 **세 Endpoint 중 어디였는지**를 말합니다. **`client_id`는 로그에 남기지 않습니다** — 인증 없이 보낼 수 있는 미검증 값입니다.
+- **등록되지 않은 `client_id`와 읽어서 거절한 Secret은 전과 같습니다.** `store.ErrNotFound`는 집계되는 경로에 그대로 둡니다 — 아무도 등록하지 않은 식별자는 실제 답이고 식별자를 바꿔 가며 대입하는 호출자가 받는 답이며, 그것이 두 Limiter가 존재하는 이유입니다. 그 둘은 여전히 `resso_client_auth_failures_total`에 세고 예산을 깎습니다.
+- **`text` 컬럼이 담을 수 없는 `client_id`는 조회 전에 "없음"으로 판정합니다.** UTF-8이 아닌 바이트나 NUL이 섞인 값은 어떤 행의 `client_id`도 될 수 없는데, PostgreSQL은 그것을 "그런 행 없음"으로 답하지 않고 **질의 인자로 거절합니다**(SQLSTATE 22021, `invalid byte sequence for encoding "UTF8"`) — 그 거절은 모든 호출자에게 `clients` 테이블이 멈춘 것과 구별되지 않습니다. 식별자는 **자격증명을 전혀 담지 않은 요청에서 그대로 올라오므로**(`client_id=bad-%ff`), 인증 없는 호출자가 정상인 데이터베이스에 대해 이쪽 장애 경보를 **한도 없이** 울릴 수 있었습니다. 이제 `ClientByIdentifier`가 그 사실이 속한 자리에서 `store.ErrNotFound`로 settle합니다. **`docs/operations.md`의 `auth_time` 사건과 같은 모양이고 답도 같습니다** — 거절이 장애로 읽히는 질문을 아예 하지 않습니다.
+- **검증 중에 호출자가 연결을 끊은 시도는 어느 계열에도 세지 않고 로그도 남기지 않습니다.** 연결이 끊기면 요청 context가 끝나고(이 Route에는 Deadline을 거는 미들웨어가 없으므로 그것 말고는 context를 끝내는 것이 없습니다) 기다리던 쪽이 그 취소를 그대로 올립니다 — v0.2 Argon2 `secret_hash`가 남은 Client라면 `password.VerifyContext`의 Argon2 대기열이, 그 밖에는 `clients` 조회의 pgx가. **틀린 Secret으로 대기열을 채운 뒤 다음 요청들을 끊으면** 인증 없는 호출자가 정상인 데이터베이스에 대해 같은 경보를 다시 한도 없이 울릴 수 있었습니다(`auth_time` 사건의 세 번째 반복입니다). 예산도 깎지 않습니다 — 답이 이미 끊긴 연결로 쓰이므로 호출자가 배우는 것이 없고, **반대로 깎으면 누구나 남의 `client_id`로 요청 20개를 보내 놓고 끊는 것만으로 그 Client와 그 주소를 세 Endpoint에서 잠글 수 있습니다.** 호출자가 떠난 순간에 겹친 진짜 장애는 함께 버려지지만, 계속되는 장애는 **답을 기다리는 다음 요청이** 올립니다.
+- **응답은 의도적으로 바뀌지 않았습니다.** 이 Helper를 함께 쓰는 세 Endpoint는 이쪽 장애에 대한 Contract가 서로 다릅니다 — `/token`은 500, `/revoke`는 503 `temporarily_unavailable`, Introspection은 200 `active=false` — 그러니 그것은 Endpoint별 변경이고 여기서 할 일이 아닙니다. 지금은 셋 모두 전과 같이 401 `invalid_client`입니다.
+- **콘솔 테스트가 npm 자신의 Node에서 돌도록 `web/package.json`의 모든 스크립트가 `${npm_node_execpath%/*}`를 PATH 앞에 둡니다.** npm은 스크립트를 실행할 때 **모든 상위 디렉터리**의 `node_modules/.bin`을 PATH에 앞세우는데, 이 저장소를 홈 아래 경로에서 작업하면 거기 설치된 `node` 패키지의 `.bin/node` 심링크가 실제 설치된 Node보다 먼저 잡힙니다. `vitest`는 `#!/usr/bin/env node` Shebang 스크립트이므로 그 shim을 집어 Node 20.19.2로 돌았고, `worker_threads.markAsUncloneable`(Node 22.10.0 추가)이 없어 undici가 `webidl.util.markAsUncloneable`에 undefined를 넣고 jsdom이 Module 로드 시점에 터져 **29개 중 26개 테스트 파일이 수집조차 되지 않았습니다.** 의존성은 `v0.9.92` 이후 한 글자도 움직이지 않았으므로 **Lockfile도 의존성도 고치지 않았습니다** — 잘못된 것은 Runtime이었습니다. Bin shim은 전과 같이 로컬 `node_modules/.bin`에서 찾고, 집어 쓰는 인터프리터만 고정됩니다.
+- `docs/operations.md`의 `resso_client_auth_errors_total`·`resso_client_auth_failures_total` 경보 항목과 README 지표 표에 위의 내용(두 예외가 닫혔다는 것, Limiter 피해가 응답보다 오래 남는다는 것, 찾아볼 로그 문구)을 적었습니다.
+
+### 확인
+
+- 새 연동 테스트 `TestIntegrationClientAuthSaysWhenItCouldNotDecide` — 실제 PostgreSQL과 프로덕션 Handler로, Limiter가 한 Server에 있어 모든 요청이 장애가 쓰던 그 예산을 나눕니다. 장애는 `ALTER TABLE clients RENAME`으로 만들고 즉시 되돌립니다. (a) **되돌린 뒤 한 번도 틀린 적 없는 Secret이 곧바로 200을 받습니다** — 전에는 남은 창 동안 429였고, 그것이 이 릴리즈의 요점이므로 직접 확인합니다 (b) 장애 중 시도는 전부 401 `invalid_client`이며 `stage="client"`로 세어지고 시도 수만큼의 로그 줄을 남깁니다 (c) 그중 어느 것도 `resso_client_auth_failures_total`에 세어지지 않습니다 (d) Secret은 로그에 없습니다 (e) **읽어서 거절한 Secret은 여전히 실패로 세고 20회로 예산을 다 써 429가 되며**, 장애 신호는 움직이지 않습니다 (f) 등록되지 않은 `client_id`도 같은 쪽입니다 (g) `text`에 담길 수 없는 바이트의 `client_id`도 이제 같은 쪽이며 — 전에는 하나하나가 `stage="client"`를 올리고 장애 로그를 남기면서 예산은 깎지 않았습니다.
+- 새 연동 테스트 `TestIntegrationClientAuthSeparatesABrokenDigestFromACallerThatHungUp` — `stage="secret"`의 두 답이 서로 반대라는 것을 못으로 박습니다. (a) **디코딩되지 않는 저장된 digest는 이쪽 잘못입니다**(`hmac` 접두는 살려 두어 앞에서 거절되지 않게 하고 Payload만 base64가 아니게 만듭니다): `stage="secret"`으로 세고 로그를 남기며, 자격증명 실패로는 세지 않고 — digest를 고쳐 쓰면 **즉시** 인증됩니다(예산을 쓰지 않았다는 뜻입니다). (b) **검증 중에 끊은 호출자는 아니다**: `clients`를 열린 트랜잭션의 `ACCESS EXCLUSIVE`로 잡아 조회를 Lock 대기열에 세우고, **그 요청 자신의 대기가 대기열에 나타나는 것을 Poll로 확인한 뒤** 끊어 취소가 검증 **안에서** 일어나게 합니다. 그 결과 계열도 로그도 (a)가 남긴 값에서 1도 움직이지 않고, 예산도 깎이지 않아 그 Client가 그대로 인증됩니다.
+- 새 단위 테스트 `TestStorableIdentifierRejectsWhatNoRowCanHold` — `"bad-\xff\xfe-utf8"` · `"bad-\x00-nul"` · `"\xc3"` · `"\x00"`은 조회 전에 거르고, 실제로 등록할 수 있는 식별자(`"web-app"` · `"클라이언트"` · `"a.b-c_d~e+f/g"` · `"ünïcode"` 등 비ASCII 포함)는 전과 같이 테이블까지 갑니다.
+- **수정 전에 실제로 실패함을 확인**했습니다 — 저장소 장애가 예산을 깎던 것(`a clients table that could not be read spent the Client's attempt budget`), `client_id=bad-%ff`가 정상 데이터베이스에서 경보를 울리던 것, 끊은 호출자가 같은 경보를 울리던 것이 각각 그 단언에서 걸립니다.
+- 콘솔은 `cd web && npm ci` 뒤 `npm test`가 **29파일 161테스트**로 통과합니다(`v0.9.96` 기준선과 같습니다). 같은 트리에서 예전 스크립트 형태(`npm exec -c 'vitest run'`)는 **여전히 26개 오류를 재현**하므로, 고친 것이 우연이 아니라 이 원인에 묶여 있습니다.
+- 릴리즈 준비에서 `make lint`, `make test`(Go `-race` 전 패키지 · 연동 SKIP 0 · `go vet` · 콘솔 29파일 161테스트 · 빌드), `make build VERSION=v0.9.97`, `git diff --check`가 통과했습니다.
+
+### Upgrade notes
+
+**응답은 한 글자도 바뀌지 않습니다.** `/token` · `/revoke` · Introspection의 Client 인증은 성공이든 실패든 전과 같고, 판정하지 못한 경우도 전과 같이 401 `invalid_client`입니다. **마이그레이션도 설정 변경도 없고** 이전 `v0.9.96` 이미지로 롤백할 수 있습니다.
+
+**달라지는 것은 Rate limit입니다 — 좋은 방향으로.** `clients`를 읽지 못하는 동안, 또는 저장된 digest가 깨진 Client에 대해, 그 시도는 이제 Client당 20회·주소당 200회의 예산을 깎지 않습니다. **장애가 걷히면 RP가 창을 기다리지 않고 즉시 회복합니다.** 반대로 **등록되지 않은 `client_id`와 틀린 Secret은 전과 똑같이 예산을 깎으므로** 대입을 막는 한도는 그대로입니다.
+
+**`resso_client_auth_failures_total`에 경보를 걸어 두었다면 이제 그 계열은 저장소 장애로 울리지 않습니다** — 즉 그 계열이 오르면 실제로 Secret 오설정이거나 누군가 대입하고 있는 것입니다. 대신 `/metrics`에 계열 하나(`resso_client_auth_errors_total`, 라벨 `stage`는 `client` · `secret`)가 늘어납니다. **이 계열이 오르면 언제나 이쪽 장애**이므로 경보를 새로 걸 곳입니다 — 401은 이 경로에서 평범한 답이라 요청 카운터로는 "RP 설정이 잘못된 조용한 시기"와 구별되지 않습니다. 호출자가 연결을 끊어 생긴 취소와 `text`에 담길 수 없는 `client_id`는 이 계열에 세지 않으므로, **외부에서 이 경보를 울릴 수 있는 길은 없습니다.**
+
+로그를 기계로 읽는다면 **`a client authentication could not be decided`가 새 메시지로 나타날 수 있습니다.** 정상 운영에서는 나오지 않는 줄이고 시도 하나에 한 줄이며, `route`로 세 Endpoint 중 어디였는지 구별됩니다.
+
+**저장소를 체크아웃해 개발하는 분들께:** `cd web && npm test`가 상위 디렉터리의 `node_modules/.bin/node`에 걸려 Node 20으로 돌던 문제가 사라집니다. 설치된 의존성은 전과 같으므로 `npm ci`를 다시 돌릴 필요는 없습니다.
+
 ## v0.9.96
 
 **UserInfo가 판정하지 못한 요청을 `resso_userinfo_errors_total{stage}`로 셉니다 — 어느 조회가 멈췄는지가 지금까지 서버 로그 한 줄에만 있었습니다.** `/userinfo` 뒤에는 서로 무관한 조회 여섯(Realm, Token 폐기 여부, 계정, 세션, Realm Role, Client Role)이 서 있고, 그중 무엇이 실패하든 `writeUserInfoUnavailable` 한 곳을 지나 똑같은 500 `server_error`로 나갑니다. 이 답 자체는 옳습니다 — Token은 멀쩡하고 RP가 고칠 것이 없으므로 401로 답하면 RP가 쓸 수 있는 자격증명을 버리고 사람을 로그아웃시킵니다. 문제는 **그 헬퍼가 ERROR 로그 한 줄만 남기고 지표에는 아무것도 남기지 않았다**는 것입니다. 운영자가 보는 것은 `resso_http_requests_total{route,status}`의 500 하나뿐이고, 여섯 중 어느 조회가 무너졌는지는 로그를 뒤져야 알 수 있었습니다. **같은 모양의 `errors_total` 계열 넷 중 UserInfo만 빠져 있었습니다** — Introspection·인가·Token은 "로그를 읽지 않아도 조회가 멈춘 것을 안다"는 바로 그 목적으로 이미 계열을 갖고 있었고, 이 Endpoint만 그 묶음 밖에 있었습니다.
