@@ -22,6 +22,17 @@ const (
 	metricTokenErrors = "resso_token_errors_total"
 	metricLogins      = "resso_login_attempts_total"
 	metricClientAuth  = "resso_client_auth_failures_total"
+	// metricClientAuthErrors counts the OIDC client authentications this
+	// service could not decide, as opposed to the ones it decided against.
+	// Both leave as 401 invalid_client, which is the ordinary answer on this
+	// path, so the request counter reads an outage here as a quiet spell of
+	// misconfigured relying parties. The series above cannot carry them: the
+	// operations guide reads a spike in it as a wrong secret or somebody
+	// guessing one, and a clients table that stopped answering is neither —
+	// counting it there turned every store fault into a credential incident
+	// that never happened, under the one series an operator is told to trust
+	// for that question.
+	metricClientAuthErrors = "resso_client_auth_errors_total"
 	// metricIntrospectionErrors counts the introspections the service could
 	// not judge, as opposed to the ones it judged dead. Both answer 200 with
 	// active=false, so without this series the two are the same call in every
@@ -65,6 +76,8 @@ func registerMetrics(registry *observability.Registry) {
 	registry.Counter(metricTokenErrors, "Token requests the service could not fulfil, by grant type.", "grant_type")
 	registry.Counter(metricLogins, "Browser login attempts, by outcome.", "result")
 	registry.Counter(metricClientAuth, "Failed OIDC client authentications.", "realm")
+	registry.Counter(metricClientAuthErrors,
+		"OIDC client authentications the service could not decide, by the step that failed.", "stage")
 	registry.Counter(metricIntrospectionErrors,
 		"Introspections the service could not judge, by the lookup that failed.", "stage")
 	registry.Counter(metricUserInfoErrors,
