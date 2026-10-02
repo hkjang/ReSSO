@@ -189,7 +189,7 @@ scrape_configs:
 | `resso_token_errors_total` | Grant type별 발급하지 못한 Token 요청 수 |
 | `resso_login_attempts_total` | 로그인 성공·실패·Rate limit·처리 실패 수 |
 | `resso_client_auth_failures_total` | Realm별 OIDC Client 인증 실패 수(Secret이 틀린 경우. 판정하지 못한 경우는 아래 계열입니다) |
-| `resso_client_auth_errors_total` | 판정하지 못한 OIDC Client 인증 수(실패한 단계별 — `client`·`secret`). 401로 나가는 것은 Secret이 틀린 경우와 같고, 이 시도는 Rate limit 예산을 깎지 않습니다 |
+| `resso_client_auth_errors_total` | 판정하지 못한 OIDC Client 인증 수(실패한 단계별 — `client`·`secret`). 401로 나가는 것은 Secret이 틀린 경우와 같고, 이 시도는 Rate limit 예산을 깎지 않습니다. 검증 중에 호출자가 연결을 끊은 시도는 이쪽 장애가 아니므로 이 계열에도 세지 않습니다(예산도 깎지 않습니다) |
 | `resso_introspection_errors_total` | 판정하지 못한 Introspection 수(실패한 조회 단계별). 죽은 Token으로 판정한 경우와 달리 서비스가 답을 낼 수 없었던 경우입니다 |
 | `resso_userinfo_errors_total` | 판정하지 못한 UserInfo 요청 수(실패한 조회 단계별). 500 `server_error`로 나가지만 그 뒤에 조회 여섯이 있어 어느 것이 멈췄는지는 이 계열에만 있습니다 |
 | `resso_authorization_errors_total` | 처리하지 못한 인가 요청 수(실패한 단계별). 대부분 302로 나가므로 성공한 인가와 HTTP 상태가 같습니다 |

@@ -836,18 +836,47 @@ func (s *Server) verifyOIDCClient(r *http.Request, realm domain.Realm, clientID,
 // cycling identifiers gets, which is the bound both limiters exist for.
 //
 // That bound only holds while nothing excluded here can be reached on demand,
-// and one thing could: a client_id that is not valid UTF-8, or that carries a
-// NUL, is refused by PostgreSQL as a parameter rather than answered as a
-// missing row (SQLSTATE 22021), so client_id=bad-%ff arrived here as a store
-// error — counted as an outage, logged as one, and bounded by neither limiter,
-// from an unauthenticated request, as often as the caller liked. Such an
-// identifier is now settled as store.ErrNotFound before the query, in
-// ClientByIdentifier, where the fact that no row can hold those bytes belongs;
-// the comment there has the rest. What is left is a store that will not answer
-// and a stored digest that will not decode, neither of which a caller chooses.
-// A request abandoned mid-verification is the one a caller can still cause, and
-// it buys nothing — the answer it would have learned from is never sent, so no
-// attempt is spent and no attempt is made.
+// and two things could. The first was a client_id that is not valid UTF-8, or
+// that carries a NUL: PostgreSQL refuses it as a parameter rather than
+// answering it as a missing row (SQLSTATE 22021), so client_id=bad-%ff arrived
+// here as a store error — counted as an outage, logged as one, and bounded by
+// neither limiter, from an unauthenticated request, as often as the caller
+// liked. Such an identifier is now settled as store.ErrNotFound before the
+// query, in ClientByIdentifier, where the fact that no row can hold those bytes
+// belongs; the comment there has the rest.
+//
+// The second is a caller that hangs up while its credential is being verified,
+// and it is what the first check below is for. Hanging up ends the request
+// context — nothing else does, because no middleware on this route puts a
+// deadline on it, and the server cancels it when the connection goes — and
+// whatever the verification was waiting on hands that cancellation straight
+// back. For a Client still holding a v0.2 Argon2 secret_hash that is the hash
+// queue: password.VerifyContext returns its caller's ctx.Err() instead of a
+// verdict once the queue is full, which an unauthenticated caller can arrange
+// by filling the queue with wrong secrets and then abandoning its next
+// requests. For the lookup it is pgx returning the same thing. Either way the
+// error arriving here is the caller's own doing, and recording it let one
+// unauthenticated caller raise resso_client_auth_errors_total and the ERROR log
+// at will against a database that was fine — the auth_time incident of
+// docs/operations.md a third time, and a claim this comment used to make from
+// reading rather than from measuring. So an attempt whose request is already
+// over is undecided without being recorded: nothing on this side failed, and
+// there is nothing to tell an operator about a question nobody is waiting for
+// an answer to. A real fault that coincides with a caller going away is dropped
+// along with it — the attempt cannot be attributed to either side, and a fault
+// that lasts is reported by the next request still there to be answered.
+//
+// Nor does an abandoned attempt spend either limiter's budget, which is worth
+// saying rather than leaving to follow from the return below. It buys the
+// caller nothing: the answer it would have learned from is written to a
+// connection that is gone, so there is no oracle to repeat. And charging it
+// would open a worse hole than the one it closes — anybody could lock any
+// Client, and any source address, out of all three of these endpoints by
+// sending twenty requests under that client_id and abandoning each one.
+//
+// What is left is a store that will not answer and a stored digest that will
+// not decode, neither of which a caller chooses and both of which are this
+// service's to report.
 //
 // The response is deliberately not changed. These three endpoints answer a
 // failed client authentication identically today and their contracts for a
@@ -862,6 +891,9 @@ func (s *Server) verifyOIDCClient(r *http.Request, realm domain.Realm, clientID,
 func (s *Server) clientAuthUndecided(r *http.Request, realmName, stage string, err error) bool {
 	if err == nil || errors.Is(err, store.ErrNotFound) {
 		return false
+	}
+	if r.Context().Err() != nil {
+		return true
 	}
 	s.metrics.Add(metricClientAuthErrors, 1, stage)
 	s.logger.Error("a client authentication could not be decided", "trace_id", traceIDFrom(r.Context()),

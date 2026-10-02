@@ -1781,6 +1781,254 @@ func TestIntegrationClientAuthSaysWhenItCouldNotDecide(t *testing.T) {
 	}
 }
 
+// The second half of the same question, on its own Server so that the limiter
+// budgets below are this test's alone.
+//
+// The test above only ever reaches the "client" step, so the comment on
+// clientAuthUndecided described the other one, stage="secret", from reading:
+// nothing a caller sends could get there, so whatever did had to be a fault on
+// this side. That was wrong. A caller that hangs up while its secret is being
+// verified ends the request context, the Argon2 queue hands back that
+// cancellation, and the cancellation arrived here as an outage — counted in
+// resso_client_auth_errors_total, logged as ERROR, and bounded by neither
+// limiter, which is an unauthenticated caller ringing this service's own alarm
+// against a database that is fine. It is the auth_time incident a third time.
+//
+// So both answers at that step need pinning, and they are opposites:
+//   - (a) a stored digest that will not decode is this side's fault. The row was
+//     read, the credential was not judged, and an operator has to be told.
+//   - (b) a caller that hung up is not. Nothing is recorded, and nothing is
+//     spent either: the answer is never delivered, so the caller learns nothing
+//     to make it worth repeating, and charging it to the limiters would let one
+//     unauthenticated caller lock any Client — and any address — out with
+//     requests it abandons on purpose.
+func TestIntegrationClientAuthSeparatesABrokenDigestFromACallerThatHungUp(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "auth-undecided-secret", Name: "Auth Undecided Secret", Type: "confidential",
+		RedirectURIs: []string{"https://auth-undecided.example.test/cb"},
+		GrantTypes:   []string{"client_credentials"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, nil))
+	metrics := observability.NewRegistry()
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	const tokenPath = "/realms/master/protocol/openid-connect/token"
+	tokenWith := func(secret string) (int, string) {
+		t.Helper()
+		response, postErr := server.Client().PostForm(server.URL+tokenPath,
+			url.Values{"grant_type": {"client_credentials"}, "client_id": {"auth-undecided-secret"},
+				"client_secret": {secret}, "scope": {"openid"}})
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+	exported := func(prefix string) string {
+		var written strings.Builder
+		metrics.WritePrometheus(&written)
+		for _, line := range strings.Split(written.String(), "\n") {
+			if strings.HasPrefix(line, prefix) {
+				return line
+			}
+		}
+		return ""
+	}
+	undecidedLines := func() int {
+		count := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, "a client authentication could not be decided") {
+				count++
+			}
+		}
+		return count
+	}
+
+	if status, body := tokenWith(created.ClientSecret); status != http.StatusOK {
+		t.Fatalf("the correct secret answered %d %s before any fault was injected", status, body)
+	}
+
+	// (a) The row is there and readable; what it holds is not a digest. The hmac
+	// prefix is intact so nothing earlier rejects it, and the payload is not
+	// base64, so VerifyClientSecret refuses it before any comparison — the one
+	// stage="secret" fault reachable through this endpoint against a database
+	// that is answering normally.
+	if _, err := data.Pool.Exec(ctx, `UPDATE clients SET secret_hash=$2 WHERE id=$1`,
+		created.Client.ID, "hmac-sha256$this is not base64"); err != nil {
+		t.Fatal(err)
+	}
+	const attempts = clientAuthMaxFailures
+	for i := 0; i < attempts; i++ {
+		status, body := tokenWith(created.ClientSecret)
+		if status != http.StatusUnauthorized || !strings.Contains(body, `"error":"invalid_client"`) {
+			t.Fatalf("attempt %d against a broken digest answered %d %s, want 401 invalid_client",
+				i+1, status, body)
+		}
+	}
+	if got := exported(`resso_client_auth_errors_total{stage="secret"}`); got !=
+		`resso_client_auth_errors_total{stage="secret"} `+strconv.Itoa(attempts) {
+		t.Fatalf("a stored digest that will not decode was not counted at the secret step: %q", got)
+	}
+	if got := undecidedLines(); got != attempts {
+		t.Fatalf("a stored digest that will not decode left %d log line(s) for %d attempts:\n%s",
+			got, attempts, logs.String())
+	}
+	if got := exported("resso_client_auth_failures_total"); got != "" {
+		t.Fatalf("a stored digest that will not decode was counted as a credential failure: %q", got)
+	}
+	// And it spent nothing: a new secret written over the broken digest
+	// authenticates at once, where the twenty attempts above would otherwise
+	// have left this Client answering 429 for the rest of the window.
+	repaired, err := data.RotateClientSecret(ctx, created.Client.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, body := tokenWith(repaired); status != http.StatusOK {
+		t.Fatalf("the Client could not authenticate after its digest was repaired: %d %s", status, body)
+	}
+
+	// (b) A caller that hangs up mid-verification. The clients table is held
+	// under ACCESS EXCLUSIVE in an open transaction, so the lookup this request
+	// makes parks in PostgreSQL's lock queue; the poll below waits for the
+	// request's own wait to appear there, which is what makes the cancellation
+	// land inside the verification rather than before it. Then the caller goes
+	// away, pgx hands back its context's cancellation, and that is the error
+	// this service has to attribute to the caller and not to itself.
+	blocker, err := data.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		_ = blocker.Rollback(context.Background())
+	}
+	// Every other test sharing this container reads the clients table, so the
+	// lock cannot outlive this one even if it fails part way through.
+	t.Cleanup(release)
+	if _, err := blocker.Exec(ctx, "LOCK TABLE clients IN ACCESS EXCLUSIVE MODE"); err != nil {
+		release()
+		t.Fatal(err)
+	}
+
+	answered := func() int {
+		count := 0
+		var written strings.Builder
+		metrics.WritePrometheus(&written)
+		for _, line := range strings.Split(written.String(), "\n") {
+			if strings.Contains(line, `route="/realms/{realm}/protocol/openid-connect/token"`) &&
+				strings.HasPrefix(line, "resso_http_requests_total") {
+				fields := strings.Fields(line)
+				n, _ := strconv.Atoi(fields[len(fields)-1])
+				count += n
+			}
+		}
+		return count
+	}
+	before := answered()
+
+	requestCtx, hangUp := context.WithCancel(context.Background())
+	body := url.Values{"grant_type": {"client_credentials"}, "client_id": {"auth-undecided-secret"},
+		"client_secret": {repaired}, "scope": {"openid"}}
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, server.URL+tokenPath,
+		strings.NewReader(body.Encode()))
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	sent := make(chan error, 1)
+	go func() {
+		response, doErr := server.Client().Do(request)
+		if response != nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+		}
+		sent <- doErr
+	}()
+
+	waiting := func() bool {
+		var count int
+		if err := data.Pool.QueryRow(context.Background(), `SELECT count(*) FROM pg_locks l
+			JOIN pg_class c ON c.oid=l.relation WHERE c.relname='clients' AND NOT l.granted`).Scan(&count); err != nil {
+			return false
+		}
+		return count > 0
+	}
+	parked := false
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
+		if waiting() {
+			parked = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !parked {
+		release()
+		t.Fatal("the request never reached the clients lookup, so cancelling it would prove nothing")
+	}
+	hangUp()
+	if doErr := <-sent; doErr == nil {
+		release()
+		t.Fatal("the abandoned request was answered, so the caller did not hang up mid-verification")
+	}
+	// The handler is still running when Do returns, so wait for the request
+	// counter the middleware writes after it to move before reading anything.
+	for deadline := time.Now().Add(20 * time.Second); answered() == before && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if answered() == before {
+		release()
+		t.Fatal("the abandoned request never finished being handled")
+	}
+	release()
+
+	// Nothing about this service failed, so nothing about it is recorded. The
+	// counts below are exactly what (a) left behind.
+	if got := exported(`resso_client_auth_errors_total{stage="client"}`); got != "" {
+		t.Errorf("a caller that hung up raised the undecided-authentication alarm against a healthy "+
+			"database: %q", got)
+	}
+	if got := exported(`resso_client_auth_errors_total{stage="secret"}`); got !=
+		`resso_client_auth_errors_total{stage="secret"} `+strconv.Itoa(attempts) {
+		t.Errorf("a caller that hung up was counted as a fault this service could not decide: %q", got)
+	}
+	if got := undecidedLines(); got != attempts {
+		t.Errorf("a caller that hung up was logged as a fault on this side (%d line(s) for %d):\n%s",
+			got, attempts, logs.String())
+	}
+	// And it spends nothing either, or one caller could lock any Client out of
+	// this endpoint with requests it abandons on purpose.
+	if got := exported("resso_client_auth_failures_total"); got != "" {
+		t.Errorf("a caller that hung up spent the Client's attempt budget: %q", got)
+	}
+	if status, body := tokenWith(repaired); status != http.StatusOK {
+		t.Errorf("the Client could not authenticate after a caller hung up on its behalf: %d %s",
+			status, body)
+	}
+}
+
 func TestIntegrationRefreshTokenReuseNamesTheAccount(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()
