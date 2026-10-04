@@ -1627,14 +1627,44 @@ func TestIntegrationClientAuthSaysWhenItCouldNotDecide(t *testing.T) {
 		_, _ = data.Pool.Exec(context.Background(), "ALTER TABLE clients_hidden RENAME TO clients")
 	})
 
+	// The same request as tokenWith, keeping the response headers: what the
+	// answer must not carry is as much of this endpoint's contract as the status.
+	outageAttempt := func() (int, string, http.Header) {
+		t.Helper()
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token",
+			url.Values{"grant_type": {"client_credentials"}, "client_id": {"auth-outage-rp"},
+				"client_secret": {created.ClientSecret}, "scope": {"openid"}})
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body), response.Header
+	}
+
 	const attempts = clientAuthMaxFailures
 	for i := 0; i < attempts; i++ {
-		status, body := tokenWith(created.ClientSecret)
-		// The answer is the one it has always been. What the fault must not do is
-		// decide anything about the credential it never read.
-		if status != http.StatusUnauthorized || !strings.Contains(body, `"error":"invalid_client"`) {
+		status, body, header := outageAttempt()
+		// invalid_client means "the credential you sent is not the one on file",
+		// and a relying party acting on it pages somebody or rotates a secret that
+		// was right the whole time. This fault never read the credential, so the
+		// answer is the one the token endpoint already gives for every other
+		// lookup of its own that will not complete.
+		if status != http.StatusInternalServerError || !strings.Contains(body, `"error":"server_error"`) {
 			restore()
-			t.Fatalf("attempt %d during the outage answered %d %s, want 401 invalid_client", i+1, status, body)
+			t.Fatalf("attempt %d during the outage answered %d %s, want 500 server_error", i+1, status, body)
+		}
+		if strings.Contains(body, "invalid_client") {
+			restore()
+			t.Fatalf("attempt %d during the outage still blamed the credential: %s", i+1, body)
+		}
+		// WWW-Authenticate invites the caller to present a different credential,
+		// which is not what is wrong here.
+		if got := header.Get("WWW-Authenticate"); got != "" {
+			restore()
+			t.Fatalf("attempt %d during the outage challenged the caller's credential: WWW-Authenticate=%q",
+				i+1, got)
 		}
 	}
 	restore()
@@ -1878,8 +1908,12 @@ func TestIntegrationClientAuthSeparatesABrokenDigestFromACallerThatHungUp(t *tes
 	const attempts = clientAuthMaxFailures
 	for i := 0; i < attempts; i++ {
 		status, body := tokenWith(created.ClientSecret)
-		if status != http.StatusUnauthorized || !strings.Contains(body, `"error":"invalid_client"`) {
-			t.Fatalf("attempt %d against a broken digest answered %d %s, want 401 invalid_client",
+		// A digest this service stored and cannot read back is its fault, not the
+		// caller's, so the token endpoint answers it the way it answers its other
+		// unfinished lookups rather than telling a relying party its secret is
+		// wrong.
+		if status != http.StatusInternalServerError || !strings.Contains(body, `"error":"server_error"`) {
+			t.Fatalf("attempt %d against a broken digest answered %d %s, want 500 server_error",
 				i+1, status, body)
 		}
 	}
@@ -1946,7 +1980,30 @@ func TestIntegrationClientAuthSeparatesABrokenDigestFromACallerThatHungUp(t *tes
 		}
 		return count
 	}
+	// The reader above deliberately ignores the status label, so it counts the
+	// abandoned request whatever it was answered with — which is what makes it
+	// usable as the handler-finished signal below. This one is the opposite: it
+	// reads only the faults this endpoint reported, because an outage signal an
+	// unauthenticated caller can raise on demand is the hole that was closed once
+	// already, and the 500 this endpoint now answers an undecided authentication
+	// with is a second way to raise it.
+	faulted := func() int {
+		count := 0
+		var written strings.Builder
+		metrics.WritePrometheus(&written)
+		for _, line := range strings.Split(written.String(), "\n") {
+			if strings.HasPrefix(line, "resso_http_requests_total") &&
+				strings.Contains(line, `route="/realms/{realm}/protocol/openid-connect/token"`) &&
+				strings.Contains(line, `status="500"`) {
+				fields := strings.Fields(line)
+				n, _ := strconv.Atoi(fields[len(fields)-1])
+				count += n
+			}
+		}
+		return count
+	}
 	before := answered()
+	beforeFaults := faulted()
 
 	requestCtx, hangUp := context.WithCancel(context.Background())
 	body := url.Values{"grant_type": {"client_credentials"}, "client_id": {"auth-undecided-secret"},
@@ -2017,6 +2074,14 @@ func TestIntegrationClientAuthSeparatesABrokenDigestFromACallerThatHungUp(t *tes
 	if got := undecidedLines(); got != attempts {
 		t.Errorf("a caller that hung up was logged as a fault on this side (%d line(s) for %d):\n%s",
 			got, attempts, logs.String())
+	}
+	// Including in the request counter. This endpoint answers an undecided
+	// authentication with 500 now, so if a cancellation were allowed through that
+	// branch an unauthenticated caller could put this route's error rate wherever
+	// it liked by abandoning requests — the same hole, through a different series.
+	if got := faulted(); got != beforeFaults {
+		t.Errorf("a caller that hung up was answered as a fault on this side: "+
+			"resso_http_requests_total{status=\"500\"} went %d -> %d", beforeFaults, got)
 	}
 	// And it spends nothing either, or one caller could lock any Client out of
 	// this endpoint with requests it abandons on purpose.
