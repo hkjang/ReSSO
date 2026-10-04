@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.9.98
+
+**Token Endpoint가 판정하지 못한 Client 인증에 401 `invalid_client` 대신 500 `server_error`로 답합니다 — 401은 "네 Secret이 틀렸다"는 뜻이고, 그 말을 들은 RP는 사람을 부르거나 자격증명을 폐기합니다.** `clients` 테이블이 답하지 못한 조회는 그 Secret에 대해 **아무것도 판정하지 않았습니다.** Secret은 처음부터 맞았고 장애가 걷히면 그 연동은 손 하나 대지 않고 그대로 다시 돌 수 있었는데, 401을 받은 RP의 표준 동작은 그것을 설정 오류로 읽고 사람을 호출하거나 Secret을 교체하는 것입니다 — **장애가 끝난 뒤에 남는 것은 손으로 분해된 연동입니다.** `v0.9.97`은 이 실패를 두 Failure limiter·`resso_client_auth_failures_total`·로그에서 이미 갈라 놓았지만 **응답만은 일부러 남겨 두었습니다**: 이 Helper를 함께 쓰는 세 Endpoint가 이쪽 장애에 대해 서로 다른 Contract를 가지므로 Endpoint별 변경이라고 적어 두었고, 이번 릴리즈가 그중 `/token`의 몫입니다. 같은 선은 이 Endpoint가 **자기 조회 넷에 이미 그어 둔 것**입니다 — 경로의 Realm, Refresh Token, 계정, Signing Key.
+
+### 수정
+
+- **`/token`은 판정하지 못한 Client 인증에 500 `server_error`를 답합니다.** 본문은 아는 것만 말합니다 — `the client credential could not be verified; no attempt has been counted against this client, retry after a short delay`. Secret이 검증되었다고 말하지 않고(읽히지 않았습니다), 이 Client에게 아무것도 집계되지 않았다는 사실을 함께 말합니다. 그것이 RP에게 **재시도가 의미 있다**는 신호입니다. `WWW-Authenticate` 헤더도, 본문의 `invalid_client`도 더는 나가지 않습니다.
+- **호출자가 스스로 연결을 끊어 판정되지 않은 시도는 전과 같이 401입니다.** 새 센티널 `errClientAuthUndecided`는 `clientAuthUndecided`가 **이쪽 장애로 이미 보고한** 시도에만 붙습니다(그 Helper가 이제 `(undecided, ours)` 둘을 돌려줍니다). 요청이 이미 끝난 호출자는 감싸지 않으므로 500을 받지 못합니다 — **인증 없는 호출자가 요청을 보내 놓고 끊는 것만으로 이 Route의 오류율(`resso_http_requests_total{status="500"}`)을 마음대로 올릴 수 있으면** `v0.9.97`이 Limiter와 지표에서 닫은 구멍이 상태 코드에서 다시 열립니다. request context는 그 Helper에서 **한 번만** 읽습니다 — 읽는 사람 아래에서 바뀌는 값이라 두 번 보면 두 신호가 서로 다른 요청을 설명하게 됩니다.
+- **등록되지 않은 `client_id`, 읽어서 거절한 Secret, 한도에 걸린 호출자의 답은 모두 전과 같습니다** — 401 `invalid_client`, 그리고 429. 예산을 깎는 범위도 `v0.9.97`과 똑같습니다.
+- **Introspection과 Revocation은 손대지 않았습니다.** 감싼 오류가 그 둘에 도달해도 `writeClientAuthError`는 Rate limit 경우만 보므로 전과 같이 401 `invalid_client`입니다. 두 Endpoint의 올바른 답(Introspection 200 `active=false`, Revocation 503 `temporarily_unavailable`)은 각각 새 `stage` 라벨과 "읽지도 않은 Token에 대해 무엇을 말할지"를 함께 결정해야 하는 별도 변경입니다.
+- **지표는 늘지 않습니다.** 이 실패는 `resso_client_auth_errors_total{stage}`에 이미 세어지고 이제 500이므로 `resso_http_requests_total{route,status}`에도 보입니다. `resso_token_errors_total`에는 세지 않았습니다 — 그 계열의 유일한 라벨 `grant_type`이 이 시점에는 `client.GrantTypes`와 대조되지 않은 **미검증 입력**이라 라벨이 열립니다(경로의 Realm 조회 실패를 같은 이유로 그 계열에서 뺀 것과 같은 판단입니다). Secret 원문도 `client_id`도 응답·로그·라벨 어디에도 남지 않습니다.
+- `docs/operations.md`의 `resso_client_auth_errors_total` 항목에서 **`v0.9.97`이 적어 둔 "응답은 둘 다 401 `invalid_client`"가 이 변경으로 틀린 말이 되므로** 그 문장을 token 500 / Introspection·Revocation 401로 고치고, 왜 `resso_token_errors_total`이 아닌지를 더했습니다. 계열이 늘지 않아 README 지표 표는 그대로입니다.
+
+### 확인
+
+- 기존 연동 테스트 `TestIntegrationClientAuthSaysWhenItCouldNotDecide`에 응답 쪽 단언을 더했습니다 — 실제 PostgreSQL과 프로덕션 Handler로, `ALTER TABLE clients RENAME`으로 만든 은닉 중 **20회 시도가 전부 500 `server_error`**이며 본문에 `invalid_client`가 없고 `WWW-Authenticate`도 없습니다(헤더를 보기 위해 `outageAttempt` 헬퍼를 더했고 기존 `tokenWith`는 건드리지 않았습니다). 되돌린 뒤 한 번도 틀린 적 없는 Secret이 **곧바로 200**을 받는 것, 그 시도들이 `resso_client_auth_failures_total`에 없는 것, 틀린 Secret 20회가 여전히 401이고 21번째가 429인 것, 등록되지 않은 `client_id`와 `text`에 담길 수 없는 `client_id`가 401인 것, Secret이 로그에 없는 것은 모두 그대로입니다.
+- 기존 연동 테스트 `TestIntegrationClientAuthSeparatesABrokenDigestFromACallerThatHungUp` — 저장된 digest가 디코딩되지 않는 `stage="secret"` 장애도 **20회 모두 500**입니다. 그리고 **검증 중에 끊은 호출자는 아니라는 것**을 지표로 직접 못 박습니다: `status="500"`만 합산하는 새 `faulted()` 리더로, `clients`를 `ACCESS EXCLUSIVE`로 잡아 조회를 Lock 대기열에 세우고 끊는 요청 전후로 그 값이 **20 → 20으로 움직이지 않음**을 단언합니다(status를 일부러 보지 않는 기존 `answered()`는 핸들러 종료 신호로 그대로 씁니다). `ours` 게이트를 빼고 돌려 이 단언이 실제로 20 → 21을 잡는 것을 확인했습니다.
+- `go test -race ./internal/httpserver`, `make test`(백엔드 13개 패키지, 콘솔 29파일/161테스트, 빌드), `make lint`(golangci-lint 0 issues, govulncheck 취약점 0, `eslint --max-warnings 0`)가 모두 통과합니다.
+
+### Upgrade notes
+
+**마이그레이션도 설정 변경도 없고 이전 `v0.9.97` 이미지로 롤백할 수 있습니다**(되돌리면 판정하지 못한 Client 인증이 다시 401로 나갈 뿐입니다). 성공하는 Token 교환, 틀린 Secret·없는 `client_id`에 대한 401, 한도에 걸린 호출자의 429는 모두 한 글자도 바뀌지 않습니다.
+
+**RP 쪽에서 달라지는 것은 장애 중 한 가지뿐입니다.** 이 서버가 `clients`를 읽지 못하는 동안(또는 저장된 digest가 깨진 Client에 대해) `/token`은 401이 아니라 **500**을 답합니다. 401 `invalid_client`를 보고 자격증명을 폐기하거나 운영자를 호출하도록 되어 있는 RP라면 이제 그 상황에서 **폐기하지 않고 재시도**하게 됩니다 — 그것이 의도입니다. 5xx를 재시도하지 않는 RP는 사용자에게 오류를 보이겠지만, 장애가 끝난 뒤 **같은 Secret으로** 회복합니다.
+
+**HTTP 상태로 경보하는 대시보드에서는 이 장애가 4xx가 아닌 5xx로 옮겨 갑니다.** `/token`의 `resso_http_requests_total{status="500"}`이 올라갈 수 있고, 그것은 `resso_client_auth_errors_total{stage}`가 이미 말하던 것과 같은 장애입니다. **인증 없는 호출자가 이 500을 올릴 수 있는 길은 없습니다** — 스스로 연결을 끊은 요청은 감싸지 않으므로 전과 같이 401로 남습니다. `resso_token_errors_total`은 움직이지 않으므로 그 계열의 경보 의미는 그대로입니다.
+
+**Introspection과 Revocation의 Client 인증 응답은 아직 바뀌지 않았습니다** — 판정하지 못한 경우도 전과 같이 401 `invalid_client`입니다. 세 Endpoint가 더는 똑같이 답하지 않으므로, 이 상황을 다루는 RP 쪽 코드가 Endpoint를 구분하지 않는다면 지금이 확인할 시점입니다.
+
 ## v0.9.97
 
 **`clients` 테이블이 답하지 못한 장애를 "Secret이 틀렸다"로 읽어 RP의 Rate limit 예산을 깎던 것을 바로잡습니다 — 장애가 걷힌 뒤에도 Secret이 처음부터 맞았던 Client가 남은 창 동안 429로 막혔습니다.** OIDC Client 자격증명 조회 두 곳이 낼 수 있는 모든 오류가 "Secret 불일치"로 읽혔고, **401은 그중 가장 사소한 결과였습니다.** 그 시도는 Client당 20회·주소당 200회의 두 Failure limiter에 함께 집계되었고, 창은 첫 실패로부터 5분 고정이며 성공으로만 비워집니다 — RP가 Refresh 교환을 재시도하는 몇 초면 예산을 다 쓰므로, **테이블이 돌아온 뒤에도 그 Client는 남은 5분 동안 429**였습니다. 장애는 끝났고 Secret은 처음부터 맞았는데 RP만 계속 죽어 있는 상태입니다. 붐비는 Realm에서는 같은 일이 **출처 주소**에도 일어나 그 주소를 쓰는 다른 Client까지 함께 데려갔습니다. 같은 시도가 `resso_client_auth_failures_total`에도 세어졌는데, 운영 가이드가 그 계열을 "Secret 오설정 또는 대입 시도"로 읽으라고 말하므로 **저장소 장애가 일어나지도 않은 자격증명 사고를, 그 질문에 답하는 유일한 계열에서 울렸습니다.** 그리고 저장소 오류 자체는 아무 데도 남지 않았습니다 — 호출자 셋이 그것을 `writeClientAuthError`에 넘기고 그 함수는 Rate limit 경우만 봅니다. 위의 두 가지를 모두 한 장애가 **로그 한 줄도 남기지 않았습니다.**
