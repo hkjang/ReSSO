@@ -3,6 +3,7 @@ package httpserver
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"mime"
@@ -484,6 +485,38 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	}
 	client, authenticated, err := s.authenticateOIDCClient(r, realm)
 	if err != nil || !authenticated {
+		// The same line this endpoint already draws for every lookup of its own
+		// that will not complete — the Realm above, the refresh token, the
+		// account, the signing key — and client authentication was the one step
+		// in front of all of them still missing it.
+		//
+		// 401 invalid_client means "the secret you sent is not
+		// the one on file", and what a relying party does with that is page
+		// somebody or rotate the credential — for a secret that was right the
+		// whole time, because a clients table that will not answer decided
+		// nothing about it. The outage ends and the integration that could have
+		// resumed untouched has instead been taken apart by hand. So an
+		// authentication this service has already reported as its own fault is
+		// answered the way its other unfinished lookups are, and the text says
+		// only what is known: the credential was not verified, and nothing has
+		// been held against it.
+		//
+		// No metric is added. resso_token_errors_total's only label is grant_type,
+		// and the form field has not been checked against client.GrantTypes yet —
+		// it is unvalidated input from an unauthenticated request, so counting it
+		// opens the label the way methodLabel and routePattern exist to keep shut.
+		// The Realm branch above declined the same series for the same reason.
+		// This failure is already counted in resso_client_auth_errors_total{stage}
+		// and the 500 shows in resso_http_requests_total{route,status}.
+		if errors.Is(err, errClientAuthUndecided) {
+			writeOAuthError(w, http.StatusInternalServerError, "server_error",
+				"the client credential could not be verified; no attempt has been counted "+
+					"against this client, retry after a short delay")
+			return
+		}
+		// A credential that was read and refused, an identifier nobody
+		// registered, a caller that hung up and a throttled caller all keep the
+		// answer they have always had.
 		s.writeClientAuthError(w, r, err)
 		return
 	}
@@ -744,6 +777,22 @@ type rateLimitedError struct{ retryAfter time.Duration }
 
 func (e *rateLimitedError) Error() string { return "client authentication is rate limited" }
 
+// errClientAuthUndecided marks a client authentication that this service could
+// not decide and has already reported as its own fault. It is what lets one
+// caller of authenticateOIDCClient answer that case differently from a
+// credential that was read and refused, without the three callers having to
+// agree on an answer: their contracts for a fault on this side are three
+// different ones, and only the token endpoint's is implemented so far.
+//
+// The sentinel is wrapped around the store error rather than replacing it so
+// that whatever an operator needs out of the original — which is nothing on
+// this path today, because clientAuthUndecided has already logged it — stays
+// reachable. It is deliberately not attached to an authentication that was
+// undecided because the caller hung up: nothing on this side failed, so there
+// is no fault for this service to claim, and claiming one would hand an
+// unauthenticated caller this route's error rate to set as it pleases.
+var errClientAuthUndecided = errors.New("the client authentication could not be decided")
+
 // authenticateOIDCClient resolves and verifies the calling client. Failed
 // attempts are counted per source address and per client identifier so that
 // guessing a client secret is bounded, and so an unauthenticated caller cannot
@@ -766,7 +815,14 @@ func (s *Server) authenticateOIDCClient(r *http.Request, realm domain.Realm) (do
 		}
 	}
 	client, authenticated, stage, err := s.verifyOIDCClient(r, realm, clientID, secret)
-	if s.clientAuthUndecided(r, realm.Name, stage, err) {
+	if undecided, ours := s.clientAuthUndecided(r, realm.Name, stage, err); undecided {
+		// Only a fault this service has claimed is marked. The other way to
+		// arrive here is a caller that ended its own request, and that error
+		// leaves unwrapped so that it keeps the answer every undecided
+		// authentication used to get — written to a connection nobody is reading.
+		if ours {
+			return client, false, fmt.Errorf("%w: %w", errClientAuthUndecided, err)
+		}
 		return client, false, err
 	}
 	if err != nil || !authenticated {
@@ -878,27 +934,45 @@ func (s *Server) verifyOIDCClient(r *http.Request, realm domain.Realm, clientID,
 // not decode, neither of which a caller chooses and both of which are this
 // service's to report.
 //
-// The response is deliberately not changed. These three endpoints answer a
-// failed client authentication identically today and their contracts for a
-// fault on this side are not the same one — the token endpoint's 500, revoke's
-// 503 temporarily_unavailable, introspection's 200 active=false — so that is a
-// change per endpoint, not one made in the helper they share.
+// The response is still not decided here, and cannot be. The three endpoints
+// sharing this helper used to answer a failed client authentication
+// identically; one of them no longer does. Their contracts for a fault on this
+// side are three different answers — the token endpoint's 500, revoke's 503
+// temporarily_unavailable, introspection's 200 active=false — so each is a
+// change at its own caller, and what this helper contributes is the second
+// return value saying which attempts are this service's to answer for.
+//
+// The token endpoint has that branch: errClientAuthUndecided reaches it and it
+// answers 500 server_error. Introspection and revocation do not yet, so the
+// marked error reaches writeClientAuthError, which looks only for the
+// rate-limit case and writes the 401 it always did. Their answers are therefore
+// unchanged — not because 401 is right for them, but because neither 503 nor
+// 200 active=false can be reached from here without also deciding what
+// introspection's new stage label is and what revoke tells a caller whose token
+// it did not look at. That is left for those endpoints to do.
+//
+// That second return value is what a caller needs and cannot work out for
+// itself: whether the undecided attempt is a fault this service has just
+// claimed, or a caller that walked away from its own request. The request
+// context is read once, here, because it is a value that changes underneath a
+// reader — a second look from the caller could disagree with this one, and the
+// two signals would then be describing different requests.
 //
 // clientID is not recorded. It arrives unverified on an unauthenticated
 // request and is the label that would be most useful and least bounded; the
 // Realm is the one this route resolved, and the route pattern says which of the
 // three endpoints was being called.
-func (s *Server) clientAuthUndecided(r *http.Request, realmName, stage string, err error) bool {
+func (s *Server) clientAuthUndecided(r *http.Request, realmName, stage string, err error) (undecided, ours bool) {
 	if err == nil || errors.Is(err, store.ErrNotFound) {
-		return false
+		return false, false
 	}
 	if r.Context().Err() != nil {
-		return true
+		return true, false
 	}
 	s.metrics.Add(metricClientAuthErrors, 1, stage)
 	s.logger.Error("a client authentication could not be decided", "trace_id", traceIDFrom(r.Context()),
 		"realm", realmName, "route", routePattern(r), "stage", stage, "error", err)
-	return true
+	return true, true
 }
 
 // writeClientAuthError emits the shared invalid_client response, upgrading it
