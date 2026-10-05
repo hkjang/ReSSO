@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.9.99
+
+**Revocation Endpoint가 판정하지 못한 Client 인증에 401 `invalid_client` 대신 503 `temporarily_unavailable`로 답합니다 — 폐기를 부른 그 한 가지 질문, "이 Token이 지금 죽었는가"에 대한 답이 전해지지 않았습니다.** `revoke`는 `authenticateOIDCClient`의 **모든** 실패를 `writeClientAuthError`에 넘겼으므로, `clients` 테이블이 답하지 못한 조회나 디코딩되지 않는 저장된 digest가 401 `invalid_client` "client authentication failed"로 나가고 **감사 트레일에는 한 줄도 남지 않았습니다.** 401은 "네 Secret이 틀렸다"는 뜻이고 그것을 받은 RP는 처음부터 맞았던 자격증명을 폐기하거나 사람을 부릅니다. 이 Endpoint에서는 그것이 **두 번 틀립니다**: 폐기는 Token이 유출되었을 때 사람이 손을 뻗는 곳이고, 판정하지 못한 인증은 **Token을 찾아보지도 않았으므로 유출된 그 Token이 그대로 살아서 계속 접근을 내주고 있습니다** — 그런데 그렇다고 말하는 유일한 답이 주어지지 않았습니다. RFC 7009 §2.2.1이 바로 이 상태를 위해 쓰여 있습니다(Client는 Token이 아직 존재한다고 가정하고 잠시 뒤 재시도한다). 이 핸들러의 아래쪽 장애 넷이 이미 그 상태 코드와 **같은 본문 문안**으로 답하므로, `writeClientAuthError` 호출 앞에 둔 분기가 그 둘을 그대로 재사용합니다. `v0.9.97`이 "Endpoint별 변경"이라고 적어 둔 셋 중 `v0.9.98`의 `/token`에 이어 두 번째이며, 남은 것은 Introspection 하나입니다.
+
+### 수정
+
+- **`/revoke`는 판정하지 못한 Client 인증에 503 `temporarily_unavailable`을 답합니다.** 본문은 이 핸들러가 이미 쓰던 문안 그대로입니다 — `the token could not be revoked and is still valid; retry after a short delay`. **Token이 아직 유효하다고 명시적으로 말하는 것**이 요점입니다. `invalid_client`도 `WWW-Authenticate` 헤더도 더는 나가지 않습니다.
+- **그 실패가 감사 트레일에 `TOKEN_REVOKED`/`FAILURE`로 남습니다**(`revoked=none`, `error`에 `authenticate the client: …`). 전에는 **항목이 아예 없었습니다** — 바로 위 Realm 분기가 "감사 항목이 아예 없는 것"을 스스로 결함으로 적어 둔 그 자리입니다. **주체는 Client가 아니라 경로의 Realm입니다**(`realm.Name`): `client_id`는 인증 없이 보낼 수 있는 미검증 입력이고 이 시점에는 아무것도 그것을 확인하지 않았으므로, 트레일에 넣으면 감사 출력이 그것을 그대로 되돌려줍니다. Realm은 이 Route가 실제로 판정한 당사자입니다.
+- **로그는 더하지 않았습니다.** `clientAuthUndecided`가 이미 단계와 사유를 담은 ERROR 한 줄을 남겼으므로, 같은 장애에 두 번째 줄을 더하면 **장애가 둘인 것처럼 보입니다.**
+- **읽어서 거절한 Secret, 등록되지 않은 `client_id`, 한도에 걸린 호출자, 스스로 연결을 끊은 호출자의 답은 모두 전과 같습니다.** 끊긴 호출자가 중요합니다 — `clientAuthUndecided`가 그 경우를 센티널로 감싸지 않으므로, **인증 없는 호출자가 요청을 보내 놓고 끊는 것만으로 이 Route의 `resso_http_requests_total{route,status="503"}`을 마음대로 올릴 수는 없습니다.** `v0.9.98`이 상태 코드에서 닫은 그 구멍이 여기서 다시 열리지 않습니다.
+- **Introspection은 손대지 않았습니다.** 이쪽 장애에 대한 그 Endpoint의 계약은 200 `active=false`인데, 그것은 RFC 7662가 **권한이 확인되지 않은 호출자에게 200을 주라고 말하는지**를 함께 판정해야 도달할 수 있습니다(새 `stage` 라벨도 따라옵니다). 그래서 Introspection은 전과 같이 401 `invalid_client`입니다.
+- **지표는 늘지 않습니다.** 이 실패는 `resso_client_auth_errors_total{stage}`에 이미 세어지고, 이제 503이므로 `resso_http_requests_total{route,status}`에도 보입니다. Secret 원문도 `client_id`도 응답·로그·라벨·트레일 어디에도 남지 않습니다.
+- `docs/operations.md`의 `resso_client_auth_errors_total` 항목에서 **`v0.9.98`이 적어 둔 "Introspection과 Revocation은 아직 401 `invalid_client`로 답하고"가 이 변경으로 틀린 말이 되므로** 그 문장을 Revocation 503 + 감사 항목 설명 / Introspection만 401로 고쳤습니다(문장을 더한 것이 아니라 고친 것입니다). 계열이 늘지 않아 README 지표 표는 그대로입니다. `internal/httpserver/oidc.go`의 "세 Endpoint 중 둘이 아직 하지 않는다"고 적어 둔 주석 문단도 "Introspection 하나만 남았다"와 503을 고른 이유로 고쳤습니다.
+
+### 확인
+
+- 새 연동 테스트 `TestIntegrationRevocationSaysWhenItCouldNotDecideTheClient` — 실제 PostgreSQL과 프로덕션 Handler로, 진짜 Refresh Token을 은닉 **전에** 발급해 두고 `ALTER TABLE clients RENAME`으로 장애를 만든 뒤 즉시 되돌립니다. ① 은닉 중 **20회가 전부 503 `temporarily_unavailable`**이며 본문 문안이 일치하고 `invalid_client`도 `WWW-Authenticate`도 없습니다 ② **되돌린 뒤 같은 Client·같은 Secret이 429가 아니라 200 + 빈 본문**을 받습니다(Limiter 예산을 쓰지 않았다는 뜻이고, `v0.9.97` 회귀 방지입니다) ③ 트레일 21건 = FAILURE 20 + SUCCESS 1이며 FAILURE는 `target_type=realm`·`target_id=master`·`realm_id` 일치·`actor_name` 빈 값·`revoked=none`이고 `error`에 `authenticate the client`가 들어 있으며 **detail에 `client_id`도 Secret도 없습니다** ④ `resso_client_auth_errors_total{stage="client"}`가 20이고 `resso_client_auth_failures_total`은 없으며 ERROR 줄이 **정확히 20**(중복 로그 없음), Secret은 로그에 없습니다 ⑤ **끊긴 호출자**(`LOCK TABLE clients IN ACCESS EXCLUSIVE MODE`로 조회를 Lock 대기열에 세우고 대기를 Poll로 확인한 뒤 context 취소)가 `resso_http_requests_total{route,status="503"}`을 **20 → 20으로 두고** 장애 계열·로그·트레일도 움직이지 않습니다 ⑥ 틀린 Secret 20회는 여전히 401 `invalid_client` + `client_auth_failures{realm="master"} 20`이고 21번째가 429 + `Retry-After`이며, 등록되지 않은 `client_id`는 401 — 그 뒤에도 `errors_total` 20·ERROR 20·트레일 21이 유지됩니다.
+- **수정 전에 실제로 실패함을 확인**했습니다 — 프로덕션 변경 전 `oidc.go`로 돌리면 `attempt 1 during the outage answered 401 {"error":"invalid_client",…}, want 503 temporarily_unavailable so the caller knows the leaked token is still live`로 걸립니다. 끊긴 호출자 단언도 따로 증명했습니다 — `ours` 게이트만 빼고 돌리니 `resso_http_requests_total{status="503"} went 20 -> 21`로 걸려, 그 단언이 실제로 그 구멍을 잡는다는 것을 확인했습니다.
+- 릴리즈 준비에서 `make lint`(golangci-lint 0 issues, govulncheck 취약점 0, `eslint --max-warnings 0`), `make test`(Go `-race` 13개 패키지 · 연동 SKIP 0 · `go vet` · 콘솔 29파일 161테스트 · 빌드), `git diff --check`가 통과했습니다.
+
+### Upgrade notes
+
+**마이그레이션도 설정 변경도 없고 이전 `v0.9.98` 이미지로 롤백할 수 있습니다**(되돌리면 판정하지 못한 Client 인증이 다시 401로 나가고 트레일 항목이 사라질 뿐입니다). 성공하는 폐기, 틀린 Secret·없는 `client_id`에 대한 401, 한도에 걸린 호출자의 429는 모두 한 글자도 바뀌지 않습니다.
+
+**RP 쪽에서 달라지는 것은 장애 중 한 가지뿐입니다.** 이 서버가 `clients`를 읽지 못하는 동안(또는 저장된 digest가 깨진 Client에 대해) `/revoke`는 401이 아니라 **503**을 답합니다. 401 `invalid_client`를 보고 자격증명을 폐기하도록 되어 있는 RP라면 이제 그 상황에서 **폐기하지 않고 재시도**하게 됩니다 — 그것이 의도입니다. **그리고 이 답은 "Token이 아직 살아 있다"는 뜻이므로, 유출된 Token을 지우려던 호출이라면 성공할 때까지 재시도해야 합니다.** 전에는 401을 받고 "자격증명 문제"로 처리하는 동안 그 Token이 조용히 살아 있었습니다.
+
+**HTTP 상태로 경보하는 대시보드에서는 이 장애가 4xx가 아닌 5xx로 옮겨 갑니다.** `/revoke`의 `resso_http_requests_total{status="503"}`이 올라갈 수 있고, 그것은 `resso_client_auth_errors_total{stage}`가 이미 말하던 것과 같은 장애입니다. **인증 없는 호출자가 이 503을 올릴 수 있는 길은 없습니다** — 스스로 연결을 끊은 요청은 감싸지 않으므로 전과 같이 401로 남습니다.
+
+**감사 트레일을 기계로 읽는다면 `TOKEN_REVOKED`/`FAILURE` 항목이 `revoked=none`과 함께 새로 나타날 수 있습니다.** 주체는 Client가 아니라 **Realm**이며(`target_type=realm`) `client_id`는 담기지 않습니다. 정상 운영에서는 나오지 않는 항목입니다.
+
+**Introspection의 Client 인증 응답은 아직 바뀌지 않았습니다** — 판정하지 못한 경우도 전과 같이 401 `invalid_client`입니다. 세 Endpoint가 이제 서로 다르게 답하므로(`/token` 500, `/revoke` 503, Introspection 401), 이 상황을 다루는 RP 쪽 코드가 Endpoint를 구분하지 않는다면 지금이 확인할 시점입니다.
+
 ## v0.9.98
 
 **Token Endpoint가 판정하지 못한 Client 인증에 401 `invalid_client` 대신 500 `server_error`로 답합니다 — 401은 "네 Secret이 틀렸다"는 뜻이고, 그 말을 들은 RP는 사람을 부르거나 자격증명을 폐기합니다.** `clients` 테이블이 답하지 못한 조회는 그 Secret에 대해 **아무것도 판정하지 않았습니다.** Secret은 처음부터 맞았고 장애가 걷히면 그 연동은 손 하나 대지 않고 그대로 다시 돌 수 있었는데, 401을 받은 RP의 표준 동작은 그것을 설정 오류로 읽고 사람을 호출하거나 Secret을 교체하는 것입니다 — **장애가 끝난 뒤에 남는 것은 손으로 분해된 연동입니다.** `v0.9.97`은 이 실패를 두 Failure limiter·`resso_client_auth_failures_total`·로그에서 이미 갈라 놓았지만 **응답만은 일부러 남겨 두었습니다**: 이 Helper를 함께 쓰는 세 Endpoint가 이쪽 장애에 대해 서로 다른 Contract를 가지므로 Endpoint별 변경이라고 적어 두었고, 이번 릴리즈가 그중 `/token`의 몫입니다. 같은 선은 이 Endpoint가 **자기 조회 넷에 이미 그어 둔 것**입니다 — 경로의 Realm, Refresh Token, 계정, Signing Key.
