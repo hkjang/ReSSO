@@ -782,7 +782,7 @@ func (e *rateLimitedError) Error() string { return "client authentication is rat
 // caller of authenticateOIDCClient answer that case differently from a
 // credential that was read and refused, without the three callers having to
 // agree on an answer: their contracts for a fault on this side are three
-// different ones, and only the token endpoint's is implemented so far.
+// different ones, and each of the three now answers its own.
 //
 // The sentinel is wrapped around the store error rather than replacing it so
 // that whatever an operator needs out of the original — which is nothing on
@@ -936,27 +936,24 @@ func (s *Server) verifyOIDCClient(r *http.Request, realm domain.Realm, clientID,
 //
 // The response is still not decided here, and cannot be. The three endpoints
 // sharing this helper used to answer a failed client authentication
-// identically; two of them no longer do. Their contracts for a fault on this
+// identically; all three no longer do. Their contracts for a fault on this
 // side are three different answers — the token endpoint's 500, revoke's 503
 // temporarily_unavailable, introspection's 200 active=false — so each is a
 // change at its own caller, and what this helper contributes is the second
 // return value saying which attempts are this service's to answer for.
 //
-// Two of those branches exist. errClientAuthUndecided reaches the token
-// endpoint, which answers 500 server_error, and revoke, which answers 503
-// temporarily_unavailable and records the failure against the Realm: RFC 7009
-// §2.2.1 defines that status as the client assuming its token still exists and
-// retrying, and that is exactly what an undecided authentication leaves behind —
-// the token was never looked for, so it is still live, and the four faults
-// further down revoke already answer that way.
-//
-// Introspection does not, so the marked error reaches writeClientAuthError,
-// which looks only for the rate-limit case and writes the 401 it always did. Its
-// answer is unchanged — not because 401 is right for it, but because 200
-// active=false cannot be reached from here without also deciding what
-// introspection's new stage label is and whether RFC 7662 means to hand a 200 to
-// a caller it never established was authorized to ask. That is left for that
-// endpoint to do.
+// All three of those branches now exist. errClientAuthUndecided reaches the
+// token endpoint, which answers 500 server_error; revoke, which answers 503
+// temporarily_unavailable and records the failure against the Realm, because RFC
+// 7009 §2.2.1 defines that status as the client assuming its token still exists
+// and retrying, and that is exactly what an undecided authentication leaves
+// behind — the token was never looked for, so it is still live, and the four
+// faults further down revoke already answer that way; and introspection, which
+// answers 200 active=false and counts the attempt under
+// resso_introspection_errors_total{stage="client_auth"}, because its body is a
+// constant that discloses nothing about any token and RFC 7662 §2.3 reserves its
+// 401 for credentials that were read and found invalid. The reasoning for each
+// is at the branch itself.
 //
 // That second return value is what a caller needs and cannot work out for
 // itself: whether the undecided attempt is a fault this service has just
@@ -1176,6 +1173,44 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client, ok, err := s.authenticateOIDCClient(r, realm)
+	// The three lookups named above each learned to separate "no" from "could not
+	// say", and the authentication in between them is the last step here that had
+	// not: a clients table that would not answer, or a stored digest that would
+	// not decode, left with 401 invalid_client "client authentication failed".
+	//
+	// That answer says the secret the caller sent is not the one on file, and what
+	// a resource server does with it is page somebody or rotate a credential that
+	// was right the whole time. Nothing read that secret, so nothing judged it.
+	//
+	// RFC 7662 does not require the 401 here. §2.3 attaches it to a condition this
+	// case does not meet — "its credentials are invalid" — and states no
+	// requirement at all for a caller whose authentication was never established;
+	// the note that follows is about the token, requiring active=false for "a
+	// properly formed and authorized query" rather than an error. §2.1's "MUST
+	// also require some form of authorization" is there to prevent token scanning,
+	// and the body written below is the same constant this endpoint already gives
+	// for a token it has never seen and for another client's refresh token, so
+	// there is no answer that varies with the token and nothing to scan. The
+	// endpoint still requires the credential; during a fault it cannot read it,
+	// and fail-closed is the direction it fails in.
+	//
+	// So the fault contract of this endpoint applies, as it does to the five
+	// stages recordUnjudgedIntrospection names: 200 active=false, with the series
+	// below as the only place the outage is visible. That series is added to
+	// directly rather than through that helper, because clientAuthUndecided has
+	// already written an ERROR line carrying the stage, the route and the reason,
+	// and the helper's own line would make one fault look like two — the same
+	// judgement revoke made when it added no line of its own.
+	if errors.Is(err, errClientAuthUndecided) {
+		s.metrics.Add(metricIntrospectionErrors, 1, "client_auth")
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	// Everything else keeps the answer it has always had, and the condition is
+	// left whole so that it does: a credential that was read and refused, an
+	// identifier nobody registered, a caller that hung up, a throttled caller, a
+	// switched-off Client and a public Client — the last two of which arrive here
+	// with no error at all, so they could not reach the branch above in any case.
 	if err != nil || !ok || client.Type != "confidential" {
 		s.writeClientAuthError(w, r, err)
 		return
@@ -1272,6 +1307,11 @@ func (s *Server) introspect(w http.ResponseWriter, r *http.Request) {
 // A Realm, a session, an account or a refresh token that is not there is a
 // real answer rather than a failure, so only errors that are not that are
 // recorded.
+//
+// The client_auth stage does not come through here. It is counted into the same
+// series at the authentication branch, which goes around this helper because
+// clientAuthUndecided has already logged that fault once and a second line
+// would make it look like two.
 func (s *Server) recordUnjudgedIntrospection(r *http.Request, stage string, err error) {
 	if err == nil || errors.Is(err, store.ErrNotFound) {
 		return

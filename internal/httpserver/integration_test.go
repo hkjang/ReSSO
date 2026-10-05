@@ -4932,6 +4932,391 @@ func TestIntegrationRevocationSaysWhenItCouldNotDecideTheClient(t *testing.T) {
 	}
 }
 
+func TestIntegrationIntrospectionSaysWhenItCouldNotDecideTheClient(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "introspect-auth-outage", Name: "Introspect Auth Outage", Type: "confidential",
+		RedirectURIs: []string{"https://introspect-outage.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A public Client keeps its 401 through this change, and it has to be created
+	// while the table is still there.
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "introspect-public-rp", Name: "Introspect Public RP", Type: "public",
+		RedirectURIs: []string{"https://introspect-public.example.test/cb"},
+		GrantTypes:   []string{"authorization_code"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "introspected", Password: "introspected-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1",
+		"introspect-auth-outage-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Issued before the table goes away, because issuing reads it too.
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, created.Client, user, session.Session.ID,
+		[]string{"openid"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, nil))
+	metrics := observability.NewRegistry()
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	const introspectPath = "/realms/master/protocol/openid-connect/token/introspect"
+	// Basic is the credential form §2.1 names first, and it is the one a resource
+	// server configured against this endpoint sends. No Origin header: the CORS
+	// middleware in front of this route reads the clients table too, and what is
+	// under test is the authentication behind it. The limiters live on this one
+	// Server, so every request below shares the budget the fault used to spend.
+	introspectWith := func(clientID, secret, token string) (int, string, http.Header) {
+		t.Helper()
+		request, reqErr := http.NewRequest(http.MethodPost, server.URL+introspectPath,
+			strings.NewReader(url.Values{"token": {token}}.Encode()))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.SetBasicAuth(clientID, secret)
+		response, postErr := server.Client().Do(request)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body), response.Header
+	}
+	exported := func(prefix string) string {
+		var written strings.Builder
+		metrics.WritePrometheus(&written)
+		for _, line := range strings.Split(written.String(), "\n") {
+			if strings.HasPrefix(line, prefix) {
+				return line
+			}
+		}
+		return ""
+	}
+	countingLines := func(message string) int {
+		count := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, message) {
+				count++
+			}
+		}
+		return count
+	}
+
+	// The clients table cannot be read. realms is untouched, the limiters are in
+	// memory, and nothing else on the way to this lookup reads it.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE clients RENAME TO clients_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE clients_hidden RENAME TO clients"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every other test sharing this container authenticates a Client, so the
+	// table cannot be left hidden even if this one fails part way through.
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "ALTER TABLE clients_hidden RENAME TO clients")
+	})
+
+	// The budget is twenty failures per Client inside five minutes, which is what
+	// a resource server validating requests gets through in the first second of an
+	// outage.
+	const attempts = clientAuthMaxFailures
+	for i := 0; i < attempts; i++ {
+		status, body, header := introspectWith("introspect-auth-outage", created.ClientSecret,
+			tokens.AccessToken)
+		// (1) 200 active=false is this endpoint's answer to everything it could not
+		// judge, and the body is the one it gives for a token it has never seen — so
+		// a caller whose authorization was never established learns nothing it could
+		// not learn anyway.
+		if status != http.StatusOK || strings.TrimSpace(body) != `{"active":false}` {
+			restore()
+			t.Fatalf("attempt %d during the outage answered %d %s, want 200 {\"active\":false} so the "+
+				"resource server is not told its own credential is wrong", i+1, status, body)
+		}
+		if strings.Contains(body, "invalid_client") || strings.Contains(body, "error") {
+			restore()
+			t.Fatalf("attempt %d during the outage blamed the credential: %s", i+1, body)
+		}
+		// WWW-Authenticate invites the caller to present a different credential,
+		// which is not what is wrong here.
+		if got := header.Get("WWW-Authenticate"); got != "" {
+			restore()
+			t.Fatalf("attempt %d during the outage challenged the caller's credential: WWW-Authenticate=%q",
+				i+1, got)
+		}
+	}
+	restore()
+
+	// (2) The fault is over and the Client that was never wrong introspects the
+	// token it has been asking about all along. The attempts above must not have
+	// spent its budget, or this answers 429 for the rest of the five-minute window
+	// — the table back, the secret always right, every request to the resource
+	// server still refused.
+	status, body, _ := introspectWith("introspect-auth-outage", created.ClientSecret, tokens.AccessToken)
+	if status == http.StatusTooManyRequests {
+		t.Fatalf("a clients table that could not be read spent the Client's attempt budget: the "+
+			"introspection stays refused after the fault is over (%d %s)", status, body)
+	}
+	var answer struct {
+		Active   bool   `json:"active"`
+		ClientID string `json:"client_id"`
+		Expiry   int64  `json:"exp"`
+	}
+	if err := json.Unmarshal([]byte(body), &answer); err != nil {
+		t.Fatalf("the introspection after the table came back answered %d %q", status, body)
+	}
+	if status != http.StatusOK || !answer.Active || answer.ClientID != "introspect-auth-outage" ||
+		answer.Expiry == 0 {
+		t.Fatalf("the introspection answered %d %s after the table came back, want 200 with "+
+			"active=true for a token that was valid the whole time", status, body)
+	}
+
+	// (3) Every attempt during the outage is counted as a fault of this endpoint —
+	// the only signal that separates the outage from every token being dead, since
+	// the response is a 200 the request counter reads as a healthy introspection —
+	// and as the undecided authentication v0.9.97 put in its own series. None of
+	// them is a credential failure, the series the operations guide reads as a
+	// wrong secret or somebody guessing one.
+	if got := exported(`resso_introspection_errors_total{stage="client_auth"}`); got !=
+		`resso_introspection_errors_total{stage="client_auth"} `+strconv.Itoa(attempts) {
+		t.Fatalf("the undecided authentications were not counted as introspection faults: %q", got)
+	}
+	if got := exported(`resso_client_auth_errors_total{stage="client"}`); got !=
+		`resso_client_auth_errors_total{stage="client"} `+strconv.Itoa(attempts) {
+		t.Fatalf("the undecided authentications were not counted where v0.9.97 put them: %q", got)
+	}
+	if got := exported("resso_client_auth_failures_total"); got != "" {
+		t.Fatalf("a store fault was counted as a failed client authentication: %q", got)
+	}
+	// The fault is named once. clientAuthUndecided already logs it with the stage
+	// and the reason, so the branch added here must not log it again — which is
+	// what going around recordUnjudgedIntrospection is for.
+	if got := countingLines("a client authentication could not be decided"); got != attempts {
+		t.Fatalf("a clients table that could not be read left %d log line(s) for %d attempts:\n%s",
+			got, attempts, logs.String())
+	}
+	if got := countingLines("introspection could not judge a token"); got != 0 {
+		t.Fatalf("the same fault was logged twice, once per helper (%d extra line(s)):\n%s",
+			got, logs.String())
+	}
+	if strings.Contains(logs.String(), created.ClientSecret) {
+		t.Fatal("the client secret was written to the log")
+	}
+	if strings.Contains(logs.String(), "introspect-auth-outage") {
+		t.Fatal("an unverified client_id was written to the log")
+	}
+
+	// (5) A caller that hangs up mid-verification, before the wrong secrets below
+	// exhaust the budget — the limiter is checked in front of the lookup, so after
+	// them this request would be refused with 429 and never reach it. The clients
+	// table is held under ACCESS EXCLUSIVE in an open transaction, so the lookup
+	// parks in PostgreSQL's lock queue; the poll below waits for that wait to
+	// appear, which is what makes the cancellation land inside the verification
+	// rather than before it. Nothing on this side failed, so an abandoned request
+	// must raise none of the signals above — the hole 8f2c73c closed, which
+	// clientAuthUndecided's second return value keeps closed.
+	blocker, err := data.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		_ = blocker.Rollback(context.Background())
+	}
+	// Every other test sharing this container reads the clients table, so the
+	// lock cannot outlive this one even if it fails part way through.
+	t.Cleanup(release)
+	if _, err := blocker.Exec(ctx, "LOCK TABLE clients IN ACCESS EXCLUSIVE MODE"); err != nil {
+		release()
+		t.Fatal(err)
+	}
+	// This reader deliberately ignores the status label, so it counts the
+	// abandoned request whatever it was answered with — which is what makes it
+	// usable as the handler-finished signal.
+	answeredOnRoute := func() int {
+		count := 0
+		var written strings.Builder
+		metrics.WritePrometheus(&written)
+		for _, line := range strings.Split(written.String(), "\n") {
+			if !strings.HasPrefix(line, "resso_http_requests_total") ||
+				!strings.Contains(line, `route="/realms/{realm}/protocol/openid-connect/token/introspect"`) {
+				continue
+			}
+			fields := strings.Fields(line)
+			n, _ := strconv.Atoi(fields[len(fields)-1])
+			count += n
+		}
+		return count
+	}
+	answeredBefore := answeredOnRoute()
+
+	requestCtx, hangUp := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, server.URL+introspectPath,
+		strings.NewReader(url.Values{"token": {tokens.AccessToken}}.Encode()))
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.SetBasicAuth("introspect-auth-outage", created.ClientSecret)
+	sent := make(chan error, 1)
+	go func() {
+		response, doErr := server.Client().Do(request)
+		if response != nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+		}
+		sent <- doErr
+	}()
+
+	waiting := func() bool {
+		var count int
+		if err := data.Pool.QueryRow(context.Background(), `SELECT count(*) FROM pg_locks l
+			JOIN pg_class c ON c.oid=l.relation WHERE c.relname='clients' AND NOT l.granted`).Scan(&count); err != nil {
+			return false
+		}
+		return count > 0
+	}
+	parked := false
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
+		if waiting() {
+			parked = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !parked {
+		release()
+		t.Fatal("the request never reached the clients lookup, so cancelling it would prove nothing")
+	}
+	hangUp()
+	if doErr := <-sent; doErr == nil {
+		release()
+		t.Fatal("the abandoned request was answered, so the caller did not hang up mid-verification")
+	}
+	// The handler is still running when Do returns, so wait for the request
+	// counter the middleware writes after it to move before reading anything.
+	for deadline := time.Now().Add(20 * time.Second); answeredOnRoute() == answeredBefore &&
+		time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if answeredOnRoute() == answeredBefore {
+		release()
+		t.Fatal("the abandoned request never finished being handled")
+	}
+	release()
+
+	// Nothing about this service failed, so nothing about it is recorded. The
+	// route's own counter cannot say so here — this endpoint answers its faults
+	// with the same 200 it answers everything else with, which is why the series
+	// below is the only place an outage shows at all.
+	if got := exported(`resso_introspection_errors_total{stage="client_auth"}`); got !=
+		`resso_introspection_errors_total{stage="client_auth"} `+strconv.Itoa(attempts) {
+		t.Errorf("a caller that hung up was counted as a fault of this endpoint: %q", got)
+	}
+	if got := exported(`resso_client_auth_errors_total{stage="client"}`); got !=
+		`resso_client_auth_errors_total{stage="client"} `+strconv.Itoa(attempts) {
+		t.Errorf("a caller that hung up was counted as a fault this service could not decide: %q", got)
+	}
+	if got := countingLines("a client authentication could not be decided"); got != attempts {
+		t.Errorf("a caller that hung up was logged as a fault on this side (%d line(s) for %d)",
+			got, attempts)
+	}
+
+	// (4) A credential that was read and refused keeps the answer it has always
+	// had, is counted where that question is answered from, and still spends the
+	// budget — which is the bound both limiters exist for. The success above
+	// cleared this Client's window and the abandoned request spent nothing, so the
+	// count starts from zero here.
+	for i := 0; i < attempts; i++ {
+		status, body, _ = introspectWith("introspect-auth-outage", "not-this-clients-secret",
+			tokens.AccessToken)
+		if status != http.StatusUnauthorized || !strings.Contains(body, `"error":"invalid_client"`) ||
+			!strings.Contains(body, "client authentication failed") {
+			t.Fatalf("wrong-secret attempt %d answered %d %s, want 401 invalid_client", i+1, status, body)
+		}
+	}
+	if got := exported("resso_client_auth_failures_total"); got !=
+		`resso_client_auth_failures_total{realm="master"} `+strconv.Itoa(attempts) {
+		t.Errorf("refused secrets were not counted as failed client authentications: %q", got)
+	}
+	status, body, header := introspectWith("introspect-auth-outage", "not-this-clients-secret",
+		tokens.AccessToken)
+	if status != http.StatusTooManyRequests || header.Get("Retry-After") == "" {
+		t.Errorf("the %d refused secrets did not exhaust the Client's budget: answered %d %s Retry-After=%q",
+			attempts, status, body, header.Get("Retry-After"))
+	}
+
+	// An identifier nobody registered is the other decided answer, under its own
+	// fresh window: store.ErrNotFound stays on the counted path, or the bound the
+	// limiters exist for would be gone.
+	status, body, _ = introspectWith("no-such-client", "irrelevant", tokens.AccessToken)
+	if status != http.StatusUnauthorized || !strings.Contains(body, `"error":"invalid_client"`) {
+		t.Errorf("an unregistered client_id answered %d %s, want 401 invalid_client", status, body)
+	}
+	if got := exported("resso_client_auth_failures_total"); got !=
+		`resso_client_auth_failures_total{realm="master"} `+strconv.Itoa(attempts+1) {
+		t.Errorf("an unregistered client_id was not counted as a failed client authentication: %q", got)
+	}
+	// A public Client is refused too, and for a reason the new branch must not
+	// reach: its lookup succeeded, so there is no marked error — introspection is
+	// open to every confidential Client of the Realm and to nothing else.
+	status, body, _ = introspectWith("introspect-public-rp", "", tokens.AccessToken)
+	if status != http.StatusUnauthorized || !strings.Contains(body, `"error":"invalid_client"`) {
+		t.Errorf("a public client_id answered %d %s, want 401 invalid_client", status, body)
+	}
+	// None of those four is a fault on this side, so both fault series stand where
+	// the outage left them.
+	if got := exported(`resso_introspection_errors_total{stage="client_auth"}`); got !=
+		`resso_introspection_errors_total{stage="client_auth"} `+strconv.Itoa(attempts) {
+		t.Errorf("a decided refusal was counted as a fault of this endpoint: %q", got)
+	}
+	if got := exported(`resso_client_auth_errors_total{stage="client"}`); got !=
+		`resso_client_auth_errors_total{stage="client"} `+strconv.Itoa(attempts) {
+		t.Errorf("a decided refusal was counted as undecided: %q", got)
+	}
+	if got := countingLines("a client authentication could not be decided"); got != attempts {
+		t.Errorf("a decided refusal was logged as a fault (%d line(s) for %d)", got, attempts)
+	}
+}
+
 // The login succeeded, the session exists and its cookies are in the browser —
 // only the authorization code failed. Returning at that point recorded nothing:
 // no entry in the trail saying anyone logged in, and no movement on the counter
