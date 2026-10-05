@@ -4521,6 +4521,417 @@ func TestIntegrationRevocationThatCannotBePerformedIsNotReportedAsDone(t *testin
 	}
 }
 
+// Every failure to revoke a token answers 503 and records FAILURE, except the
+// one in front of all of them: a client authentication this service could not
+// decide left with 401 invalid_client "client authentication failed" and no
+// entry in the trail at all. That answer is a statement about the caller's
+// credential — a relying party acting on it rotates a secret that was right the
+// whole time, or pages somebody — and it is the wrong statement twice over,
+// because the only question revocation is asked is whether a leaked token is
+// dead. It was not: the clients table never answered, so the token was never
+// looked for and is still issuing access. RFC 7009 §2.2.1 is written for exactly
+// this state, and this handler already answers four other faults with it.
+func TestIntegrationRevocationSaysWhenItCouldNotDecideTheClient(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	bootstrap, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByID(ctx, bootstrap.RealmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "revoke-auth-outage", Name: "Revoke Auth Outage", Type: "confidential",
+		RedirectURIs: []string{"https://revoke-outage.example.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "leaked-again", Password: "leaked-again-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour, "127.0.0.1",
+		"revoke-auth-outage-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Issued before the table goes away, because issuing reads it too.
+	service := ressooidc.Service{Store: data}
+	tokens, err := service.IssueUserTokens(ctx, realm, created.Client, user, session.Session.ID,
+		[]string{"openid"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, nil))
+	metrics := observability.NewRegistry()
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	const revokePath = "/realms/master/protocol/openid-connect/revoke"
+	// No Origin header: the CORS middleware in front of this route reads the
+	// clients table too, and what is under test is the authentication behind it.
+	// The limiters live on this one Server, so every request below shares the
+	// budget the fault used to spend.
+	revokeWith := func(clientID, secret, token string) (int, string, http.Header) {
+		t.Helper()
+		response, postErr := server.Client().PostForm(server.URL+revokePath,
+			url.Values{"token": {token}, "client_id": {clientID}, "client_secret": {secret}})
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body), response.Header
+	}
+	exported := func(prefix string) string {
+		var written strings.Builder
+		metrics.WritePrometheus(&written)
+		for _, line := range strings.Split(written.String(), "\n") {
+			if strings.HasPrefix(line, prefix) {
+				return line
+			}
+		}
+		return ""
+	}
+	undecidedLines := func() int {
+		count := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, "a client authentication could not be decided") {
+				count++
+			}
+		}
+		return count
+	}
+	revocationTrail := func() []store.AuditRow {
+		t.Helper()
+		page, listErr := data.ListAudit(ctx, store.AuditFilter{EventType: "TOKEN_REVOKED",
+			Ascending: true, Limit: 200})
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		return page.Items
+	}
+
+	// The clients table cannot be read. realms is untouched, the limiters are in
+	// memory, and nothing else on the way to this lookup reads it.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE clients RENAME TO clients_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE clients_hidden RENAME TO clients"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every other test sharing this container authenticates a Client, so the
+	// table cannot be left hidden even if this one fails part way through.
+	t.Cleanup(func() {
+		_, _ = data.Pool.Exec(context.Background(), "ALTER TABLE clients_hidden RENAME TO clients")
+	})
+
+	// The budget is twenty failures per Client inside five minutes, which is what
+	// a relying party retrying a revocation gets through in the first seconds of
+	// an outage.
+	const attempts = clientAuthMaxFailures
+	for i := 0; i < attempts; i++ {
+		status, body, header := revokeWith("revoke-auth-outage", created.ClientSecret, tokens.RefreshToken)
+		// (1) 503 temporarily_unavailable is what §2.2.1 provides for and what this
+		// handler already answers its four other faults with: assume the token still
+		// exists, retry shortly.
+		if status != http.StatusServiceUnavailable ||
+			!strings.Contains(body, `"error":"temporarily_unavailable"`) ||
+			!strings.Contains(body, "the token could not be revoked and is still valid; retry after a short delay") {
+			restore()
+			t.Fatalf("attempt %d during the outage answered %d %s, want 503 temporarily_unavailable "+
+				"so the caller knows the leaked token is still live", i+1, status, body)
+		}
+		if strings.Contains(body, "invalid_client") {
+			restore()
+			t.Fatalf("attempt %d during the outage still blamed the credential: %s", i+1, body)
+		}
+		// WWW-Authenticate invites the caller to present a different credential,
+		// which is not what is wrong here.
+		if got := header.Get("WWW-Authenticate"); got != "" {
+			restore()
+			t.Fatalf("attempt %d during the outage challenged the caller's credential: WWW-Authenticate=%q",
+				i+1, got)
+		}
+	}
+	restore()
+
+	// (4) The fault is over and the Client that was never wrong revokes the token
+	// it has been trying to revoke all along. The attempts above must not have
+	// spent its budget, or this answers 429 for the rest of the five-minute
+	// window — the table back, the secret always right, the leaked token alive.
+	status, body, _ := revokeWith("revoke-auth-outage", created.ClientSecret, tokens.RefreshToken)
+	if status == http.StatusTooManyRequests {
+		t.Fatalf("a clients table that could not be read spent the Client's attempt budget: the "+
+			"revocation stays refused after the fault is over (%d %s)", status, body)
+	}
+	if status != http.StatusOK || body != "" {
+		t.Fatalf("the revocation answered %d %q after the table came back, want 200 with an empty body",
+			status, body)
+	}
+
+	// (2) Each of those failures is in the trail. Before this change not one of
+	// them was: an operator asking what happened to the token found nothing, the
+	// same gap the Realm branch in front of this one records for itself.
+	trail := revocationTrail()
+	if len(trail) != attempts+1 {
+		t.Fatalf("the trail holds %d TOKEN_REVOKED entries for %d failures and one success",
+			len(trail), attempts)
+	}
+	for i, entry := range trail[:attempts] {
+		if entry.Result != "FAILURE" {
+			t.Errorf("entry %d records result=%s for a revocation that did not happen", i+1, entry.Result)
+		}
+		// The Client is not known here — its identifier arrives unverified on an
+		// unauthenticated request and nothing has checked it — so the entry is keyed
+		// on the Realm the route resolved, which is the only party that is.
+		if entry.TargetType != "realm" || entry.TargetID != realm.Name {
+			t.Errorf("entry %d is keyed on %s=%q, want realm=%q", i+1,
+				entry.TargetType, entry.TargetID, realm.Name)
+		}
+		if entry.RealmID == nil || *entry.RealmID != realm.ID {
+			t.Errorf("entry %d does not name the Realm it happened in: %v", i+1, entry.RealmID)
+		}
+		if entry.ActorName != "" {
+			t.Errorf("entry %d names an actor nothing authenticated: %q", i+1, entry.ActorName)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(entry.Detail, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded["revoked"] != "none" {
+			t.Errorf("entry %d records revoked=%v, want none: nothing was revoked", i+1, decoded["revoked"])
+		}
+		reason, _ := decoded["error"].(string)
+		if !strings.Contains(reason, "authenticate the client") {
+			t.Errorf("entry %d gives no reason an operator can act on: %v", i+1, decoded)
+		}
+		// Unverified input stays out of the trail, or the audit output hands it
+		// back to whoever reads it.
+		if strings.Contains(string(entry.Detail), "revoke-auth-outage") ||
+			strings.Contains(string(entry.Detail), created.ClientSecret) {
+			t.Errorf("entry %d copied unverified form input into the trail: %s", i+1, entry.Detail)
+		}
+	}
+	if trail[attempts].Result != "SUCCESS" {
+		t.Errorf("the revocation after the outage recorded result=%s", trail[attempts].Result)
+	}
+
+	// (3) Every attempt during the outage is counted where v0.9.97 put it, and
+	// none of them is a credential failure — the series the operations guide reads
+	// as a wrong secret or somebody guessing one.
+	if got := exported(`resso_client_auth_errors_total{stage="client"}`); got !=
+		`resso_client_auth_errors_total{stage="client"} `+strconv.Itoa(attempts) {
+		t.Fatalf("the undecided authentications were not counted: %q", got)
+	}
+	if got := exported("resso_client_auth_failures_total"); got != "" {
+		t.Fatalf("a store fault was counted as a failed client authentication: %q", got)
+	}
+	if strings.Contains(logs.String(), created.ClientSecret) {
+		t.Fatal("the client secret was written to the log")
+	}
+	// The fault is named once. clientAuthUndecided already logs it, so the branch
+	// added here must not log it again.
+	if got := undecidedLines(); got != attempts {
+		t.Fatalf("a clients table that could not be read left %d log line(s) for %d attempts:\n%s",
+			got, attempts, logs.String())
+	}
+
+	// (5) A caller that hangs up mid-verification. The clients table is held under
+	// ACCESS EXCLUSIVE in an open transaction, so the lookup this request makes
+	// parks in PostgreSQL's lock queue; the poll below waits for that wait to
+	// appear, which is what makes the cancellation land inside the verification
+	// rather than before it. This endpoint answers an undecided authentication
+	// with 503 now, so if a cancellation were allowed through that branch an
+	// unauthenticated caller could put this route's error rate wherever it liked
+	// by abandoning requests — the hole 8f2c73c closed, through a new series.
+	blocker, err := data.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		_ = blocker.Rollback(context.Background())
+	}
+	// Every other test sharing this container reads the clients table, so the
+	// lock cannot outlive this one even if it fails part way through.
+	t.Cleanup(release)
+	if _, err := blocker.Exec(ctx, "LOCK TABLE clients IN ACCESS EXCLUSIVE MODE"); err != nil {
+		release()
+		t.Fatal(err)
+	}
+	// The reader below deliberately ignores the status label, so it counts the
+	// abandoned request whatever it was answered with — which is what makes it
+	// usable as the handler-finished signal. The one after it reads only the
+	// faults this endpoint reported.
+	onRoute := func(status string) int {
+		count := 0
+		var written strings.Builder
+		metrics.WritePrometheus(&written)
+		for _, line := range strings.Split(written.String(), "\n") {
+			if !strings.HasPrefix(line, "resso_http_requests_total") ||
+				!strings.Contains(line, `route="/realms/{realm}/protocol/openid-connect/revoke"`) {
+				continue
+			}
+			if status != "" && !strings.Contains(line, `status="`+status+`"`) {
+				continue
+			}
+			fields := strings.Fields(line)
+			n, _ := strconv.Atoi(fields[len(fields)-1])
+			count += n
+		}
+		return count
+	}
+	answeredBefore := onRoute("")
+	faultsBefore := onRoute("503")
+	if faultsBefore != attempts {
+		t.Fatalf("the route counter recorded %d 503s for %d outage attempts", faultsBefore, attempts)
+	}
+
+	requestCtx, hangUp := context.WithCancel(context.Background())
+	abandoned := url.Values{"token": {tokens.RefreshToken}, "client_id": {"revoke-auth-outage"},
+		"client_secret": {created.ClientSecret}}
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, server.URL+revokePath,
+		strings.NewReader(abandoned.Encode()))
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	sent := make(chan error, 1)
+	go func() {
+		response, doErr := server.Client().Do(request)
+		if response != nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+		}
+		sent <- doErr
+	}()
+
+	waiting := func() bool {
+		var count int
+		if err := data.Pool.QueryRow(context.Background(), `SELECT count(*) FROM pg_locks l
+			JOIN pg_class c ON c.oid=l.relation WHERE c.relname='clients' AND NOT l.granted`).Scan(&count); err != nil {
+			return false
+		}
+		return count > 0
+	}
+	parked := false
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
+		if waiting() {
+			parked = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !parked {
+		release()
+		t.Fatal("the request never reached the clients lookup, so cancelling it would prove nothing")
+	}
+	hangUp()
+	if doErr := <-sent; doErr == nil {
+		release()
+		t.Fatal("the abandoned request was answered, so the caller did not hang up mid-verification")
+	}
+	// The handler is still running when Do returns, so wait for the request
+	// counter the middleware writes after it to move before reading anything.
+	for deadline := time.Now().Add(20 * time.Second); onRoute("") == answeredBefore && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if onRoute("") == answeredBefore {
+		release()
+		t.Fatal("the abandoned request never finished being handled")
+	}
+	release()
+
+	// Nothing about this service failed, so nothing about it is recorded — not the
+	// route's error rate, not the fault series, not the log, and not the trail.
+	if got := onRoute("503"); got != faultsBefore {
+		t.Errorf("a caller that hung up was answered as a fault on this side: "+
+			"resso_http_requests_total{status=\"503\"} went %d -> %d", faultsBefore, got)
+	}
+	if got := exported(`resso_client_auth_errors_total{stage="client"}`); got !=
+		`resso_client_auth_errors_total{stage="client"} `+strconv.Itoa(attempts) {
+		t.Errorf("a caller that hung up was counted as a fault this service could not decide: %q", got)
+	}
+	if got := undecidedLines(); got != attempts {
+		t.Errorf("a caller that hung up was logged as a fault on this side (%d line(s) for %d)",
+			got, attempts)
+	}
+	if got := len(revocationTrail()); got != attempts+1 {
+		t.Errorf("a caller that hung up added %d entries to the trail", got-attempts-1)
+	}
+
+	// (3, continued) A credential that was read and refused keeps the answer it
+	// has always had, is counted where that question is answered from, and still
+	// spends the budget — which is the bound both limiters exist for. The success
+	// above cleared this Client's window and the abandoned request spent nothing,
+	// so the count starts from zero here.
+	for i := 0; i < attempts; i++ {
+		status, body, _ = revokeWith("revoke-auth-outage", "not-this-clients-secret", tokens.RefreshToken)
+		if status != http.StatusUnauthorized || !strings.Contains(body, `"error":"invalid_client"`) ||
+			!strings.Contains(body, "client authentication failed") {
+			t.Fatalf("wrong-secret attempt %d answered %d %s, want 401 invalid_client", i+1, status, body)
+		}
+	}
+	if got := exported("resso_client_auth_failures_total"); got !=
+		`resso_client_auth_failures_total{realm="master"} `+strconv.Itoa(attempts) {
+		t.Errorf("refused secrets were not counted as failed client authentications: %q", got)
+	}
+	status, body, header := revokeWith("revoke-auth-outage", "not-this-clients-secret", tokens.RefreshToken)
+	if status != http.StatusTooManyRequests || header.Get("Retry-After") == "" {
+		t.Errorf("the %d refused secrets did not exhaust the Client's budget: answered %d %s Retry-After=%q",
+			attempts, status, body, header.Get("Retry-After"))
+	}
+
+	// An identifier nobody registered is the other decided answer, under its own
+	// fresh window: store.ErrNotFound stays on the counted path, or the bound the
+	// limiters exist for would be gone.
+	status, body, _ = revokeWith("no-such-client", "irrelevant", tokens.RefreshToken)
+	if status != http.StatusUnauthorized || !strings.Contains(body, `"error":"invalid_client"`) {
+		t.Errorf("an unregistered client_id answered %d %s, want 401 invalid_client", status, body)
+	}
+	if got := exported("resso_client_auth_failures_total"); got !=
+		`resso_client_auth_failures_total{realm="master"} `+strconv.Itoa(attempts+1) {
+		t.Errorf("an unregistered client_id was not counted as a failed client authentication: %q", got)
+	}
+	// None of that is a fault on this side, so the fault signals stand where the
+	// outage left them.
+	if got := exported(`resso_client_auth_errors_total{stage="client"}`); got !=
+		`resso_client_auth_errors_total{stage="client"} `+strconv.Itoa(attempts) {
+		t.Errorf("a decided refusal was counted as undecided: %q", got)
+	}
+	if got := undecidedLines(); got != attempts {
+		t.Errorf("a decided refusal was logged as a fault (%d line(s) for %d)", got, attempts)
+	}
+	// And none of them is in the trail either: revoke answers a refused
+	// credential before it has anything to record.
+	if got := len(revocationTrail()); got != attempts+1 {
+		t.Errorf("a decided refusal added %d entries to the trail", got-attempts-1)
+	}
+}
+
 // The login succeeded, the session exists and its cookies are in the browser —
 // only the authorization code failed. Returning at that point recorded nothing:
 // no entry in the trail saying anyone logged in, and no movement on the counter
