@@ -936,20 +936,27 @@ func (s *Server) verifyOIDCClient(r *http.Request, realm domain.Realm, clientID,
 //
 // The response is still not decided here, and cannot be. The three endpoints
 // sharing this helper used to answer a failed client authentication
-// identically; one of them no longer does. Their contracts for a fault on this
+// identically; two of them no longer do. Their contracts for a fault on this
 // side are three different answers — the token endpoint's 500, revoke's 503
 // temporarily_unavailable, introspection's 200 active=false — so each is a
 // change at its own caller, and what this helper contributes is the second
 // return value saying which attempts are this service's to answer for.
 //
-// The token endpoint has that branch: errClientAuthUndecided reaches it and it
-// answers 500 server_error. Introspection and revocation do not yet, so the
-// marked error reaches writeClientAuthError, which looks only for the
-// rate-limit case and writes the 401 it always did. Their answers are therefore
-// unchanged — not because 401 is right for them, but because neither 503 nor
-// 200 active=false can be reached from here without also deciding what
-// introspection's new stage label is and what revoke tells a caller whose token
-// it did not look at. That is left for those endpoints to do.
+// Two of those branches exist. errClientAuthUndecided reaches the token
+// endpoint, which answers 500 server_error, and revoke, which answers 503
+// temporarily_unavailable and records the failure against the Realm: RFC 7009
+// §2.2.1 defines that status as the client assuming its token still exists and
+// retrying, and that is exactly what an undecided authentication leaves behind —
+// the token was never looked for, so it is still live, and the four faults
+// further down revoke already answer that way.
+//
+// Introspection does not, so the marked error reaches writeClientAuthError,
+// which looks only for the rate-limit case and writes the 401 it always did. Its
+// answer is unchanged — not because 401 is right for it, but because 200
+// active=false cannot be reached from here without also deciding what
+// introspection's new stage label is and whether RFC 7662 means to hand a 200 to
+// a caller it never established was authorized to ask. That is left for that
+// endpoint to do.
 //
 // That second return value is what a caller needs and cannot work out for
 // itself: whether the undecided attempt is a fault this service has just
@@ -1301,6 +1308,40 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	}
 	client, ok, err := s.authenticateOIDCClient(r, realm)
 	if err != nil || !ok {
+		// The Realm branch above and the four faults below all answer 503 and
+		// record FAILURE. This step sits between them and did neither: a clients
+		// table that would not answer, or a stored digest that would not decode,
+		// left with 401 invalid_client "client authentication failed".
+		//
+		// That answer says the secret the caller sent is not the one on file, and
+		// what a relying party does with it is rotate a credential that was right
+		// the whole time or page somebody about it. Here it is wrong twice over.
+		// Revocation is what somebody reaches for when a token has leaked, and the
+		// only question it is asked is whether that token is dead; an
+		// authentication this service could not decide never got as far as looking
+		// for the token, so it is alive and still issuing access, and the one
+		// answer that said so was not given. §2.2.1 is written for precisely this
+		// state — the client is to assume the token still exists and may retry —
+		// which is why the four faults below already use it.
+		//
+		// The entry is keyed on the Realm, not the Client. client_id arrives on an
+		// unauthenticated request and nothing has checked it at this point, so
+		// recording it would put unverified input in the trail for the audit output
+		// to hand back; realm.Name is the party this route did resolve. Nothing is
+		// logged either: clientAuthUndecided has already written the ERROR line
+		// naming the step and the error, and a second line for the same fault would
+		// only make it look like two.
+		if errors.Is(err, errClientAuthUndecided) {
+			s.audit(r, &realm.ID, nil, "", "TOKEN_REVOKED", "FAILURE", "realm", realm.Name,
+				map[string]any{"revoked": "none", "error": "authenticate the client: " + err.Error()})
+			writeOAuthError(w, http.StatusServiceUnavailable, "temporarily_unavailable",
+				"the token could not be revoked and is still valid; retry after a short delay")
+			return
+		}
+		// A credential that was read and refused, an identifier nobody registered,
+		// a caller that hung up and a throttled caller all keep the answer they
+		// have always had — and none of them reaches the trail, because none of
+		// them is this service failing to do what it was asked.
 		s.writeClientAuthError(w, r, err)
 		return
 	}
