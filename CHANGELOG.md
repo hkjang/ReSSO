@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.9.101
+
+**인가 코드가 두 번 제시되었을 때 그에 대한 Refresh Token 폐기가 실패하면 `AUTHORIZATION_CODE_REUSED` 감사 항목이 아예 남지 않았습니다 — 코드가 유출되고, 유출에 대한 대응까지 실패했는데, 트레일에는 아무 일도 없었던 것으로 되어 있었습니다.** 코드가 두 번 제시되었다는 것은 그 코드가 유출되었다는 뜻이고 그에 대한 대응은 그 코드가 만들어 낼 수 있었던 Refresh Token을 폐기하는 것입니다. 그 폐기가 실패하면 `RedeemAuthorizationCode`가 데이터베이스 오류를 **그대로** 돌려주었으므로 Grant의 `errors.Is(err, store.ErrCodeReuse)`가 거짓이 되었고, **그 한 조건이 `AUTHORIZATION_CODE_REUSED`를 쓸지 말지를 혼자 결정합니다.** `docs/operations.md`가 감사 화면에서 찾아보라고 보내는 그 항목은 만들어지지 않았고 로그도 한 줄 남지 않았으며, 호출자는 **코드를 잘못 입력했을 때와 똑같은** 400 `invalid_grant`를 받았습니다. 같은 문제의 답은 Refresh Token 쪽에 이미 있었습니다 — `ErrFamilyNotRevoked`가 `ErrTokenReuse`와 함께 올라와 감지가 자신의 실패한 대응보다 오래 살고, Grant가 그것을 읽어 `family_revoked=false`와 오류 한 줄을 남깁니다. 이번 릴리즈는 그 관용구를 코드 쪽으로 옮깁니다.
+
+### 수정
+
+- **재사용 분기의 폐기 `Exec`와 `Commit` 실패가 `ErrCodeReuse` + `ErrFamilyNotRevoked`로 감싸여 올라옵니다.** 감지가 자신의 실패한 대응보다 오래 삽니다 — 이제 `errors.Is(err, store.ErrCodeReuse)`가 참이므로 **폐기가 실패해도 감사 항목은 남습니다.**
+- **그 두 반환이 zero value 대신 `code`를 함께 돌려줍니다.** 호출부가 그 코드의 계정과 Session을 항목에 써 넣기 때문입니다 — zero value를 받으면 `actor_id`가 어떤 `users` 행에도 없는 값이 되어 **감사 기록의 외래 키가 거부하고**, 항목이 **두 번째 방식으로** 사라졌습니다.
+- **감사 detail에 `tokens_revoked=false`가 들어갑니다.** 폐기가 된 평범한 재사용에는 이 키가 **없습니다**(기존 항목의 모양이 그대로 유지됩니다).
+- **사건은 로그 한 줄로만 남습니다 — 다만 결과에 맞는 심각도로.** 폐기가 된 경우는 전과 같이 Warn `authorization code replayed`이고, 실패한 경우는 ERROR `authorization code replayed but the tokens it should have revoked were not`(`trace_id`·`realm`·`client`·`error`)입니다. **ERROR가 Warn과 같은 구절로 시작하므로** 운영자가 `authorization code replayed`로 찾을 때 **최악의 경우가 검색에서 빠지지 않습니다.** 같은 사건에 두 줄을 남기지 않으려고 한 줄로 했습니다. 사유는 로그에만 들어가고 **detail에는 넣지 않습니다** — detail은 그대로 저장되어 감사 화면이 되돌려주는 값이며, 코드 원문과 그 verifier는 **둘 중 어디에도** 들어가지 않습니다.
+- **호출자에게 가는 답은 한 글자도 바뀌지 않았습니다.** 재사용은 어느 쪽이든 죽은 Grant이고, 전과 후가 모두 400 `invalid_grant` "authorization code is invalid or expired"입니다.
+- `ErrFamilyNotRevoked`의 doc을 고쳤습니다 — 이제 **두 재사용 센티널 양쪽**에 따라붙으며, 폐기되지 못하고 남는 것이 무엇인지가 둘 사이에 다릅니다(`ErrTokenReuse`는 재사용된 Token의 계열 전체, `ErrCodeReuse`는 그 코드가 발급된 **한 Session·한 Client의 Refresh Token** — 유출된 코드가 닿을 수 있는 범위가 거기까지입니다).
+- `docs/operations.md`의 `AUTHORIZATION_CODE_REUSED` 항목이 **"해당 Session·Client의 Refresh Token은 이미 폐기되었습니다"라고 단정하던 것이 이 변경으로 조건부가 되므로** 그 항목을 고쳤습니다(문장을 더한 것이 아니라 고친 것입니다) — `tokens_revoked=false`가 무슨 뜻인지, Token이 아직 살아 있으므로 관리 → 세션에서 기록된 Session을 **직접 종료**해야 한다는 것, 사유는 서버 로그의 위 ERROR 문구에서 찾는다는 것까지.
+
+### 확인
+
+- 새 연동 테스트 `TestIntegrationCodeReuseIsRecordedEvenWhenItsRevocationFails` — 실제 PostgreSQL과 프로덕션 배선(`New(data, logger, nil, nil)` + `httptest`)으로, 코드는 진짜 `/auth` 302 `Location`에서 PKCE와 함께 둘을 채굴합니다. 장애는 `ALTER TABLE refresh_tokens RENAME COLUMN revoked_at TO revoked_at_moved`로 **폐기 UPDATE만** 깨뜨려 만들고(코드 조회·감사 기록·첫 교환의 Token INSERT는 그대로 돕니다) 단언 전에 즉시 되돌립니다. ① **폐기가 되는 평범한 재사용**: 첫 교환 200·live Refresh Token 1 → 재사용 400 `invalid_grant`·**live 0**(폐기가 실제로 돌았다는 증거)·감사 1건(actor `code-replay-user`/target `client=code-replay-rp`/detail `session_id` 일치/**`tokens_revoked` 키 부재**)·`level=WARN msg="authorization code replayed"` 1줄·ERROR 0줄 ② **컬럼을 치운 뒤의 재사용**: 400 + 본문 `invalid_grant` + "authorization code is invalid or expired" 그대로·감사 **2건**(둘째가 같은 actor·target, detail `session_id` + `tokens_revoked=false`, detail에 `revoked_at`·코드 원문·verifier 미노출)·그 ERROR 문구 **정확히 1줄**·`authorization code replayed`로 찾히는 줄 **합계 2**·WARN은 여전히 1줄·로그에 코드와 verifier 미노출.
+- **수정 전에 실제로 실패함을 확인**했습니다 — 프로덕션 변경 **전**에 돌리면 `1 reuse events were recorded, want 2: a leaked code whose revocation failed left no entry at all, so the only record of the leak is gone`으로 걸립니다.
+- **단언이 실제로 바뀐 경로를 지나는지 프로브 둘로 따로 증명**했습니다 — ① store가 `code` 대신 `AuthorizationCode{}`를 돌려주게 하면 다시 `1 reuse events were recorded, want 2`로 걸립니다(`actor_id`가 `uuid.Nil`이라 `audit_events`의 외래 키가 거부하고 `WriteAudit`이 조용히 실패합니다 — **항목이 또 다른 이유로 사라집니다**) ② `detail["tokens_revoked"]`와 ERROR 줄만 빼면 `the entry records tokens_revoked=<nil>`·`a revocation that failed left 0 error line(s) saying so`·`1 of the two replays are findable by the phrase an operator searches for` 셋이 동시에 걸립니다. 둘 다 즉시 되돌렸습니다.
+- 기존 재사용 테스트(`internal/httpserver/integration_test.go`, `internal/store`)는 그대로 통과합니다 — `go test -race ./internal/httpserver -run '^TestIntegration' -count=1` ok, `go test -race ./internal/store -count=1` ok.
+- 릴리즈 준비에서 `make lint`(golangci-lint 0 issues, govulncheck 취약점 0, `eslint --max-warnings 0`), `make test`(Go `-race` 13개 패키지 · 연동 SKIP 0 · `go vet` · 콘솔 29파일 161테스트 · 빌드), `make build VERSION=v0.9.101`, `git diff --check`가 통과했습니다.
+
+### Upgrade notes
+
+**마이그레이션도 설정 변경도 없고 이전 `v0.9.100` 이미지로 롤백할 수 있습니다**(되돌리면 폐기가 실패한 재사용이 다시 아무 기록도 남기지 않을 뿐입니다). **HTTP 응답은 어느 경우에도 한 글자도 바뀌지 않습니다** — 재사용된 코드는 전과 같이 400 `invalid_grant` "authorization code is invalid or expired"이고, 정상적인 코드 교환도 그대로입니다. RP 쪽에서 고칠 것은 없습니다.
+
+**달라지는 것은 감사 트레일과 로그뿐이며, 좋은 방향입니다.** 전에는 폐기가 실패한 재사용이 **기록을 하나도 남기지 않았습니다**. 이제 그 경우도 `AUTHORIZATION_CODE_REUSED` `result=FAILURE`로 남고, 상세에 **`tokens_revoked=false`**가 붙습니다. 폐기가 정상적으로 된 재사용의 항목은 전과 똑같습니다(이 키가 붙지 않습니다) — 즉 **기존 항목의 모양을 읽는 쪽은 바뀌는 것이 없습니다.**
+
+**`tokens_revoked=false`를 보면 사람이 손을 써야 합니다.** 그 코드로 받아 간 Refresh Token이 **아직 살아 있다**는 뜻이므로, 관리 → 세션에서 기록된 Session을 직접 종료하세요. 폐기가 왜 실패했는지는 서버 로그의 `authorization code replayed but the tokens it should have revoked were not`에 있습니다. `docs/operations.md`의 해당 항목에 이 절차를 적었습니다.
+
+**로그를 기계로 읽는다면 ERROR 문구 하나가 새로 나타날 수 있습니다** — 위의 그 줄이고, 정상 운영에서는 나오지 않습니다. **기존 Warn `authorization code replayed`로 걸어 둔 검색은 그대로 두어도 됩니다**: 새 ERROR가 같은 구절로 시작하므로 그 검색에 함께 걸립니다. 다만 **심각도로 거르고 있다면** 폐기가 실패한 경우는 Warn이 아니라 ERROR로 올라오므로, 그쪽이 더 급한 사건임을 감안해 조건을 확인하세요. 사건 하나에 로그는 여전히 한 줄입니다.
+
 ## v0.9.100
 
 **Introspection Endpoint가 판정하지 못한 Client 인증에 401 `invalid_client` 대신 200 `{"active":false}`로 답하고 `resso_introspection_errors_total{stage="client_auth"}`에 셉니다 — 이것이 `v0.9.97`이 "Endpoint별 과제"로 남긴 세 Endpoint의 마지막 조각입니다.** `introspect`는 `authenticateOIDCClient`의 **모든** 실패를 `writeClientAuthError`에 넘겼으므로, `clients` 테이블이 답하지 못한 조회나 디코딩되지 않는 저장된 digest가 401 `invalid_client` "client authentication failed"로 나갔습니다. 401은 "네 Secret이 틀렸다"는 뜻이고 그것을 받은 Resource Server는 사람을 부르거나 자격증명을 폐기합니다 — **그러나 그 Secret은 읽히지도 않았습니다.** 판정하지 못한 조회는 그 Secret에 대해 아무것도 판정하지 않았고, Secret은 처음부터 맞았으며 장애가 걷히면 그 연동은 손 하나 대지 않고 다시 돌 수 있었습니다. 이 Endpoint의 이쪽 장애 계약은 처음부터 200 `active=false`였고(위에 있는 다섯 단계 — `realm`·`revocation_state`·`session`·`user`·`refresh_token` — 가 모두 그렇게 답합니다), 인증만이 그 선 밖에 서 있던 마지막 단계였습니다. `v0.9.97`이 Limiter·`client_auth_failures`·로그를 갈라 놓고 응답을 Endpoint별 과제로 남긴 뒤 `v0.9.98`이 `/token`의 500, `v0.9.99`가 `/revoke`의 503을 가져갔으며, 이번이 남은 하나입니다.
