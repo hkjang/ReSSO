@@ -548,17 +548,35 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		return nil
 	})
 	if err != nil {
-		// A replayed code is an incident, not a routine bad request: the
-		// store has already revoked what it could, and this is the only
-		// place an operator can learn it happened.
+		// A replayed code is an incident, not a routine bad request, and this is
+		// the only place an operator can learn it happened. The store's response
+		// to the replay is revoking the refresh tokens that code could have
+		// produced; when that response did not land it says so with
+		// ErrFamilyNotRevoked, and that is the part a reader has to act on,
+		// because the tokens whoever took the code is holding still work.
 		if errors.Is(err, store.ErrCodeReuse) {
 			// Whose code leaked is the first thing an operator needs, so the
 			// name is resolved here even though the grant is already lost.
 			affected, _ := s.store.UserByID(r.Context(), code.UserID)
+			detail := map[string]any{"session_id": code.SessionID.String()}
+			if errors.Is(err, store.ErrFamilyNotRevoked) {
+				detail["tokens_revoked"] = false
+				// One line for the event either way, at the severity the
+				// outcome earns, and it opens with the phrase the ordinary case
+				// logs: the operations guide sends a reader looking for
+				// replayed codes, and the worst of them must not be the one
+				// that search misses. The reason goes in the log and not the
+				// detail, which is stored verbatim and handed back by the audit
+				// screen; the grant's code and verifier go in neither.
+				s.logger.Error("authorization code replayed but the tokens it should have revoked were not",
+					"trace_id", traceIDFrom(r.Context()), "realm", realm.Name,
+					"client", client.ClientID, "error", err)
+			} else {
+				s.logger.Warn("authorization code replayed", "trace_id", traceIDFrom(r.Context()),
+					"realm", realm.Name, "client", client.ClientID)
+			}
 			s.audit(r, &realm.ID, &code.UserID, affected.Username, "AUTHORIZATION_CODE_REUSED", "FAILURE",
-				"client", client.ClientID, map[string]any{"session_id": code.SessionID.String()})
-			s.logger.Warn("authorization code replayed", "trace_id", traceIDFrom(r.Context()),
-				"realm", realm.Name, "client", client.ClientID)
+				"client", client.ClientID, detail)
 		}
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code is invalid or expired")
 		return
