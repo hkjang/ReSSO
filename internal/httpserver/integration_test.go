@@ -2183,6 +2183,264 @@ func TestIntegrationRefreshTokenReuseNamesTheAccount(t *testing.T) {
 	}
 }
 
+// A replayed authorization code means the code leaked, and the response to it
+// is revoking the refresh tokens that code could have produced. When that
+// revocation did not land, RedeemAuthorizationCode returned the database error
+// unchanged — so errors.Is(err, store.ErrCodeReuse) was false in the grant, and
+// that one condition is what decides whether AUTHORIZATION_CODE_REUSED is
+// written at all. The entry an operator is sent to the audit screen to look for
+// was never created, no line was logged, and the answer was the same
+// invalid_grant a mistyped code gets: the code leaked, the response to the leak
+// failed, and the trail said nothing had happened.
+//
+// The refresh token path has answered this for some time — ErrFamilyNotRevoked
+// rides along with ErrTokenReuse so the detection survives its own failed
+// response — and this pins the same shape for codes. What it must not change is
+// the answer: a replay is a bad grant to the caller either way, 400
+// invalid_grant, before and after.
+func TestIntegrationCodeReuseIsRecordedEvenWhenItsRevocationFails(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "code-replay-rp", Name: "Code Replay RP", Type: "public",
+		RedirectURIs: []string{"https://code-replay.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "code-replay-user", Password: "code-replay-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour,
+		"127.0.0.1", "code-replay-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, nil))
+	server := httptest.NewServer(New(data, logger, nil, nil).Handler())
+	t.Cleanup(server.Close)
+
+	// Codes are minted through the real browser flow, because a code the store
+	// never issued never reaches the reuse branch. Both are taken now, while
+	// nothing is broken: authorization writes nothing to refresh_tokens, but it
+	// is one less thing the outage below has to be narrow enough to leave alone.
+	verifier := strings.Repeat("code-replay-verify", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	browser := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	mint := func() string {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodGet, server.URL+
+			"/realms/master/protocol/openid-connect/auth?response_type=code&client_id=code-replay-rp"+
+			"&redirect_uri="+url.QueryEscape("https://code-replay.test/cb")+"&scope=openid&state=s"+
+			"&code_challenge="+challenge+"&code_challenge_method=S256", nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		authorized, doErr := browser.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = authorized.Body.Close()
+		location, parseErr := url.Parse(authorized.Header.Get("Location"))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		code := location.Query().Get("code")
+		if code == "" {
+			t.Fatalf("no authorization code was issued: %s", location)
+		}
+		return code
+	}
+	answered, replayed := mint(), mint()
+
+	exchange := func(code string) (int, string) {
+		t.Helper()
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token",
+			url.Values{"grant_type": {"authorization_code"}, "code": {code},
+				"redirect_uri": {"https://code-replay.test/cb"}, "client_id": {"code-replay-rp"},
+				"code_verifier": {verifier}})
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+	reuseEntries := func() []store.AuditRow {
+		t.Helper()
+		page, listErr := data.ListAudit(ctx, store.AuditFilter{RealmID: &realm.ID,
+			EventType: "AUTHORIZATION_CODE_REUSED", Ascending: true})
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		return page.Items
+	}
+	lines := func(substring string) int {
+		count := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, substring) {
+				count++
+			}
+		}
+		return count
+	}
+	liveTokens := func() int {
+		t.Helper()
+		count := 0
+		if scanErr := data.Pool.QueryRow(ctx, `SELECT count(*) FROM refresh_tokens
+			WHERE session_id=$1 AND client_id=$2 AND revoked_at IS NULL`,
+			session.Session.ID, created.Client.ID).Scan(&count); scanErr != nil {
+			t.Fatal(scanErr)
+		}
+		return count
+	}
+
+	// (1) The replay whose revocation lands. Unchanged by this work, and pinned
+	// here because nothing asserted it through the production wiring before.
+	if status, body := exchange(answered); status != http.StatusOK {
+		t.Fatalf("the first exchange answered %d: %s", status, body)
+	}
+	if got := liveTokens(); got != 1 {
+		t.Fatalf("the exchange left %d live refresh token(s) for this session and client, want 1", got)
+	}
+	if status, body := exchange(answered); status != http.StatusBadRequest ||
+		!strings.Contains(body, `"error":"invalid_grant"`) {
+		t.Fatalf("replaying a code answered %d %s, want 400 invalid_grant", status, body)
+	}
+	if got := liveTokens(); got != 0 {
+		t.Errorf("the replay left %d live refresh token(s): the response to the leak did not happen", got)
+	}
+	trail := reuseEntries()
+	if len(trail) != 1 {
+		t.Fatalf("%d reuse events were recorded for an answered replay, want 1", len(trail))
+	}
+	if trail[0].ActorName != "code-replay-user" || trail[0].TargetType != "client" ||
+		trail[0].TargetID != "code-replay-rp" {
+		t.Errorf("the entry is keyed on actor=%q %s=%q, want actor=code-replay-user client=code-replay-rp",
+			trail[0].ActorName, trail[0].TargetType, trail[0].TargetID)
+	}
+	var answeredDetail map[string]any
+	if err := json.Unmarshal(trail[0].Detail, &answeredDetail); err != nil {
+		t.Fatal(err)
+	}
+	if answeredDetail["session_id"] != session.Session.ID.String() {
+		t.Errorf("the entry names session %v, want %s", answeredDetail["session_id"], session.Session.ID)
+	}
+	// A revocation that happened says nothing, exactly as the refresh path's
+	// family_revoked key is absent when the family really went away.
+	if _, present := answeredDetail["tokens_revoked"]; present {
+		t.Errorf("an answered replay recorded tokens_revoked: %s", trail[0].Detail)
+	}
+	// The request log reports a 400 at WARN too, so the message is matched whole
+	// rather than the level counted.
+	if got := lines(`level=WARN msg="authorization code replayed"`); got != 1 {
+		t.Errorf("an answered replay left %d warning(s) naming it:\n%s", got, logs.String())
+	}
+	if got := lines("level=ERROR"); got != 0 {
+		t.Errorf("an answered replay was logged as a fault on this side:\n%s", logs.String())
+	}
+
+	// (2) The replay whose revocation does not land. Only the reuse branch's
+	// UPDATE is broken: moving the column away leaves the code lookup, the audit
+	// write and the first exchange's refresh token INSERT — which enumerates its
+	// columns and does not include revoked_at — working.
+	if status, body := exchange(replayed); status != http.StatusOK {
+		t.Fatalf("the second exchange answered %d: %s", status, body)
+	}
+	if _, err := data.Pool.Exec(ctx,
+		"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at TO revoked_at_moved"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE refresh_tokens RENAME COLUMN revoked_at_moved TO revoked_at"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(restore)
+	status, body := exchange(replayed)
+	restore()
+
+	// The caller is told exactly what it was told before. A replay is a dead
+	// grant whether or not this server managed to respond to it, and a 500 here
+	// would be a different change than the one under test.
+	if status != http.StatusBadRequest ||
+		!strings.Contains(body, `"error":"invalid_grant"`) ||
+		!strings.Contains(body, "authorization code is invalid or expired") {
+		t.Errorf("a replay whose revocation failed answered %d %s, want the unchanged 400 invalid_grant",
+			status, body)
+	}
+	trail = reuseEntries()
+	if len(trail) != 2 {
+		t.Fatalf("%d reuse events were recorded, want 2: a leaked code whose revocation failed left "+
+			"no entry at all, so the only record of the leak is gone", len(trail))
+	}
+	failed := trail[1]
+	if failed.ActorName != "code-replay-user" || failed.TargetType != "client" ||
+		failed.TargetID != "code-replay-rp" {
+		t.Errorf("the entry is keyed on actor=%q %s=%q, want actor=code-replay-user client=code-replay-rp",
+			failed.ActorName, failed.TargetType, failed.TargetID)
+	}
+	var failedDetail map[string]any
+	if err := json.Unmarshal(failed.Detail, &failedDetail); err != nil {
+		t.Fatal(err)
+	}
+	if failedDetail["session_id"] != session.Session.ID.String() {
+		t.Errorf("the entry names session %v, want %s", failedDetail["session_id"], session.Session.ID)
+	}
+	if failedDetail["tokens_revoked"] != false {
+		t.Errorf("the entry records tokens_revoked=%v: a reader cannot tell the tokens are still live: %s",
+			failedDetail["tokens_revoked"], failed.Detail)
+	}
+	// The reason belongs in the log, not the trail, which is stored verbatim and
+	// handed back by the audit screen.
+	if strings.Contains(string(failed.Detail), "revoked_at") ||
+		strings.Contains(string(failed.Detail), replayed) ||
+		strings.Contains(string(failed.Detail), verifier) {
+		t.Errorf("the entry copied the fault or the grant's credentials into the trail: %s", failed.Detail)
+	}
+	// One line per event, at the severity the outcome earns — and it keeps the
+	// phrase the answered case logs, so that looking for replayed codes finds
+	// the worst case rather than only the ones that were answered.
+	if got := lines(
+		`level=ERROR msg="authorization code replayed but the tokens it should have revoked were not"`,
+	); got != 1 {
+		t.Errorf("a revocation that failed left %d error line(s) saying so:\n%s", got, logs.String())
+	}
+	if got := lines("authorization code replayed"); got != 2 {
+		t.Errorf("%d of the two replays are findable by the phrase an operator searches for:\n%s",
+			got, logs.String())
+	}
+	if got := lines(`level=WARN msg="authorization code replayed"`); got != 1 {
+		t.Errorf("a revocation that failed was logged as the ordinary case too, %d warning(s):\n%s",
+			got, logs.String())
+	}
+	if strings.Contains(logs.String(), replayed) || strings.Contains(logs.String(), verifier) {
+		t.Error("the authorization code or its verifier was written to the log")
+	}
+}
+
 func TestIntegrationRefreshFailureLeavesTheClientsTokenUsable(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()

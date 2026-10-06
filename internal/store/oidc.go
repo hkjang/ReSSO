@@ -166,12 +166,26 @@ func (s *Store) RedeemAuthorizationCode(ctx context.Context, raw string, validat
 	if consumed {
 		// Scoped to the session and client this code was issued for, so one
 		// relying party's incident does not sign the user out of the others.
-		if _, err := tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
-			WHERE session_id=$1 AND client_id=$2 AND revoked_at IS NULL`, code.SessionID, code.ClientID); err != nil {
-			return AuthorizationCode{}, err
+		if _, revokeErr := tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,now())
+			WHERE session_id=$1 AND client_id=$2 AND revoked_at IS NULL`, code.SessionID, code.ClientID); revokeErr != nil {
+			// The detection outlives its own failed response. Returning the
+			// database error unchanged made errors.Is(err, ErrCodeReuse) false
+			// in the caller, and that one condition is what decides whether the
+			// reuse is recorded at all: a code that leaked, and whose response
+			// then failed, came back as the same invalid_grant a mistyped code
+			// gets, with nothing in the trail and nothing in the log. The
+			// detection is worth reporting more in this case than in the
+			// ordinary one, because the tokens that should have been taken away
+			// are still usable by whoever has them.
+			//
+			// The code is returned alongside the error, where the two returns
+			// this replaces gave the zero value, because the caller writes the
+			// account and session it names into that record.
+			return code, fmt.Errorf("%w: %w: %v", ErrCodeReuse, ErrFamilyNotRevoked, revokeErr)
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return AuthorizationCode{}, err
+			// Nothing was written either, so this is the same shortfall.
+			return code, fmt.Errorf("%w: %w: %v", ErrCodeReuse, ErrFamilyNotRevoked, err)
 		}
 		return code, ErrCodeReuse
 	}
@@ -227,10 +241,13 @@ func (s *Store) CreateRefreshToken(ctx context.Context, token RefreshToken) (str
 
 var ErrTokenReuse = errors.New("refresh token reuse detected")
 
-// ErrFamilyNotRevoked accompanies ErrTokenReuse when the reuse was detected
-// and the response to it did not land. The detection is still worth reporting —
-// more so, because the family it should have taken away is still usable by
-// whoever has it.
+// ErrFamilyNotRevoked accompanies either reuse sentinel when the reuse was
+// detected and the response to it did not land. The detection is still worth
+// reporting — more so, because what it should have taken away is still usable
+// by whoever has it. What that is differs between the two: with ErrTokenReuse
+// it is the replayed token's whole family, and with ErrCodeReuse it is the
+// refresh tokens of the one session and client the replayed code was issued
+// for, which is as far as a leaked code can reach.
 var ErrFamilyNotRevoked = errors.New("the reused token's family was not revoked")
 
 // refreshRotationGrace lets a token that was already rotated be presented
