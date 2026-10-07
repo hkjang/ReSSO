@@ -556,9 +556,30 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		// because the tokens whoever took the code is holding still work.
 		if errors.Is(err, store.ErrCodeReuse) {
 			// Whose code leaked is the first thing an operator needs, so the
-			// name is resolved here even though the grant is already lost.
-			affected, _ := s.store.UserByID(r.Context(), code.UserID)
+			// name is resolved here even though the grant is already lost. That
+			// the grant is lost is no reason to drop the lookup's error, which
+			// is what this used to do: while users could not be read the entry
+			// was still written, but its actor column was blank and nothing
+			// said why — and the operations guide sends a reader to search this
+			// event by account, a search that could never return it. The
+			// refresh path says so in as many words a few hundred lines below.
+			//
+			// The verdict steers the signals and nothing else. The response is
+			// the same 400 either way: the redemption that detected the replay
+			// spent the code, so there is no retry for a 500 to invite, and
+			// answering one here was a separate change that was not taken.
+			// ErrNotFound is not this kind of failure and userLookupFailed
+			// already filters it — an account that is genuinely gone is a real
+			// answer to the question, not a blank this server owes an
+			// explanation for. Its error line reports a different fact than the
+			// replay's own line below, so the two are not one event written
+			// twice: one says a code was replayed, the other says the account
+			// behind it could not be named.
+			affected, actorErr := s.store.UserByID(r.Context(), code.UserID)
 			detail := map[string]any{"session_id": code.SessionID.String()}
+			if s.userLookupFailed(r, realm.Name, "authorization_code", actorErr) {
+				detail["actor_resolved"] = false
+			}
 			if errors.Is(err, store.ErrFamilyNotRevoked) {
 				detail["tokens_revoked"] = false
 				// One line for the event either way, at the severity the
