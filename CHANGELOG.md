@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.9.102
+
+**`users`를 읽을 수 없는 동안 재사용된 인가 코드의 `AUTHORIZATION_CODE_REUSED` 항목은 계정 칸이 빈 채로 기록되었고, 왜 비었는지는 로그에도 지표에도 없었습니다 — 운영 가이드가 그 항목을 계정으로 검색하라고 보내는데, 그 검색으로는 영원히 찾을 수 없는 항목이었습니다.** `AUTHORIZATION_CODE_REUSED` 항목은 코드가 유출되었다는 **유일한** 기록이고, 거기 적히는 이름은 Grant가 이미 죽은 뒤에 하는 `UserByID` 한 번에서 옵니다. 그 호출의 오류가 `_`로 버려지고 있었습니다 — `users`를 읽지 못하는 동안에도 항목은 그대로 쓰였지만 그 `actor` 칸은 비어 있었고, **그 사실을 말하는 것이 아무것도 없었습니다.** 읽는 사람은 그 빈칸이 **조회에 실패한 것인지, 주인이 없는 코드인지 구별할 수 없었습니다.** 같은 문제의 답은 형제 경로에 이미 있었습니다 — Refresh Token 쪽은 회전 **전에** `userLookupFailed`를 지나 actor를 보장하며, 그 주석이 **바로 이 결함을 문장으로 지목해** 고쳐 둔 자리입니다. 코드 재사용 쪽만 `_`로 남아 있었습니다.
+
+### 수정
+
+- **재사용 분기의 `UserByID` 오류가 `userLookupFailed`를 지나갑니다.** 형제 경로(Refresh Token)가 이미 쓰는 그 헬퍼이고, 이제 조회 실패가 **세 곳에서 말합니다** — 감사 detail의 `actor_resolved=false`, 서버 로그 ERROR `the account named in the grant could not be looked up`, 그리고 `resso_token_errors_total{grant_type="authorization_code"}`. 뒤의 둘은 헬퍼가 원래 남기는 것이고, 이 변경이 더한 것은 **detail의 키 하나**입니다.
+- **헬퍼의 판정은 신호만 조종하고 응답은 건드리지 않습니다.** 사유는 로그에만 들어가고 **detail에는 넣지 않습니다** — detail은 그대로 저장되어 감사 화면이 되돌려주는 값입니다. 조회가 정상이었던 평범한 재사용에는 `actor_resolved` 키가 **없습니다**(기존 항목의 모양이 그대로 유지됩니다).
+- **호출자에게 가는 답은 한 글자도 바뀌지 않았습니다** — 전과 후가 모두 400 `invalid_grant` "authorization code is invalid or expired"입니다. 이 경로에서 500 `server_error`로 답하는 것은 **의도적으로 하지 않았습니다**: 재사용을 감지한 그 교환이 코드를 이미 소진했으므로 **500이 권하는 재시도가 존재하지 않습니다.** (계정 조회 실패에 500으로 답하는 것은 이 경로에서 별도 변경으로 제출되어 기각된 바 있습니다.)
+- **`store.ErrNotFound`는 전과 같이 조용합니다** — 헬퍼가 그것을 걸러 냅니다. 정말로 없어진 계정은 이쪽 장애가 아니라 **질문에 대한 실제 답**이고, 이 서버가 설명을 빚진 빈칸이 아닙니다.
+- `docs/operations.md`의 두 줄을 **고쳤습니다**(문장을 더한 것이 아닙니다). `AUTHORIZATION_CODE_REUSED` 항목에는 `actor_resolved=false`면 계정 칸이 빈 이유가 **조회 실패이고 계정이 없다는 뜻이 아니라는 것**, 그때는 계정으로 검색할 수 없으므로 detail의 `session_id`로 관리 → 세션에서 주인을 찾고 위 ERROR 문구에서 사유를 확인하라는 것을 적었습니다. `resso_token_errors_total` 불릿에는 **"계정 조회 실패는 이 역시 500 `server_error`로 답합니다"의 예외**를 적었습니다 — 코드 재사용 뒤의 계정 조회는 이 계열에 세고 같은 로그를 남기지만 **응답은 400 그대로**이며, 그 경우의 표시는 응답이 아니라 감사 항목의 `actor_resolved=false`라는 것까지. 계열이 늘지 않아 README 지표 표는 그대로입니다.
+
+### 확인
+
+- 새 연동 테스트 `TestIntegrationCodeReuseNamesWhoseCodeLeakedEvenWhenTheAccountCannotBeRead` — 실제 PostgreSQL과 프로덕션 배선(`New(data, logger, nil, metrics)` + `httptest`)으로, 코드는 진짜 `/auth` 302 `Location`에서 PKCE와 함께 둘을 채굴합니다. **등록기를 반드시 넘겨야 합니다** — 기존 재사용 테스트를 그대로 복사하면 `nil`이라 지표를 읽을 수 없습니다. 장애는 `ALTER TABLE users RENAME TO users_hidden`으로 만들고 단언 전에 즉시 되돌립니다(`restored` 플래그 + `t.Cleanup`). ① **평범한 재사용**: `actor_name=code-actor-user`·detail에 `actor_resolved` 키 **부재**·WARN `authorization code replayed` 1줄·ERROR 0줄·`resso_token_errors_total{grant_type=` 샘플 **부재** ② **`users` 은닉 중의 재사용**: 400 + 본문 `invalid_grant` + 문안 그대로·감사 항목이 **2건으로 보존**·detail `actor_resolved=false` + `session_id` 일치·detail에 `users_hidden`·코드 원문·verifier 미노출·그 ERROR 문구 **정확히 1줄**·WARN 합계 2줄·재사용 ERROR 0줄(폐기는 성공했으므로)·`resso_token_errors_total{grant_type="authorization_code"} 1`·로그에 코드와 verifier 미노출.
+- **수정 전에 실제로 실패함을 확인**했습니다 — 프로덕션 변경 **전**에 돌리면 셋이 함께 걸립니다: `the entry records actor_resolved=<nil>: with actor="" a reader cannot tell a failed lookup from a code that belonged to nobody`·`a lookup that failed left 0 error line(s) saying so`·`the failed lookup was not counted`. **`actor=""`가 결함 자체의 증거입니다.**
+- **단언이 실제로 바뀐 줄을 지나는지 프로브로 따로 증명**했습니다 — `detail["actor_resolved"] = false` 한 줄만 `_ = affected`로 바꾸니 detail 단언만 걸리고 ERROR·지표 단언은 통과했습니다. **두 신호가 서로 독립으로 고정되어 있다는 뜻**이고, 즉시 되돌렸습니다.
+- **감사 항목이 `users` 은닉 중에도 살아남는지를 실행으로 확인**했습니다(추측으로 남겨 둘 수 없는 전제였습니다) — `audit_events.actor_id`의 외래 키는 테이블 이름이 바뀌어도 그대로 통과하므로 항목 2건이 모두 남습니다. 컬럼을 치우는 좁은 대안은 필요하지 않았습니다.
+- **지표 부재 단언은 계열 이름이 아니라 샘플 줄(`resso_token_errors_total{grant_type=`)로 써야 합니다** — 등록기가 표본 없는 계열에도 `# HELP`/`# TYPE`을 출력하므로, 이름만 보면 평범한 경우에서 **틀린 이유로** 실패합니다(첫 red 실행에서 실제로 그렇게 떴습니다).
+- **정말로 삭제된 계정으로는 이 분기에 닿을 수 없습니다** — `authorization_codes.user_id`가 `ON DELETE CASCADE`(`migrations/001_initial.sql:152`)이므로 삭제된 계정은 자기 코드를 함께 가져가고, 그러면 재사용 감지 자체가 일어나지 않습니다. 손으로 만든 상태로 단언하지 않았고, `ErrNotFound` 필터는 무수정 `userLookupFailed` 안에 있으며 다른 두 호출부가 이미 쓰고 있습니다.
+- 기존 2201개 테스트가 **무수정으로** 통과합니다 — `go test -race ./internal/httpserver -count=1` ok, `go test -race ./internal/store -count=1` ok.
+- 릴리즈 준비에서 `make lint`(golangci-lint 0 issues, govulncheck 취약점 0, `eslint --max-warnings 0`), `make test`(Go `-race` 13개 패키지 · 연동 SKIP 0 · `go vet` · 콘솔 29파일 161테스트 · 빌드), `make build VERSION=v0.9.102`, `git diff --check`가 통과했습니다.
+
+### Upgrade notes
+
+**마이그레이션도 설정 변경도 없고 이전 `v0.9.101` 이미지로 롤백할 수 있습니다**(되돌리면 조회에 실패한 계정 칸이 다시 이유 없이 비어 있을 뿐입니다). **HTTP 응답은 어느 경우에도 한 글자도 바뀌지 않습니다** — 재사용된 코드는 전과 같이 400 `invalid_grant` "authorization code is invalid or expired"이고, 정상적인 코드 교환도 그대로입니다. RP 쪽에서 고칠 것은 없습니다.
+
+**달라지는 것은 감사 트레일과 로그와 지표뿐이며, 좋은 방향입니다.** 전에는 `users` 장애 중에 재사용이 감지되면 계정 칸이 **이유 없이 비어 있었습니다.** 이제 그 경우 상세에 **`actor_resolved=false`**가 붙습니다. 조회가 정상이었던 재사용 항목은 전과 똑같습니다(이 키가 붙지 않습니다) — 즉 **기존 항목의 모양을 읽는 쪽은 바뀌는 것이 없습니다.**
+
+**`actor_resolved=false`를 보면 계정으로 검색하지 마세요.** 그 항목은 계정 칸이 비어 있어 그 검색에 걸리지 않습니다. 상세의 `session_id`로 관리 → 세션에서 코드의 주인을 찾고, 조회가 왜 실패했는지는 서버 로그의 `the account named in the grant could not be looked up`에서 확인하세요. **이것은 계정이 없다는 뜻이 아닙니다** — 없어진 계정은 이 키를 붙이지 않습니다.
+
+**지표로 경보한다면 한 가지를 알아 두세요** — `resso_token_errors_total{grant_type="authorization_code"}`가 이제 **응답이 500이 아닌데도** 오를 수 있습니다. 코드 재사용 뒤의 계정 조회 실패가 그 경우이고, 코드가 이미 소진되어 재시도할 것이 없으므로 응답은 400 그대로입니다. 이 계열을 `resso_http_requests_total{route,status="500"}`과 묶어 보고 있다면 둘이 어긋나는 유일한 경우이며, `docs/operations.md`의 해당 불릿에 예외로 적었습니다.
+
+**로그를 기계로 읽는다면 ERROR 문구 하나가 이 경로에서 새로 나타날 수 있습니다** — `the account named in the grant could not be looked up`이고, 이미 Refresh Token 경로가 쓰던 그 문구입니다(새 문구가 아니라 `grant_type="authorization_code"`로 함께 나타나는 것입니다). 정상 운영에서는 나오지 않습니다. 기존 WARN `authorization code replayed`로 걸어 둔 검색은 **그대로 두세요** — 재사용 자체의 줄은 전과 같이 한 줄이고, 위 ERROR는 **다른 사실**(코드가 재사용되었다는 것이 아니라 그 뒤의 계정 조회가 실패했다는 것)을 말하는 별개의 줄입니다.
+
 ## v0.9.101
 
 **인가 코드가 두 번 제시되었을 때 그에 대한 Refresh Token 폐기가 실패하면 `AUTHORIZATION_CODE_REUSED` 감사 항목이 아예 남지 않았습니다 — 코드가 유출되고, 유출에 대한 대응까지 실패했는데, 트레일에는 아무 일도 없었던 것으로 되어 있었습니다.** 코드가 두 번 제시되었다는 것은 그 코드가 유출되었다는 뜻이고 그에 대한 대응은 그 코드가 만들어 낼 수 있었던 Refresh Token을 폐기하는 것입니다. 그 폐기가 실패하면 `RedeemAuthorizationCode`가 데이터베이스 오류를 **그대로** 돌려주었으므로 Grant의 `errors.Is(err, store.ErrCodeReuse)`가 거짓이 되었고, **그 한 조건이 `AUTHORIZATION_CODE_REUSED`를 쓸지 말지를 혼자 결정합니다.** `docs/operations.md`가 감사 화면에서 찾아보라고 보내는 그 항목은 만들어지지 않았고 로그도 한 줄 남지 않았으며, 호출자는 **코드를 잘못 입력했을 때와 똑같은** 400 `invalid_grant`를 받았습니다. 같은 문제의 답은 Refresh Token 쪽에 이미 있었습니다 — `ErrFamilyNotRevoked`가 `ErrTokenReuse`와 함께 올라와 감지가 자신의 실패한 대응보다 오래 살고, Grant가 그것을 읽어 `family_revoked=false`와 오류 한 줄을 남깁니다. 이번 릴리즈는 그 관용구를 코드 쪽으로 옮깁니다.
