@@ -2441,6 +2441,255 @@ func TestIntegrationCodeReuseIsRecordedEvenWhenItsRevocationFails(t *testing.T) 
 	}
 }
 
+// A replayed code is the one record that a credential leaked, and the operations
+// guide sends a reader to the audit screen to search it by account. The name in
+// that entry comes from a users lookup made after the grant is already lost, and
+// the error from that lookup used to go to _: while users could not be read the
+// entry was still written, but its actor column was blank and nothing anywhere
+// said why. A reader searching by account could never return it, and could not
+// tell the blank apart from a code that belonged to nobody.
+//
+// The refresh path already answers this — userLookupFailed runs before the
+// rotation there, so REFRESH_TOKEN_REUSE always has its actor — and this pins
+// the same guarantee for codes, with the one difference that here the helper's
+// verdict steers nothing but the signals: the code is spent, there is nothing to
+// retry, and the caller is told what it was told before.
+func TestIntegrationCodeReuseNamesWhoseCodeLeakedEvenWhenTheAccountCannotBeRead(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "code-actor-rp", Name: "Code Actor RP", Type: "public",
+		RedirectURIs: []string{"https://code-actor.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "code-actor-user", Password: "code-actor-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour,
+		"127.0.0.1", "code-actor-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, nil))
+	// The registry is passed in rather than left nil, because the lookup failure
+	// has to be countable: resso_token_errors_total is half of what tells an
+	// operator the blank actor is this server's fault and not the account's.
+	metrics := observability.NewRegistry()
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	// Everything that needs to read users happens first. Authorization resolves
+	// the session's account, and the first exchange of each code reads it again,
+	// so both codes are minted and both first exchanges are made before the
+	// table is moved out of the way — what is left to break is the replay.
+	verifier := strings.Repeat("code-actor-verify", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	browser := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	mint := func() string {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodGet, server.URL+
+			"/realms/master/protocol/openid-connect/auth?response_type=code&client_id=code-actor-rp"+
+			"&redirect_uri="+url.QueryEscape("https://code-actor.test/cb")+"&scope=openid&state=s"+
+			"&code_challenge="+challenge+"&code_challenge_method=S256", nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+		authorized, doErr := browser.Do(request)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		_ = authorized.Body.Close()
+		location, parseErr := url.Parse(authorized.Header.Get("Location"))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		code := location.Query().Get("code")
+		if code == "" {
+			t.Fatalf("no authorization code was issued: %s", location)
+		}
+		return code
+	}
+	named, blanked := mint(), mint()
+
+	exchange := func(code string) (int, string) {
+		t.Helper()
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token",
+			url.Values{"grant_type": {"authorization_code"}, "code": {code},
+				"redirect_uri": {"https://code-actor.test/cb"}, "client_id": {"code-actor-rp"},
+				"code_verifier": {verifier}})
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+	reuseEntries := func() []store.AuditRow {
+		t.Helper()
+		page, listErr := data.ListAudit(ctx, store.AuditFilter{RealmID: &realm.ID,
+			EventType: "AUTHORIZATION_CODE_REUSED", Ascending: true})
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		return page.Items
+	}
+	lines := func(substring string) int {
+		count := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, substring) {
+				count++
+			}
+		}
+		return count
+	}
+	exported := func() string {
+		t.Helper()
+		var out strings.Builder
+		metrics.WritePrometheus(&out)
+		return out.String()
+	}
+
+	// (1) A replay while users answers normally. This is the behaviour that must
+	// not move: the account is named, the detail says nothing new, and the
+	// lookup counter and the error log stay empty.
+	if status, body := exchange(named); status != http.StatusOK {
+		t.Fatalf("the first exchange answered %d: %s", status, body)
+	}
+	if status, body := exchange(named); status != http.StatusBadRequest ||
+		!strings.Contains(body, `"error":"invalid_grant"`) {
+		t.Fatalf("replaying a code answered %d %s, want 400 invalid_grant", status, body)
+	}
+	trail := reuseEntries()
+	if len(trail) != 1 {
+		t.Fatalf("%d reuse events were recorded for an ordinary replay, want 1", len(trail))
+	}
+	if trail[0].ActorName != "code-actor-user" {
+		t.Errorf("an ordinary replay named actor=%q, want code-actor-user", trail[0].ActorName)
+	}
+	var namedDetail map[string]any
+	if err := json.Unmarshal(trail[0].Detail, &namedDetail); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := namedDetail["actor_resolved"]; present {
+		t.Errorf("an ordinary replay recorded actor_resolved even though the account was read: %s",
+			trail[0].Detail)
+	}
+	if got := lines(`level=WARN msg="authorization code replayed"`); got != 1 {
+		t.Errorf("an ordinary replay left %d warning(s) naming it:\n%s", got, logs.String())
+	}
+	if got := lines("level=ERROR"); got != 0 {
+		t.Errorf("an ordinary replay was logged as a fault on this side:\n%s", logs.String())
+	}
+	// The sample line, not the name: the registry prints HELP and TYPE for every
+	// series it knows, counted or not, so matching the name alone would pass
+	// here for the wrong reason and fail below for one.
+	if strings.Contains(exported(), `resso_token_errors_total{grant_type=`) {
+		t.Errorf("an ordinary replay was counted as a token error:\n%s", exported())
+	}
+
+	// (2) The same replay while users cannot be read. The whole table goes,
+	// because the lookup under test is UserByID's SELECT of every user column
+	// and nothing narrower reaches it; the audit insert's actor_id still
+	// references the rows, which moved with the table rather than going away.
+	if status, body := exchange(blanked); status != http.StatusOK {
+		t.Fatalf("the second exchange answered %d: %s", status, body)
+	}
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE users RENAME TO users_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE users_hidden RENAME TO users"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(restore)
+	status, body := exchange(blanked)
+	restore()
+
+	// Not one character of the answer changes. The code was spent by the
+	// redemption that detected the replay, so there is nothing for the caller to
+	// retry and nothing a 500 would buy it; answering one here was a separate
+	// change, and it was not taken.
+	if status != http.StatusBadRequest ||
+		!strings.Contains(body, `"error":"invalid_grant"`) ||
+		!strings.Contains(body, "authorization code is invalid or expired") {
+		t.Errorf("a replay found while users was unreadable answered %d %s, "+
+			"want the unchanged 400 invalid_grant", status, body)
+	}
+	// The entry is the point of the exercise: losing it would lose the only
+	// record that the code leaked at all.
+	trail = reuseEntries()
+	if len(trail) != 2 {
+		t.Fatalf("%d reuse events were recorded, want 2: the replay found while users was "+
+			"unreadable left no entry, so the record of the leak is gone", len(trail))
+	}
+	blankedEntry := trail[1]
+	var blankedDetail map[string]any
+	if err := json.Unmarshal(blankedEntry.Detail, &blankedDetail); err != nil {
+		t.Fatal(err)
+	}
+	if blankedDetail["session_id"] != session.Session.ID.String() {
+		t.Errorf("the entry names session %v, want %s", blankedDetail["session_id"], session.Session.ID)
+	}
+	if blankedDetail["actor_resolved"] != false {
+		t.Errorf("the entry records actor_resolved=%v: with actor=%q a reader cannot tell a failed "+
+			"lookup from a code that belonged to nobody: %s",
+			blankedDetail["actor_resolved"], blankedEntry.ActorName, blankedEntry.Detail)
+	}
+	// The reason for the blank goes to the log, never to the detail, which is
+	// stored verbatim and handed back by the audit screen.
+	if strings.Contains(string(blankedEntry.Detail), "users_hidden") ||
+		strings.Contains(string(blankedEntry.Detail), blanked) ||
+		strings.Contains(string(blankedEntry.Detail), verifier) {
+		t.Errorf("the entry copied the fault or the grant's credentials into the trail: %s",
+			blankedEntry.Detail)
+	}
+	// Two lines for two different facts, counted exactly so that neither is a
+	// second rendering of the other: the replay happened, and the account behind
+	// it could not be looked up.
+	if got := lines(`level=ERROR msg="the account named in the grant could not be looked up"`); got != 1 {
+		t.Errorf("a lookup that failed left %d error line(s) saying so:\n%s", got, logs.String())
+	}
+	if got := lines(`level=WARN msg="authorization code replayed"`); got != 2 {
+		t.Errorf("%d of the two replays were reported as replays:\n%s", got, logs.String())
+	}
+	if got := lines(`level=ERROR msg="authorization code replayed`); got != 0 {
+		t.Errorf("the revocation landed, yet %d line(s) report it as failed:\n%s", got, logs.String())
+	}
+	// The counter is the half of the signal that survives log retention, and the
+	// grant type is known by here, so it carries the label.
+	if got := exported(); !strings.Contains(got,
+		`resso_token_errors_total{grant_type="authorization_code"} 1`) {
+		t.Errorf("the failed lookup was not counted:\n%s", got)
+	}
+	if strings.Contains(logs.String(), blanked) || strings.Contains(logs.String(), verifier) {
+		t.Error("the authorization code or its verifier was written to the log")
+	}
+}
+
 func TestIntegrationRefreshFailureLeavesTheClientsTokenUsable(t *testing.T) {
 	data := openHTTPIntegrationStore(t)
 	ctx := context.Background()
