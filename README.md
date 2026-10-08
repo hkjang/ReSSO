@@ -216,7 +216,7 @@ test_env="$(scripts/test-services.sh)" &&
 
 이전 README의 수동 절차로 `resso-test-pg`를 만들었다면 비밀번호가 달라 인증에 실패할 수 있습니다. **기존 테스트 데이터를 삭제해도 되는 경우에만** `scripts/test-services.sh --stop`으로 정리한 뒤 위 준비·검증 명령을 다시 실행하세요. 이 명령은 PostgreSQL·LDAP·LDAPS 테스트 컨테이너를 제거하고 테스트 인증서를 정리합니다. 검증 후 더 이상 필요 없을 때도 같은 명령으로 정리할 수 있습니다.
 
-기존 LDAPS 컨테이너에 별도 인증서 디렉터리를 사용했다면 `docker inspect resso-test-ldaps`의 `Mounts`에서 인증서 마운트 원본 경로를 확인하고, 준비와 정리 모두 같은 `RESSO_TEST_CERT_DIR`를 지정하세요. 인증서 검증을 끄지 마세요.
+기존 LDAPS 컨테이너를 재사용할 때 지정된 인증서 디렉터리에 `ca.crt`가 없거나 읽을 수 있는 일반 파일이 아니면 준비 스크립트는 환경변수를 출력하지 않고 실패합니다. `docker inspect resso-test-ldaps`의 `Mounts`에서 인증서 마운트 원본 경로를 확인하고, 준비와 정리 모두 그 경로를 `RESSO_TEST_CERT_DIR`로 지정하세요. 스크립트는 이 경우 인증서를 자동 재발급하거나 컨테이너를 재생성하지 않습니다. 인증서 검증을 끄지 마세요.
 
 실제 PostgreSQL과 실행 중인 ReSSO를 대상으로 OIDC, Refresh, UserInfo, 개인 API Key와 MCP까지 확인:
 

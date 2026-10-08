@@ -70,10 +70,16 @@ func runTestServices(t *testing.T, stubDir string) (string, string, error) {
 	if _, err := os.Stat(script); err != nil {
 		t.Fatal(err)
 	}
+	// These port tests need a readable CA file to reach the port checks.
+	// Actual certificate verification is covered by the real LDAPS tests.
+	certs := t.TempDir()
+	if err := os.WriteFile(filepath.Join(certs, "ca.crt"), []byte("port test CA placeholder\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	command := exec.Command("bash", script)
 	command.Env = append(os.Environ(),
 		"PATH="+stubDir+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"RESSO_TEST_CERT_DIR="+filepath.Join(t.TempDir(), "certs"),
+		"RESSO_TEST_CERT_DIR="+certs,
 	)
 	var out, errOut strings.Builder
 	command.Stdout = &out
