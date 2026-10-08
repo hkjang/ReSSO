@@ -1,7 +1,7 @@
 {
   "name": "resso-web",
   "private": true,
-  "version": "0.9.102",
+  "version": "0.9.103",
   "type": "module",
   "scripts": {
     "dev": "PATH=\"${npm_node_execpath%/*}:$PATH\" vite",
