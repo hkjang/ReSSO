@@ -6,11 +6,21 @@ ReSSO의 User Federation은 Realm별로 여러 LDAP/Active Directory 공급자�
 
 통합 테스트는 PostgreSQL과 디렉터리 두 개(평문, TLS)를 필요로 합니다. 없으면 60여 개가 건너뛰어지는데, 건너뛴 테스트도 `go test`는 `ok`로 보고하므로 로컬에서는 초록이고 CI에서 실패하는 일이 생깁니다. `make test`가 건너뛴 개수를 알려줍니다.
 
+저장소 루트의 같은 Bash 셸에서 다음 명령을 실행하세요. 준비 스크립트나 `eval`이 실패하면 테스트를 실행하지 않습니다.
+
 ```bash
-eval "$(scripts/test-services.sh)"   # 서비스 기동 + 환경변수 설정
-go test ./internal/...
-scripts/test-services.sh --stop      # 정리
+test_env="$(scripts/test-services.sh)" &&
+  eval "$test_env" &&
+  go test ./internal/...
 ```
+
+검증 후에는 서비스를 그대로 두고 다음 검증에서 재사용하는 것이 기본입니다. 더 이상 필요 없고 **기존 테스트 데이터를 버려도 되는 경우에만** 아래 명령으로 정리하세요. PostgreSQL·LDAP·LDAPS 테스트 컨테이너와 테스트 인증서를 삭제합니다.
+
+```bash
+scripts/test-services.sh --stop
+```
+
+사용자 지정 인증서 디렉터리를 쓴다면 준비와 정리 모두 같은 `RESSO_TEST_CERT_DIR`을 지정하세요. 예를 들어 위 준비 명령 전에 `export RESSO_TEST_CERT_DIR='/path/to/test-certs'`로 설정하고 정리할 때도 같은 값을 유지합니다. 기존 LDAPS 컨테이너의 CA 경로 문제로 준비가 실패하면 [README의 개발 및 검증](../README.md#개발-및-검증)에 있는 마운트 경로 확인·복구 안내를 따르세요.
 
 CI도 같은 스크립트를 실행하므로, 로컬에서 통과한 것과 CI가 검증하는 것이 갈라지지 않습니다.
 
