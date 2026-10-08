@@ -267,6 +267,11 @@ make_certificates() {
 
 start_tls_directory() {
   if docker inspect "$tls_container" >/dev/null 2>&1; then
+    if [ ! -f "$certs/ca.crt" ] || [ ! -r "$certs/ca.crt" ]; then
+      log "$certs/ca.crt is not a readable regular file; cannot reuse $tls_container"
+      log "check Mounts in docker inspect $tls_container and set RESSO_TEST_CERT_DIR to the existing certificate directory"
+      exit 1
+    fi
     tls_port="$(published_port "$tls_container" 636)"
     return
   fi
