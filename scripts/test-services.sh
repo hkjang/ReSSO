@@ -7,7 +7,13 @@
 # script rather than instructions in three places keeps what runs here and what
 # runs in CI the same thing.
 #
-#   eval "$(scripts/test-services.sh)"    # start and export
+# The environment is assigned first and evaluated second on purpose. A bare
+# `eval "$(...)"` evaluates the empty output of a failed run and succeeds, so
+# the one failure that matters here - preparation that could not bring the
+# services up - is reported by this script and then thrown away by the line
+# that was supposed to run it.
+#
+#   test_env="$(scripts/test-services.sh)" && eval "$test_env"
 #   scripts/test-services.sh --stop       # remove the containers
 set -euo pipefail
 

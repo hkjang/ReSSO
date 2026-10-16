@@ -74,7 +74,8 @@ test: web/node_modules
 		if [ "$$skipped" -gt 0 ]; then \
 			echo; \
 			echo "$$skipped integration test(s) did not run: their services were not reachable."; \
-			echo "Start them with: eval \"\$$(scripts/test-services.sh)\""; \
+			echo "Start them with, in this shell:"; \
+			echo "  test_env=\"\$$(scripts/test-services.sh)\" && eval \"\$$test_env\""; \
 		fi; \
 		exit $$status
 	go vet ./...
