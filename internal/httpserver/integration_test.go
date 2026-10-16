@@ -2756,6 +2756,234 @@ func TestIntegrationRefreshFailureLeavesTheClientsTokenUsable(t *testing.T) {
 	}
 }
 
+// The refresh grant rotates the caller's token in one transaction, and the
+// first thing that transaction does for a session-bound token is ask whether
+// the session is still live. A sso_sessions table this server cannot read makes
+// that question unanswerable — and the answer it used to give was invalid_grant,
+// which tells the relying party the token is dead. Nothing had been written at
+// that point: the rotation is further down the same transaction and the
+// transaction is rolled back, so the token in the caller's hand was still the
+// live one. A few seconds of trouble reading one table took every session that
+// renewed during it, permanently.
+func TestIntegrationRefreshSurvivesASessionLookupItCannotRun(t *testing.T) {
+	data := openHTTPIntegrationStore(t)
+	ctx := context.Background()
+	if _, err := data.Bootstrap(ctx, "admin", "bootstrap-password-123"); err != nil {
+		t.Fatal(err)
+	}
+	realm, err := data.RealmByName(ctx, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.EnsureActiveSigningKey(ctx, realm.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.CreateClient(ctx, realm.ID, store.CreateClientInput{
+		ClientID: "refresh-outage-rp", Name: "Refresh Outage RP", Type: "public",
+		RedirectURIs: []string{"https://refresh-outage.test/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"}, DefaultScopes: []string{"openid"}}); err != nil {
+		t.Fatal(err)
+	}
+	user, err := data.CreateUser(ctx, realm.ID, store.CreateUserInput{
+		Username: "refresh-outage-user", Password: "refresh-outage-password-1234", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := data.CreateSession(ctx, realm.ID, user.ID, time.Hour,
+		"127.0.0.1", "refresh-outage-test", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, nil))
+	// The registry is passed in rather than left nil: resso_token_errors_total is
+	// the half of the signal that outlives log retention, and a fault answered
+	// 500 has to be countable as one.
+	metrics := observability.NewRegistry()
+	server := httptest.NewServer(New(data, logger, nil, metrics).Handler())
+	t.Cleanup(server.Close)
+
+	// The refresh token is earned through the real flow rather than inserted,
+	// because what is under test only runs for a session-bound token: the
+	// liveness query is inside `if old.SessionID != nil`, and a code minted at
+	// /auth for a signed-in browser is how refresh_tokens.session_id comes to be
+	// set in production.
+	verifier := strings.Repeat("refresh-outage-verify", 3)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	browser := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	request, err := http.NewRequest(http.MethodGet, server.URL+
+		"/realms/master/protocol/openid-connect/auth?response_type=code&client_id=refresh-outage-rp"+
+		"&redirect_uri="+url.QueryEscape("https://refresh-outage.test/cb")+"&scope=openid&state=s"+
+		"&code_challenge="+challenge+"&code_challenge_method=S256", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+	authorized, err := browser.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = authorized.Body.Close()
+	location, err := url.Parse(authorized.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := location.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no authorization code was issued: %s", location)
+	}
+
+	post := func(form url.Values) (int, string) {
+		t.Helper()
+		response, postErr := server.Client().PostForm(
+			server.URL+"/realms/master/protocol/openid-connect/token", form)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+	refreshWith := func(token string) (int, string) {
+		t.Helper()
+		return post(url.Values{"grant_type": {"refresh_token"}, "refresh_token": {token},
+			"client_id": {"refresh-outage-rp"}})
+	}
+	refreshTokenIn := func(body string) string {
+		t.Helper()
+		var decoded struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		if decodeErr := json.Unmarshal([]byte(body), &decoded); decodeErr != nil {
+			t.Fatalf("decode token response: %v: %s", decodeErr, body)
+		}
+		if decoded.RefreshToken == "" {
+			t.Fatalf("no refresh token was issued: %s", body)
+		}
+		return decoded.RefreshToken
+	}
+	lines := func(substring string) int {
+		count := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, substring) {
+				count++
+			}
+		}
+		return count
+	}
+	exported := func() string {
+		t.Helper()
+		var out strings.Builder
+		metrics.WritePrometheus(&out)
+		return out.String()
+	}
+
+	status, body := post(url.Values{"grant_type": {"authorization_code"}, "code": {code},
+		"redirect_uri": {"https://refresh-outage.test/cb"}, "client_id": {"refresh-outage-rp"},
+		"code_verifier": {verifier}})
+	if status != http.StatusOK {
+		t.Fatalf("the code exchange answered %d: %s", status, body)
+	}
+	held := refreshTokenIn(body)
+
+	// (1) The outage. Only sso_sessions goes: InspectRefreshToken reads
+	// refresh_tokens and UserByID reads users, so neither of the two faults this
+	// endpoint already answers 500 is triggered, and the first thing to fail is
+	// the liveness query inside the rotation.
+	if _, err := data.Pool.Exec(ctx, "ALTER TABLE sso_sessions RENAME TO sso_sessions_hidden"); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := data.Pool.Exec(context.Background(),
+			"ALTER TABLE sso_sessions_hidden RENAME TO sso_sessions"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(restore)
+	status, body = refreshWith(held)
+	restore()
+
+	if status != http.StatusInternalServerError || !strings.Contains(body, `"error":"server_error"`) {
+		t.Errorf("a refresh made while sso_sessions was unreadable answered %d %s, want 500 server_error "+
+			"so the relying party does not throw away a token that is still live", status, body)
+	}
+	// The description says only what is known, in the same terms the lookup
+	// failure above it uses: the token was neither rotated nor rejected, which is
+	// what tells a caller a retry is worth making. The stage differs so that two
+	// faults of the same grant are told apart in a support thread.
+	if !strings.Contains(body, "the token was neither rotated nor rejected") {
+		t.Errorf("the answer does not tell the caller its token survived: %s", body)
+	}
+	if got := lines(`level=ERROR msg="the refresh token could not be rotated"`); got != 1 {
+		t.Errorf("a rotation that could not run left %d error line(s) saying so:\n%s", got, logs.String())
+	}
+	if got := exported(); !strings.Contains(got, `resso_token_errors_total{grant_type="refresh_token"} 1`) {
+		t.Errorf("the failed rotation was not counted:\n%s", got)
+	}
+	if strings.Contains(logs.String(), held) || strings.Contains(logs.String(), verifier) {
+		t.Error("the refresh token or its verifier was written to the log")
+	}
+
+	// (2) The claim the whole change rests on: the failed attempt rotated
+	// nothing, so the very same token the caller already sent is still good.
+	status, body = refreshWith(held)
+	if status != http.StatusOK {
+		t.Fatalf("the same refresh token answered %d after the outage lifted: %s, want 200 — "+
+			"the failed attempt was not supposed to have spent it", status, body)
+	}
+	successor := refreshTokenIn(body)
+	if successor == held {
+		t.Error("the exchange handed back the token it was given instead of a successor")
+	}
+
+	// (3) Ordinary rejections do not move. A token nobody issued keeps the answer
+	// that deliberately does not distinguish an unknown value from somebody
+	// else's.
+	if status, body := refreshWith("not-a-token-anyone-issued"); status != http.StatusBadRequest ||
+		!strings.Contains(body, `"error":"invalid_grant"`) ||
+		!strings.Contains(body, "refresh token is invalid or expired") {
+		t.Errorf("an unknown refresh token answered %d %s, want the unchanged 400 invalid_grant", status, body)
+	}
+	// And a session that really has ended is a real answer, not a missing one:
+	// the idle timeout is how sessionIsLive stops being satisfied without
+	// touching the token itself, which is what keeps this case on the
+	// !sessionActive branch rather than on reuse.
+	idle := store.UpdateRealmInput{DisplayName: realm.DisplayName, IssuerURL: realm.IssuerURL, Enabled: true,
+		AccessTokenTTLSeconds: realm.AccessTokenTTLSeconds, RefreshTokenTTLSeconds: realm.RefreshTokenTTLSeconds,
+		SessionTTLSeconds: realm.SessionTTLSeconds, PasswordMinLength: realm.PasswordMinLength,
+		MaxLoginAttempts: realm.MaxLoginAttempts, LockoutSeconds: realm.LockoutSeconds, IdleTimeoutSeconds: 900}
+	if _, err := data.UpdateRealm(ctx, realm.ID, idle); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.Pool.Exec(ctx, `UPDATE sso_sessions SET last_access=now()-make_interval(secs => 7200)
+        WHERE id=$1`, session.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if status, body := refreshWith(successor); status != http.StatusBadRequest ||
+		!strings.Contains(body, `"error":"invalid_grant"`) ||
+		!strings.Contains(body, "refresh token is invalid or was already used") {
+		t.Errorf("a refresh on a session that has ended answered %d %s, "+
+			"want the unchanged 400 invalid_grant", status, body)
+	}
+	// Neither ordinary rejection is this server's fault, so neither adds to the
+	// fault counter or to the error log.
+	if got := exported(); !strings.Contains(got, `resso_token_errors_total{grant_type="refresh_token"} 1`) {
+		t.Errorf("an ordinary rejection was counted as a fault of this endpoint:\n%s", got)
+	}
+	// Counted apart from the request log, which reports the 500 itself at ERROR
+	// and would make this pass for a second rendering of the same fault.
+	if got := lines("level=ERROR") - lines(`level=ERROR msg="http request"`); got != 1 {
+		t.Errorf("%d error lines of this endpoint's own were logged, want only the one for the "+
+			"unreadable table:\n%s", got, logs.String())
+	}
+}
+
 // Revocation answers 200 whether or not the token matched, which is what the
 // specification requires but leaves the audit trail unable to say whether a
 // token is actually dead. The entry has to distinguish the three outcomes.

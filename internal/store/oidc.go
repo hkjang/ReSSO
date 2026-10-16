@@ -322,9 +322,23 @@ func (s *Store) RotateRefreshToken(ctx context.Context, raw string, reducedScope
 	}
 	if old.SessionID != nil {
 		var sessionActive bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sso_sessions s
+		// The two halves of this used to share one answer. A session that has
+		// ended is a real verdict — the token behind it is finished, and
+		// ErrNotFound is what says so. A query that could not run is no verdict
+		// at all: it says nothing about this token, and reporting it as the first
+		// told the caller its token was dead when it was not. Nothing has been
+		// written by this point — the rotation below has not run and the
+		// transaction is rolled back by the defer above — so the token in the
+		// caller's hand survives either answer, and only one of the two tells it
+		// so. The error is returned unchanged rather than behind a new sentinel,
+		// because the caller judges it by being neither of the two it knows.
+		err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sso_sessions s
             JOIN realms r ON r.id=s.realm_id WHERE s.id=$1 AND `+sessionIsLive+`)`,
-			old.SessionID).Scan(&sessionActive); err != nil || !sessionActive {
+			old.SessionID).Scan(&sessionActive)
+		if err != nil {
+			return RefreshToken{}, "", err
+		}
+		if !sessionActive {
 			return RefreshToken{}, "", ErrNotFound
 		}
 		// Refreshing a token is somebody working in a relying party, which is
