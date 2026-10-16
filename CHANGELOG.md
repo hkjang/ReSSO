@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.9.104
+
+**회전 트랜잭션이 돌지 못한 Refresh Token 교환이 400 `invalid_grant`로 답했습니다 — RP는 그 답을 "이 Token은 죽었다"로 읽고 버리므로, `sso_sessions`를 몇 초 읽지 못한 것이 그 사이 갱신된 모든 세션을 영구히 끊었습니다.** `RotateRefreshToken`은 서로 다른 두 답을 `ErrNotFound` 하나에 접어 넣고 있었습니다 — **끝난 세션**은 그 Token에 대한 실제 판정이지만, **돌지 못한 세션 생존 질의**는 아무런 판정이 아닙니다. Refresh 그랜트는 `ErrTokenReuse`가 아닌 모든 것을 400 `invalid_grant`로 답했으므로, 회전 트랜잭션의 저장소 장애(`Begin`·`Scan`·`Exec`·`Commit`, 그리고 그 생존 질의)가 RP에게 Token이 죽었다고 말했습니다. **그 시점에는 아무것도 기록되지 않았습니다** — `rotated_at`은 같은 트랜잭션의 더 아래에서 찍히고 트랜잭션은 `defer`된 `Rollback`으로 되돌려지므로, 호출자가 든 Token은 그 답 전후로 똑같이 살아 있었습니다. 같은 핸들러의 이웃 두 장애는 이미 500 `server_error`로 답하고 있었고, 회전만 그 패턴에 남아 있었습니다. 이번 릴리즈는 `v0.9.103` 이후 머지된 이 수정과 Go 툴체인 상향을 함께 포함합니다.
+
+### 수정
+
+- **회전이 돌지 못한 경우를 500 `server_error`로 답합니다.** `internal/store`의 세션 생존 질의는 이제 자기 오류를 **그대로** 돌려주고 `ErrNotFound`는 **세션이 실제로 끝난 경우**에만 남습니다. 그랜트는 `ErrNotFound`도 `ErrTokenReuse`도 아닌 나머지를 500으로 답하고, `resso_token_errors_total{grant_type="refresh_token"}`에 세며, 서버 로그 ERROR `the refresh token could not be rotated`를 남깁니다 — 같은 핸들러의 이웃 두 장애가 이미 하던 것과 같습니다. 응답 본문은 회전도 거절도 일어나지 않았으니 잠시 뒤 재시도하라고 말합니다. `raw`는 Bearer 자격증명이므로 로그에도 지표에도 넣지 않습니다.
+- **평범한 거절은 한 글자도 움직이지 않습니다.** 없는 Token·만료된 Token·다른 Realm이나 Client에게 발급된 Token과 **끝난 세션**은 그대로 400 `invalid_grant` "refresh token is invalid or was already used"이고, 재사용은 그대로 400에 `REFRESH_TOKEN_REUSE` 감사 항목입니다. 재사용 제외는 분기에 기대지 않고 `ErrTokenReuse`를 **이름으로** 걸러 냅니다 — `ErrFamilyNotRevoked`가 그 센티넬을 함께 감싸고 그 분기는 반환하지 않으므로, 폐기가 실패한 재사용도 이 줄에 닿아 자기 감사 항목이 서술하는 400을 지킵니다.
+- **인가 코드 교환은 의도적으로 그대로 둡니다.** 그 경로가 실패하는 시점에는 코드가 이미 소진되어 호출자가 재시도할 것이 없습니다(500으로 답하는 안은 별도 변경으로 제출되어 기각된 바 있습니다). 이것이 Refresh 쪽 두 경우와의 차이이며, 그쪽은 호출자가 든 Token이 여전히 살아 있습니다. `internal/httpserver`의 주석도 남은 것이 이 하나임을 적도록 고쳤습니다.
+- `docs/operations.md`의 `resso_token_errors_total` 불릿에 회전 실패를 적었습니다 — 이 계열이고 500이며, 장애가 걷히면 **같은 Token이 그대로 200으로 교환된다**는 것까지. 같은 그랜트의 두 500은 로그 문구로 단계를 구별하도록 안내합니다(`...could not be looked up`은 조회, `...could not be rotated`는 회전). 끝난 세션과 재사용은 이 계열에 세지 않는다는 것도 명시했습니다. 계열이 늘지 않아 README 지표 표는 그대로입니다.
+- **Go 툴체인을 1.26.9로 올렸습니다.** `go.mod`의 `toolchain`과 `Dockerfile`의 빌더 베이스 이미지를 함께 올려 패치된 `net/http`와 `crypto/tls`로 빌드합니다. 두 핀은 `TestToolchainPinsAgreeAcrossTheBuild`가 계속 대조합니다 — 테스트는 새 Go로 돌고 출하되는 바이너리는 옛 Go로 빌드되는 조용한 드리프트를 막는 자리입니다.
+
+### 확인
+
+- 새 연동 테스트 `TestIntegrationRefreshSurvivesASessionLookupItCannotRun`은 실제 PostgreSQL과 프로덕션 배선으로, `sso_sessions`를 읽을 수 없게 만든 뒤 교환이 500 `server_error`로 답하고 그 Token이 **장애가 걷힌 뒤 그대로 200으로 교환되는 것**까지 확인합니다. 회전 전이라 아무것도 기록되지 않았다는 주장이 실행으로 증명되는 자리입니다.
+- 릴리즈 준비에서 `make lint`(golangci-lint 0 issues, govulncheck, `eslint --max-warnings 0`), `make test`(Go `-race` 13개 패키지 · 연동 SKIP 0 · `go vet` · 콘솔 스위트 · 빌드), `make build VERSION=v0.9.104`, `git diff --check`가 통과했습니다. 빌드 명령의 버전 링크 플래그와 일곱 자리 버전 파일의 일치도 확인했습니다.
+- 로컬 Go가 `go.mod`의 새 툴체인과 같은 1.26.9라 govulncheck가 출하되는 표준 라이브러리를 그대로 봅니다.
+
+### Upgrade notes
+
+프로덕션 DB 마이그레이션도 런타임 설정 변경도 없고, 이전 `v0.9.103` 이미지로 롤백할 수 있습니다(되돌리면 회전이 돌지 못한 교환이 다시 400 `invalid_grant`로 답할 뿐입니다). **평범한 교환과 평범한 거절의 응답은 바뀌지 않으므로 RP 쪽에서 고칠 것은 없습니다.**
+
+**달라지는 것은 저장소 장애 중의 응답 하나입니다.** 전에는 회전 트랜잭션이 돌지 못하면 400 `invalid_grant`가 나가 RP가 Token을 버렸습니다. 이제 그 경우 500 `server_error`가 나가고, RP의 표준 동작은 잠시 뒤 재시도이므로 **장애가 걷히면 같은 Refresh Token이 그대로 교환됩니다.** 사람을 다시 로그인으로 보내지 않습니다.
+
+**지표로 경보한다면** `resso_token_errors_total{grant_type="refresh_token"}`이 전에는 오르지 않던 경우에 오를 수 있습니다 — 회전 트랜잭션의 실패가 그 경우이고, 이 계열을 `resso_http_requests_total{route,status="500"}`과 함께 보고 있다면 둘이 같이 움직입니다. 끝난 세션과 재사용은 전과 같이 400이고 이 계열에 세지 않습니다.
+
+**로그를 기계로 읽는다면** 이 경로에 ERROR `the refresh token could not be rotated`가 새로 나타날 수 있습니다. 정상 운영에서는 나오지 않습니다. 같은 그랜트의 `the refresh token offered to the grant could not be looked up`은 **다른 단계**(회전이 아니라 조회)이므로 두 문구를 구별해 두세요.
+
 ## v0.9.103
 
 **디렉터리 연동 테스트를 준비할 때 CA가 없으면 실패를 드러내고, LDAP 개발 가이드도 그 실패에서 멈춥니다.** 기존 LDAPS 컨테이너를 재사용하면서 인증서 경로가 잘못되면 준비 스크립트가 사용할 수 없는 CA 경로를 내보냈습니다. 스크립트가 실패하도록 고친 뒤에도 가이드의 단독 `eval "$(scripts/test-services.sh)"`은 빈 출력을 평가한 성공으로 그 실패를 덮을 수 있었습니다. 이번 릴리즈는 `v0.9.102` 이후 머지된 준비 스크립트 수정과 가이드 수정을 함께 포함합니다.
