@@ -648,13 +648,14 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 	inspected, _, err := s.store.InspectRefreshToken(r.Context(), raw)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		// The earliest of the places in this endpoint that answered a fault on
-		// this side as a spent grant, and not the last of them: the code
-		// redemption above answers invalid_grant for every
-		// RedeemAuthorizationCode failure, and RotateRefreshToken below answers
-		// it for everything that is not ErrTokenReuse — which includes the store
-		// faults that call returns unchanged and the session-liveness query it
-		// reports as ErrNotFound. Those are separate changes and are still to
-		// make; this is the one made here.
+		// this side as a spent grant. The rotation below now separates the same
+		// two cases, so what is left of the pattern in this file is the code
+		// redemption above, which answers invalid_grant for every
+		// RedeemAuthorizationCode failure. That one is deliberately not changed:
+		// answering it 500 was proposed and turned down, and by the time it is
+		// reached the code has been spent, so there is nothing for the caller to
+		// retry — which is the difference from both of the refresh cases, where
+		// the token in the caller's hand is still live.
 		//
 		// invalid_grant tells the relying party the refresh token it holds is
 		// dead, and the ordinary response is to discard it and send the person
@@ -741,6 +742,39 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request, real
 			}
 			s.audit(r, &realm.ID, inspected.UserID, user.Username,
 				"REFRESH_TOKEN_REUSE", "FAILURE", "client", client.ClientID, detail)
+		}
+		// ErrTokenReuse is excluded as well as ErrNotFound, and by name rather
+		// than by relying on the branch above: the ErrFamilyNotRevoked errors wrap
+		// ErrTokenReuse too, and that branch records the replay without returning,
+		// so a replay whose revocation failed reaches this line and keeps the 400
+		// its audit entry describes.
+		//
+		// What is left is neither of the two answers the rotation can give. Not
+		// ErrNotFound — the token is absent, expired, or its session has ended —
+		// and not a replay, but the transaction failing to run: a Begin, a Scan,
+		// an Exec or a Commit, and the session-liveness query that used to be
+		// folded into ErrNotFound alongside the session actually being over.
+		//
+		// Nothing was written. The rotation marks rotated_at, and every one of
+		// these fails before it or is rolled back by the deferred Rollback, so the
+		// token the caller is holding is exactly as live after this answer as
+		// before it. invalid_grant says the opposite — the ordinary response to it
+		// is to discard the token and send the person through login again — which
+		// turned a table that stopped answering for a few seconds into every
+		// session that renewed during it, gone for good.
+		//
+		// The same argument as the two faults answered above it, and the
+		// description is worded to match them while naming its own stage, so that
+		// two reports of "500 on refresh" can still be told apart. raw is a bearer
+		// credential and goes to neither the log nor the metric.
+		if !errors.Is(err, store.ErrTokenReuse) && !errors.Is(err, store.ErrNotFound) {
+			s.metrics.Add(metricTokenErrors, 1, "refresh_token")
+			s.logger.Error("the refresh token could not be rotated",
+				"trace_id", traceIDFrom(r.Context()), "realm", realm.Name, "client", client.ClientID,
+				"grant_type", "refresh_token", "error", err)
+			writeOAuthError(w, http.StatusInternalServerError, "server_error",
+				"the rotation of the refresh token could not be completed; the token was neither rotated nor rejected, retry after a short delay")
+			return
 		}
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token is invalid or was already used")
 		return

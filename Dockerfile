@@ -8,7 +8,7 @@ COPY web ./web
 COPY webui ./webui
 RUN cd web && npm run build
 
-FROM golang:1.26.7-alpine AS go-builder
+FROM golang:1.26.9-alpine AS go-builder
 # A placeholder, not a version. Both `make image` and the release workflow pass
 # VERSION explicitly; this only applies to a bare `docker build .`, and a real
 # number here goes stale the moment the next release lands — it had been sitting
