@@ -2,7 +2,7 @@ name: resso-maintenance
 
 services:
   resso-maintenance:
-    image: resso:${RESSO_VERSION:-v0.9.104}
+    image: resso:${RESSO_VERSION:-v0.9.105}
     profiles:
       - maintenance
     environment:
