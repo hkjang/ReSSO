@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.9.106
+
+**README가 푸시 전 Go 작업을 확인하는 방법으로 안내하는 `make lint`이 깨끗한 트리에서 규칙 하나 대지 못한 채 죽었고, 이유도 말하지 않았습니다.** 레시피는 두 린터를 `PATH="$(go env GOPATH)/bin:$PATH"`로 돌렸습니다 — GOBIN **디렉터리 전체**를 앞에 붙인 것입니다. go.mod가 요구하는 툴체인을 갖추는 평범한 방법인 `go install golang.org/dl/go1.26.9@latest`는 바로 그 디렉터리에 `go1.26.9`라는 이름의 프로그램을 둡니다. 그리고 툴체인을 전환해야 하는 `go`는 **모듈 캐시의 사본보다 PATH에서 찾은 `goX.Y.Z` 프로그램을 먼저 고릅니다.** 그 프로그램은 `$HOME/sdk`에 SDK를 풀어 두지 않으면 아무 일도 하지 않으므로, 두 도구가 코드에 닿으려고 부른 모든 `go` 호출이 `go1.26.9: not downloaded. Run 'go1.26.9 download' to install`로 답했고 `make lint`은 context loading에서 exit 3으로 끝났습니다. 이번 릴리즈는 `v0.9.105` 이후 머지된 이 수정 하나를 포함하며, 프로덕션 코드 변경은 없습니다.
+
+`v0.9.105`의 변경 기록이 "`make lint`은 이 기계에서 돌지 않습니다 — 이번 변경과 무관한 환경 문제입니다"라고 적어 두었던 바로 그 항목입니다. 이번에 그 원인을 실행으로 확정하고 고쳤습니다.
+
+### 수정
+
+- `Makefile`에 `TOOL = $$(command -v $(1) 2>/dev/null || echo "$$(go env GOPATH)/bin/$(1)")`가 생겼고, `golangci-lint`와 `govulncheck`를 돌리던 두 줄이 `$(call TOOL,...)`로 바뀌었습니다. **도구를 어디서 찾을지와 도구에게 어떤 PATH를 넘길지는 서로 다른 질문입니다** — 이제 도구는 경로로 해결되고(탐색 우선순위는 바로 위 설치 확인 블록과 같습니다: PATH 먼저, 없으면 GOBIN), `go`가 보는 PATH는 그대로 둡니다. 신선한 클론에 필요한 것은 여전히 `go install` 뿐입니다.
+- 도구가 없을 때 인쇄하던 안내에서 `export PATH="$(go env GOPATH)/bin:$PATH"` 한 줄을 지웠습니다. 그 안내를 따른 사람은 셸의 `go build`·`go test`까지 같은 이유로 깨뜨리게 됩니다. 고친 레시피는 PATH 없이 GOBIN을 직접 보므로 그 줄은 더 이상 필요하지도 않습니다.
+- 왜 두 질문을 나누는지를 레시피 위 열 줄 주석에 적었습니다. 다음에 그 줄을 짧게 줄이려는 사람이 같은 결함을 되돌려 놓지 않도록 하는 자리입니다.
+
+### 확인
+
+- 새 테스트 `TestLintDoesNotHandItsToolsTheToolchainProgramOnPath`는 문자열을 대조하지 않고 **레시피를 실제로 실행합니다.** ① go.mod에서 `toolchain` 지시를 읽어 ② 임시 GOPATH/bin에 그 이름의 프로그램(SDK 없는 `golang.org/dl`이 하는 그대로 `not downloaded` + exit 1)과 두 도구의 스텁(받은 PATH를 기록하고 `go env -json GOMOD`를 돌려 실패하면 exit 7)을 깔고 ③ **`make -n lint`으로 real make에게 레시피 줄을 렌더받아**(확장은 make의 것이지 테스트의 재구현이 아닙니다) ④ 패키지 목록을 가진 두 줄을 Makefile 자신의 셸(`bash -o pipefail -c`)로 실제로 돌립니다. 단언은 둘입니다 — 도구가 `go`를 돌릴 수 있어야 하고, 도구가 받은 PATH에 GOBIN이 없어야 합니다.
+- 수정 **전**에 돌린 그 테스트는 실제 오류(`exit status 7` / `go1.26.9: not downloaded`)로 두 서브테스트를 모두 실패시켰고, 같은 실행에서 PATH 단언도 함께 떨어졌습니다. **인과는 양방향으로 확인했습니다**: 고친 뒤 버그를 되돌리니 real `make lint`이 같은 `Error 3`으로 다시 떨어졌고, golangci-lint 줄만 옛 형태로 되돌리니 그 서브테스트만 실패했습니다 — 두 줄이 각각 독립으로 고정돼 있다는 뜻입니다.
+- **real `make lint`이 이 기계에서 처음으로 exit 0입니다** — `golangci-lint` 0 issues, `govulncheck` 호출 취약점 0, `npm run lint`(`--max-warnings 0`) 통과. `make test`(Go `-race` 13개 패키지 · 연동 SKIP 0 · `go vet` · 콘솔 스위트 · 빌드), `make build VERSION=v0.9.106`, `gofmt -l cmd internal`(빈 출력), `git diff --check`가 함께 통과했습니다. 일곱 자리 버전 파일의 일치도 확인했습니다.
+- npm 설치는 `web` devDependencies의 취약점 5건(중간 2·높음 3)을, govulncheck는 코드에서 호출하지 않는 모듈 취약점 3건을 보고합니다. 이번 릴리즈에서 해결하거나 개별 영향을 분석하지 않았습니다.
+
+### Upgrade notes
+
+**프로덕션 코드도, DB 마이그레이션도, 런타임 설정 변경도 없습니다.** 이미지의 동작은 `v0.9.105`와 같고 이전 이미지로 롤백할 수 있습니다. 운영자가 할 일은 없습니다.
+
+달라지는 것은 **소스에서 린터를 돌리는 개발자**뿐입니다. GOBIN에 `golang.org/dl`로 받은 `goX.Y.Z` 프로그램이 있는 기계에서 `make lint`이 `not downloaded`로 죽던 것이 이제 정상적으로 돕니다. 지난 안내를 따라 `export PATH="$(go env GOPATH)/bin:$PATH"`를 셸 설정에 넣어 둔 사람은 **그 줄을 지우세요** — 그대로 두면 `make lint` 밖의 `go build`·`go test`가 같은 이유로 계속 깨집니다. CI는 두 도구를 `make`를 거치지 않고 직접 부르고 go.mod가 요구하는 Go로 도므로 처음부터 영향을 받지 않았습니다.
+
 ## v0.9.105
 
 **준비가 실패해도 그대로 지나가는 단독 `eval "$(scripts/test-services.sh)"`이 두 곳에 남아 있었습니다 — 그 형태를 따라간 사람은 서비스가 뜨지 않은 채 연동 테스트를 돌려 로컬에서는 초록을, CI에서는 실패를 받습니다.** `eval "$(...)"`는 종료값이 0이 아닌 실행의 **빈 출력**을 평가하므로 `eval ""`이 성공하고, 스크립트가 애써 보고한 그 실패는 그것을 실행하기로 되어 있던 바로 그 줄에서 버려집니다. `v0.9.103`의 `c1b71bb`가 `docs/user-federation.md`를 고쳤고 README는 처음부터 옳았지만, **스크립트 자신의 머리말**과 **`make test`가 "돌지 않은 테스트가 있다"고 알릴 때 인쇄하는 안내** 두 곳에는 그대로 남아 있었습니다 — 후자는 방금 뭔가 잘못됐다는 말을 들은 사람이 **바로 복사하는 줄**입니다. 이번 릴리즈는 `v0.9.104` 이후 머지된 이 수정 하나를 포함하며, 프로덕션 코드 변경은 없습니다.
