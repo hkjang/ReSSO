@@ -33,6 +33,18 @@ web/node_modules: web/package-lock.json web/package.json
 	cd web && npm ci
 	@touch $@
 
+# Both tools below reach the code by running `go`, and GOBIN must not be on the
+# PATH they inherit. `go install golang.org/dl/go1.26.9@latest` — the ordinary
+# way to have the toolchain go.mod asks for — puts a program of that name there,
+# and a `go` that has to switch toolchains prefers a goX.Y.Z program it finds on
+# PATH over the copy in the module cache. That program only downloads an SDK
+# into $HOME/sdk, so with GOBIN prepended every `go` call the linters made
+# answered "not downloaded" and lint died in context loading, naming no rule, on
+# a tree that was clean. Where the tools are looked up and what PATH they are
+# handed are separate questions: these resolve a path and change nothing, so
+# `go install` is all a fresh clone needs.
+TOOL = $$(command -v $(1) 2>/dev/null || echo "$$(go env GOPATH)/bin/$(1)")
+
 # govulncheck reports on the standard library of whichever Go is on PATH, not
 # the one go.mod names, so it was describing the developer's machine rather
 # than the artifact. That reads as false alarms when the local toolchain is
@@ -57,11 +69,10 @@ lint: web/node_modules
 		case "$$missing" in *govulncheck*) \
 			echo "  go install golang.org/x/vuln/cmd/govulncheck@latest";; \
 		esac; \
-		echo "  export PATH=\"\$$(go env GOPATH)/bin:\$$PATH\""; \
 		exit 1; \
 	fi
-	PATH="$$(go env GOPATH)/bin:$$PATH" golangci-lint run $(GO_PACKAGES)
-	PATH="$$(go env GOPATH)/bin:$$PATH" GOTOOLCHAIN=auto govulncheck $(GO_PACKAGES)
+	$(call TOOL,golangci-lint) run $(GO_PACKAGES)
+	GOTOOLCHAIN=auto $(call TOOL,govulncheck) $(GO_PACKAGES)
 	cd web && npm run lint
 
 # A skipped test still lets `go test` print ok, and sixty of these are gated on
